@@ -596,6 +596,26 @@ async fn register(
         return Err(ApiError::Conflict("phone already registered".to_string()));
     }
 
+    // Every customer gets their TJS wallet at the door — onboarding must not
+    // have a separate "now create a wallet" step. Fail-soft: registration
+    // stands even if this insert loses a race or the pool hiccups (clients
+    // self-heal an empty wallet list on first Home load).
+    let wallet = async {
+        let tjs = state.ledger.lookup_currency("TJS").await?;
+        state
+            .ledger
+            .open_account_owned(
+                &Account::new(AccountId::new(), AccountType::UserWallet, tjs),
+                Some(user_id),
+            )
+            .await
+            .map_err(ApiError::from)
+    }
+    .await;
+    if let Err(e) = wallet {
+        tracing::warn!(user = %user_id, error = %e, "could not auto-create TJS wallet at registration");
+    }
+
     let tokens = issue_tokens(&state, user_id).await?;
     Ok((StatusCode::CREATED, Json(tokens)))
 }

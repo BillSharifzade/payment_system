@@ -171,14 +171,20 @@ async fn register(app: &axum::Router) -> (String, String) {
     )
 }
 
+/// The user's TJS wallet — auto-created at registration, so this reads the
+/// wallet list rather than opening a second one.
 async fn create_wallet(app: &axum::Router, token: &str) -> String {
     let (status, body) = send(
         app,
-        req("POST", "/v1/wallets", Some(token), None, json!({})),
+        req("GET", "/v1/wallets", Some(token), None, Value::Null),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "create wallet: {body}");
-    body["id"].as_str().unwrap().to_string()
+    assert_eq!(status, StatusCode::OK, "list wallets: {body}");
+    body.as_array()
+        .and_then(|w| w.first())
+        .and_then(|w| w["id"].as_str())
+        .expect("registration must auto-create a TJS wallet")
+        .to_string()
 }
 
 #[tokio::test]

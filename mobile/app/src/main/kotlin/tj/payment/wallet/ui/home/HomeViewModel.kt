@@ -49,7 +49,12 @@ class HomeViewModel(
             val kycDeferred = async { repo.kycStatus() }
 
             val wallets = when (val outcome = walletsDeferred.await()) {
-                is ApiOutcome.Ok -> outcome.value
+                // Registration auto-creates a TJS wallet; if this account somehow
+                // predates that (or the auto-create failed), heal it here.
+                is ApiOutcome.Ok -> outcome.value.ifEmpty {
+                    repo.createWallet("TJS")
+                    (repo.wallets() as? ApiOutcome.Ok)?.value.orEmpty()
+                }
                 is ApiOutcome.Failed -> {
                     _state.value = _state.value.copy(loading = false, error = outcome.userMessage())
                     kycDeferred.await()

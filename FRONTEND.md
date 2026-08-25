@@ -218,7 +218,8 @@ Money is `amount_minor` (i64, diram) everywhere. Auth is `Bearer <access>`.
 | `POST /v1/auth/refresh` | `{refresh_token}` | `TokenResponse` (rotates) |
 | `POST /v1/auth/logout` | `{refresh_token}` | 204 |
 | `GET /v1/wallets` | — | `[{id, currency, balance_minor, display}]` |
-| `GET /v1/accounts/{id}/transactions?cursor=&limit=` | — | `{entries:[{entry_id, transaction_id, direction, amount_minor, currency, created_at_ms}], next_cursor}` |
+| `GET /v1/accounts/{id}/transactions?cursor=&limit=` | — | `{entries:[{entry_id, transaction_id, direction, amount_minor, currency, created_at_ms, kind, counterparty_phone?, counterparty_name?}], next_cursor}` — `kind` ∈ transfer/deposit/fx/fee/withdrawal/other from the viewer's POV; counterparty only on `transfer` (2026-08-25) |
+| `GET /v1/config` | — | `{transfer_fee_bps}` — server-owned pricing for display-only fee previews (2026-08-25) |
 | `POST /v1/transfers` | `{from_account, to_account, amount_minor, currency}` + `Idempotency-Key` | `{transaction_id, status}` |
 | `POST /v1/fx` | `{from_account, to_account, amount_minor}` + `Idempotency-Key` | `FxResponse` |
 | `GET /v1/fx/rates` | — | admin-set rate table |
@@ -276,24 +277,35 @@ clarity).
 
 ### 7.3 Build order — thin vertical slices (each ends installed & driven on the emulator)
 
-1. **Skeleton + core + auth.** Gradle project (flavors dev/prod), the pure-Kotlin
-   `core` (Money, error-code mapping, `ApiClient`, `SecureSession`,
-   `PaymentSubmitter`), register/login/refresh, single-flight 401 refresh,
-   land on an empty Home. *Exit: real login against local backend, token in
-   Keystore, survives app kill.*
-2. **Home.** `GET /v1/wallets` → balance card(s); KYC-level-0 banner.
-3. **History.** Paged `…/transactions`, grouped by day, in/out from the user's
-   POV, Room-cached last page (never across accounts).
-4. **Send.** (needs §7.2 decision) resolve recipient → amount keypad in somoni
-   with live display-only fee line → confirm (shows exactly what lands) →
-   `PaymentSubmitter` §2.2 machine (key persisted before first request, retried
-   on restart). *Exit: two emulator users, money moves once under a killed-app
-   retry.*
-5. **KYC.** status chip + camera capture → `POST /v1/kyc/documents` → submit →
-   poll for approved/rejected.
-6. **FX convert.** quote from `/v1/fx/rates` → confirm → `POST /v1/fx`.
-7. **Settings + hardening pass.** PIN/biometric app-lock, `FLAG_SECURE`,
-   Tajik+Russian localization, cert pinning, R8, log scrubbing.
+1. ✅ **Skeleton + core + auth** (2026-07-20). Gradle project (flavors
+   dev/staging/prod), the pure-Kotlin `core` (Money, error-code mapping),
+   `ApiClient`, `SecureSession`, register/login/refresh, single-flight 401
+   refresh. *Exit met: real login against local backend AND the LAN server,
+   token in Keystore, survives app kill.*
+2. ✅ **Home** (2026-08-25). Wallet cards, KYC-level-0 banner, action row
+   (Send/Receive/History/Convert), recent-activity preview. Registration now
+   auto-creates the TJS wallet server-side (client self-heals an empty list).
+3. ✅ **History** (2026-08-25). Paged `…/transactions` (keyset, infinite
+   scroll), grouped by day (Today/Yesterday/date), in/out from the user's POV
+   with counterparty name/phone from the enriched statement. No Room cache yet
+   — deliberate (lean); add if offline history becomes a real ask.
+4. ✅ **Send** (2026-08-25). resolve → amount keypad in somoni with live
+   display-only fee line (`GET /v1/config` bps, floored exactly like the
+   backend) → confirm → `PaymentSubmitter` §2.2 machine. *Exit met and
+   exceeded: payment survived server-down submit, app force-stop AND
+   reinstall, then same-key retry posted exactly once (ledger-verified).*
+5. ✅ **KYC** (2026-08-25). Status states (form/under-review/verified/
+   rejected), photo-picker upload (multipart, 5 MB client check), submit,
+   10s poll while under review (live-verified: approval flipped the screen
+   with no user action). Camera capture (vs. picker) still open.
+6. ✅ **FX convert** (2026-08-25). Rate from `/v1/fx/rates`, integer-exact
+   floored quote ("you get exactly"), swap direction, one-tap "open a USD
+   wallet" when the second wallet is missing.
+7. **Settings + hardening pass — PARTIAL.** Done: `FLAG_SECURE` (prod flavor
+   only, so emulator QA screenshots keep working), R8 release build green,
+   Receive screen (phone + tap-to-copy). Open: PIN/biometric app-lock,
+   Tajik+Russian localization, cert pinning (needs the real HTTPS domain),
+   log scrubbing audit, receive-QR.
 
 ### 7.4 Stack & module specifics
 

@@ -237,17 +237,23 @@ fun ActionButton(
     modifier: Modifier = Modifier,
     glyph: @Composable () -> Unit,
 ) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 0.92f else 1f,
+        animationSpec = spring(dampingRatio = 0.55f, stiffness = 900f),
+        label = "actionScale",
+    )
     Column(
-        modifier = modifier,
+        // The whole tile — glyph AND label — is the touch target; a label that
+        // ignores taps reads as broken.
+        modifier = modifier.clickable(
+            interactionSource = interaction,
+            indication = null,
+            onClick = onClick,
+        ),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        val interaction = remember { MutableInteractionSource() }
-        val pressed by interaction.collectIsPressedAsState()
-        val scale by animateFloatAsState(
-            targetValue = if (pressed) 0.92f else 1f,
-            animationSpec = spring(dampingRatio = 0.55f, stiffness = 900f),
-            label = "actionScale",
-        )
         Box(
             modifier = Modifier
                 .size(58.dp)
@@ -255,8 +261,7 @@ fun ActionButton(
                     scaleX = scale
                     scaleY = scale
                 }
-                .background(MaterialTheme.colorScheme.surfaceVariant, CircleShape)
-                .clickable(interactionSource = interaction, indication = null, onClick = onClick),
+                .background(MaterialTheme.colorScheme.surfaceVariant, CircleShape),
             contentAlignment = Alignment.Center,
         ) { glyph() }
         Spacer(Modifier.height(8.dp))

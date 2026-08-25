@@ -146,7 +146,12 @@ private fun GateScreen(
         }
         when (repo.restore()) {
             is ApiOutcome.Ok -> toHome()
-            else -> toLogin()
+            // Unreachable server with an intact session: land on Home anyway —
+            // it shows the offline state and a retry. Login would be a dead end
+            // (you can't sign in offline) and would hide a possibly-pending
+            // payment behind a password prompt.
+            is ApiOutcome.Offline -> toHome()
+            is ApiOutcome.Failed -> toLogin()
         }
     }
 
