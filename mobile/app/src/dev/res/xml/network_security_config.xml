@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- dev flavor only: permit cleartext HTTP to the host loopback so the emulator
+     can reach a locally-run payment-server at http://10.0.2.2:8099. Everything
+     else stays cleartext-denied. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

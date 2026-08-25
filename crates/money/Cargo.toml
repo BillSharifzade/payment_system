@@ -1,0 +1,18 @@
+[package]
+name = "money"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Currency-safe integer money type for the payment system. No floats, ever."
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]

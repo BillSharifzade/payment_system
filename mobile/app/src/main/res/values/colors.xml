@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Warm near-black; matches the ops console brand. -->
+    <color name="brand_bg">#0E0B0A</color>
+    <color name="brand_rust">#D34516</color>
+</resources>

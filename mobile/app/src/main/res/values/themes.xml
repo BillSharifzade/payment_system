@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose paints the UI; this XML theme only governs the initial window
+         and system bars so there is no white flash before the first frame. -->
+    <style name="Theme.PaymentWallet" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/brand_bg</item>
+        <item name="android:statusBarColor">@color/brand_bg</item>
+        <item name="android:navigationBarColor">@color/brand_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- staging flavor only: permit cleartext HTTP to the deployed LAN server
+     (srv-dchr01, 192.168.1.156). Everything else stays cleartext-denied. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.1.156</domain>
+    </domain-config>
+</network-security-config>

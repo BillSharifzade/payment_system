@@ -1,0 +1,113 @@
+# Production stack for a single server. Structured so each piece can later be
+# lifted to the multi-node HA design (k3s for the app tier, Patroni for Postgres)
+# without changing the app. Run:  ./deploy.sh   (or: docker compose -f deploy/docker-compose.prod.yml up -d --build)
+name: payment
+
+x-app-env: &app-env
+  env_file: [.env]
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: payment
+    # Durability: real fsync + a named volume that survives restarts.
+    command: ["postgres", "-c", "max_connections=200"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment -d payment"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # Not published to the host: only reachable on the internal network.
+    expose: ["5432"]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    expose: ["6379"]
+
+  nats:
+    image: nats:2
+    restart: unless-stopped
+    command: ["-js", "-sd", "/data"]   # JetStream, durable store dir
+    volumes:
+      - natsdata:/data
+    expose: ["4222"]
+
+  payment-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: payment-system:latest
+    restart: unless-stopped
+    <<: *app-env
+    # Migrations run automatically on startup (sqlx holds an advisory lock, so
+    # scaling to >1 replica is safe). Scale with:  --scale payment-server=2
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    expose: ["8080"]
+    # Uploaded KYC documents (served only via the admin endpoint).
+    environment:
+      DOCUMENT_STORE_DIR: /data/kyc-docs
+    volumes:
+      - kycdocs:/data/kyc-docs
+
+  payment-workers:
+    image: payment-system:latest
+    restart: unless-stopped
+    <<: *app-env
+    entrypoint: ["/usr/local/bin/payment-workers"]
+    # Run EXACTLY ONE instance: the sealer assigns sequential checkpoint ids and
+    # is not safe to run concurrently (the outbox relay would be, via SKIP LOCKED).
+    depends_on:
+      postgres: { condition: service_healthy }
+      nats:     { condition: service_started }
+      payment-server: { condition: service_started }   # let the server migrate first
+    # Retention prunes orphaned KYC documents, so it needs the same volume the
+    # API writes them to.
+    environment:
+      DOCUMENT_STORE_DIR: /data/kyc-docs
+    volumes:
+      - kycdocs:/data/kyc-docs
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    # TLS terminates here; Caddy sets X-Forwarded-For to the real client IP
+    # (the app runs with TRUST_PROXY=true and reads the right-most hop).
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Admin console static build (run `npm run build` in console/ first;
+      # Caddy serves it at /admin).
+      - ../console/dist:/srv/admin:ro
+      - caddydata:/data
+      - caddyconfig:/config
+    depends_on:
+      payment-server: { condition: service_started }
+
+volumes:
+  pgdata:
+  redisdata:
+  natsdata:
+  caddydata:
+  caddyconfig:
+  kycdocs:

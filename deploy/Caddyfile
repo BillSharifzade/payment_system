@@ -1,0 +1,38 @@
+# Reverse proxy + TLS. Set SITE_ADDRESS to your domain (e.g. payments.example.com)
+# in .env and Caddy provisions a Let's Encrypt certificate automatically. Left as
+# ":80" it serves plain HTTP for an initial IP-based smoke test only — use a
+# domain + HTTPS before real traffic.
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	# Admin console: a static SPA served at /admin (auth happens in-app against
+	# the same-origin API, so no CORS). Tighten further by IP-allowlisting this
+	# block once you know your ops network.
+	handle_path /admin* {
+		root * /srv/admin
+		try_files {path} /index.html
+		file_server
+		header {
+			# blob: is needed for the KYC document viewer (documents are
+			# fetched with the Bearer token and rendered from object URLs).
+			# 'unsafe-inline' styles: React style={} attributes.
+			Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob:; frame-src blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+			X-Frame-Options "DENY"
+			Referrer-Policy "no-referrer"
+		}
+	}
+
+	# Load-balances across all payment-server replicas (Docker DNS returns one
+	# A record per replica; add more with `--scale payment-server=N`).
+	reverse_proxy payment-server:8080 {
+		lb_policy round_robin
+		health_uri /health
+		health_interval 5s
+		health_timeout 2s
+	}
+
+	# Caddy sets X-Forwarded-For to the client IP automatically. Since it is the
+	# only proxy hop, the right-most value (what the app trusts) is the real client.
+	header -Server
+	header X-Content-Type-Options nosniff
+}

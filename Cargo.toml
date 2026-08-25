@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/money",
+    "crates/ledger",
+    "crates/storage",
+    "crates/auth",
+    "crates/crypto",
+    "crates/workers",
+    "crates/api",
+]
+
+# Fatter release optimization: thin LTO + a single codegen unit typically buys
+# 5-15% on this kind of hash/serde/async-heavy workload, for slower builds.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[workspace.package]
+edition = "2021"
+license = "proprietary"
+rust-version = "1.96"
+
+[workspace.dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+proptest = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "macros", "migrate", "json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+axum = { version = "0.8", features = ["multipart"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tower-http = { version = "0.6", features = ["trace"] }
+deadpool-redis = "0.18"
+argon2 = "0.5"
+jsonwebtoken = "9"
+sha2 = "0.10"
+hex = "0.4"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+money = { path = "crates/money" }
+ledger = { path = "crates/ledger" }
+storage = { path = "crates/storage" }
+auth = { path = "crates/auth" }
+crypto = { path = "crates/crypto" }

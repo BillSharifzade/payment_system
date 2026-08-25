@@ -1,0 +1,28 @@
+# Rust
+/target/
+
+# Node / console
+node_modules/
+console/dist/
+
+# Android / mobile
+mobile/.gradle/
+mobile/.kotlin/
+mobile/build/
+mobile/*/build/
+mobile/local.properties
+mobile/captures/
+*.apk
+*.aab
+
+# Local dev artifacts
+kyc-documents/
+.env
+.env.*
+!.env.prod.example
+
+# Editors / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store

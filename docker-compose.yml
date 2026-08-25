@@ -1,0 +1,44 @@
+# Local development environment (§12.10 "Dev").
+#
+# This is the ONE-MACHINE dev stack — deliberately minimal. The production HA
+# datacenter topology (§12.4) is a separate, later concern and lives nowhere
+# near this file. Bring it up with:  docker compose up -d
+#
+# Only Postgres is here today because it is the only dependency with a consumer
+# (the `storage` crate). Redis and NATS get added when the code that needs them
+# (rate limiting, the async workers) actually lands.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: payment_pg_dev
+    environment:
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD: payment_dev_pw
+      POSTGRES_DB: payment
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment -d payment"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # Event bus for the outbox relay (transaction.posted events).
+  nats:
+    image: nats:2-alpine
+    container_name: payment_nats_dev
+    command: ["-js"] # enable JetStream
+    ports:
+      - "4222:4222"
+
+  # Shared store for multi-instance rate limiting (and later: sessions, hot reads).
+  redis:
+    image: redis:7-alpine
+    container_name: payment_redis_dev
+    ports:
+      - "6379:6379"
+
+volumes:
+  pg_data:

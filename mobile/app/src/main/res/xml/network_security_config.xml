@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Default (prod): no cleartext, ever. The dev flavor overrides this file to
+     allow HTTP only to the emulator-host loopback (10.0.2.2). -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

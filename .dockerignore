@@ -1,0 +1,6 @@
+target/
+.git/
+.github/
+deploy/
+scratchpad/
+**/*.swp

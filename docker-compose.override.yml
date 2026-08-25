@@ -1,0 +1,8 @@
+# Dev-box override: host port 5432 is occupied by another project's Postgres
+# (ats_booking_system), so the payment Postgres is published on 5439 instead.
+# Applied automatically by `docker compose up`. Use:
+#   DATABASE_URL=postgres://payment:payment_dev_pw@localhost:5439/payment
+services:
+  postgres:
+    ports: !override
+      - "5439:5432"
