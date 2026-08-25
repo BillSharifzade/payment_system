@@ -345,6 +345,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/refresh", post(refresh))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/wallets", post(create_wallet).get(list_wallets))
+        .route("/v1/config", get(client_config))
         .route("/v1/users/resolve", get(resolve_recipient))
         .route("/v1/accounts/{id}/balance", get(get_balance))
         .route(
@@ -1739,6 +1740,24 @@ async fn list_wallets(
     Ok(Json(wallets_of(&state, user_id).await?))
 }
 
+/// The pricing/config facts a client needs to render truthful previews.
+#[derive(Serialize)]
+struct ClientConfigResponse {
+    /// Transfer fee in basis points, deducted from what the recipient receives.
+    /// The client uses this for a display-only fee line; the server remains the
+    /// authority on what is actually charged.
+    transfer_fee_bps: u32,
+}
+
+async fn client_config(
+    AuthUser(_user_id): AuthUser,
+    State(state): State<AppState>,
+) -> ApiResult<Json<ClientConfigResponse>> {
+    Ok(Json(ClientConfigResponse {
+        transfer_fee_bps: state.fees.transfer_bps,
+    }))
+}
+
 #[derive(Deserialize)]
 struct ResolveParams {
     /// Look up a recipient by phone number (the "check number" flow).
@@ -1867,6 +1886,15 @@ struct StatementEntry {
     amount_minor: i64,
     currency: String,
     created_at_ms: i64,
+    /// What this movement was, from the viewing account's side: `transfer`
+    /// (another user), `deposit` (settlement top-up), `fx` (between the caller's
+    /// own wallets), `fee`, or `other`.
+    kind: String,
+    /// The other user's phone / verified name — only for `transfer` (both
+    /// parties to a transfer already know each other; system accounts and other
+    /// kinds expose nothing).
+    counterparty_phone: Option<String>,
+    counterparty_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1899,14 +1927,40 @@ async fn list_account_transactions(
         }
     };
 
-    let base = "SELECT id, transaction_id, direction, amount_minor, currency,
-                       created_at::text AS ts,
-                       (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS ms
-                FROM entries WHERE account_id = $1";
+    // Each entry is joined (LATERAL, both index-backed) to the most relevant
+    // *counterpart* entry of its transaction — opposite direction, preferring a
+    // user wallet — so the client can render "sent to / received from whom"
+    // instead of a bare debit/credit. The counterpart's verified name comes only
+    // from an approved KYC submission, mirroring `resolve_recipient`.
+    let base = "SELECT e.id, e.transaction_id, e.direction, e.amount_minor, e.currency,
+                       e.created_at::text AS ts,
+                       (EXTRACT(EPOCH FROM e.created_at) * 1000)::BIGINT AS ms,
+                       cp.account_type AS cp_type,
+                       cp.owner_user_id AS cp_owner,
+                       cp.phone AS cp_phone,
+                       cp.verified_name AS cp_name
+                FROM entries e
+                LEFT JOIN LATERAL (
+                    SELECT ca.account_type, ca.owner_user_id, u.phone,
+                           (SELECT ks.full_name FROM kyc_submissions ks
+                             WHERE ks.user_id = ca.owner_user_id AND ks.status = 'approved'
+                             ORDER BY ks.reviewed_at DESC NULLS LAST, ks.created_at DESC
+                             LIMIT 1) AS verified_name
+                    FROM entries ce
+                    JOIN accounts ca ON ca.id = ce.account_id
+                    LEFT JOIN users u ON u.id = ca.owner_user_id
+                    WHERE ce.transaction_id = e.transaction_id
+                      AND ce.account_id <> e.account_id
+                    ORDER BY (ce.direction <> e.direction) DESC,
+                             (ca.account_type = 'user_wallet') DESC,
+                             (ce.currency = e.currency) DESC
+                    LIMIT 1
+                ) cp ON TRUE
+                WHERE e.account_id = $1";
     let rows = match &cursor {
         None => {
             sqlx::query(&format!(
-                "{base} ORDER BY created_at DESC, id DESC LIMIT $2"
+                "{base} ORDER BY e.created_at DESC, e.id DESC LIMIT $2"
             ))
             .bind(id)
             .bind(limit)
@@ -1915,8 +1969,8 @@ async fn list_account_transactions(
         }
         Some((ts, eid)) => {
             sqlx::query(&format!(
-                "{base} AND (created_at, id) < ($3::timestamptz, $4)
-                 ORDER BY created_at DESC, id DESC LIMIT $2"
+                "{base} AND (e.created_at, e.id) < ($3::timestamptz, $4)
+                 ORDER BY e.created_at DESC, e.id DESC LIMIT $2"
             ))
             .bind(id)
             .bind(limit)
@@ -1938,13 +1992,39 @@ async fn list_account_transactions(
     for row in rows {
         let entry_id: Uuid = row.try_get("id").map_err(StorageError::from)?;
         let ts: String = row.try_get("ts").map_err(StorageError::from)?;
+        let direction: String = row.try_get("direction").map_err(StorageError::from)?;
+        let cp_type: Option<String> = row.try_get("cp_type").map_err(StorageError::from)?;
+        let cp_owner: Option<Uuid> = row.try_get("cp_owner").map_err(StorageError::from)?;
+
+        let kind = match (cp_type.as_deref(), cp_owner) {
+            // The caller's own other wallet — only FX moves money between them.
+            (Some("user_wallet"), Some(owner)) if owner == user_id => "fx",
+            (Some("user_wallet"), _) => "transfer",
+            (Some("system_settlement"), _) if direction == "credit" => "deposit",
+            (Some("system_settlement"), _) => "withdrawal",
+            (Some("system_fx_gain_loss"), _) => "fx",
+            (Some("system_fee_revenue"), _) => "fee",
+            _ => "other",
+        };
+        let (counterparty_phone, counterparty_name) = if kind == "transfer" {
+            (
+                row.try_get("cp_phone").map_err(StorageError::from)?,
+                row.try_get("cp_name").map_err(StorageError::from)?,
+            )
+        } else {
+            (None, None)
+        };
+
         entries.push(StatementEntry {
             entry_id,
             transaction_id: row.try_get("transaction_id").map_err(StorageError::from)?,
-            direction: row.try_get("direction").map_err(StorageError::from)?,
+            direction,
             amount_minor: row.try_get("amount_minor").map_err(StorageError::from)?,
             currency: row.try_get("currency").map_err(StorageError::from)?,
             created_at_ms: row.try_get("ms").map_err(StorageError::from)?,
+            kind: kind.to_string(),
+            counterparty_phone,
+            counterparty_name,
         });
         last = Some((ts, entry_id));
     }

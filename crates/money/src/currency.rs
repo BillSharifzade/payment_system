@@ -34,7 +34,7 @@ impl Currency {
     pub const fn tjs() -> Self {
         Self {
             // Safe: "TJS" is three ASCII uppercase letters.
-            code: CurrencyCode([b'T', b'J', b'S']),
+            code: CurrencyCode(*b"TJS"),
             exponent: 2,
         }
     }

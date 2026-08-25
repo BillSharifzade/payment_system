@@ -2054,3 +2054,137 @@ async fn page_phone(app: &axum::Router, admin: &str, user_id: &str) -> String {
         .map(|u| u["phone"].as_str().unwrap().to_string())
         .expect("freshly registered user must be on the first page")
 }
+
+/// A user's phone, read straight from the DB (test-only shortcut).
+async fn db_phone(pool: &PgPool, user_id: &str) -> String {
+    sqlx::query_scalar("SELECT phone FROM users WHERE id = $1")
+        .bind(Uuid::parse_str(user_id).unwrap())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL (docker compose up -d)"]
+async fn statement_is_enriched_with_kind_and_counterparty() {
+    let _fx = FX_RATE_LOCK.lock().await;
+    let (app, pool) = app().await;
+    let admin = admin_token(&app, &pool).await;
+
+    let (alice_id, alice_tok) = register(&app).await;
+    let alice_wallet = create_wallet(&app, &alice_tok).await;
+    approve_named_kyc(&pool, &alice_id, "Alice Statement").await;
+    let (bob_id, bob_tok) = register(&app).await;
+    let bob_wallet = create_wallet(&app, &bob_tok).await;
+    approve_named_kyc(&pool, &bob_id, "Bobojon Qurbonov").await;
+    let alice_phone = db_phone(&pool, &alice_id).await;
+    let bob_phone = db_phone(&pool, &bob_id).await;
+
+    // Fund Alice, then she pays Bob.
+    admin_deposit(&app, &admin, &alice_wallet, 10_000).await;
+    let (s, body) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/transfers",
+            Some(&alice_tok),
+            Some(&Uuid::new_v4().to_string()),
+            json!({
+                "from_account": alice_wallet, "to_account": bob_wallet,
+                "amount_minor": 2_500, "currency": "TJS"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "transfer: {body}");
+
+    // Alice's statement, newest first: [transfer out to Bob, deposit].
+    let (s, body) = send(
+        &app,
+        req(
+            "GET",
+            &format!("/v1/accounts/{alice_wallet}/transactions"),
+            Some(&alice_tok),
+            None,
+            Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "alice statement: {body}");
+    let entries = body["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "alice entries: {body}");
+    assert_eq!(entries[0]["kind"], "transfer");
+    assert_eq!(entries[0]["direction"], "debit");
+    assert_eq!(entries[0]["counterparty_phone"], json!(bob_phone));
+    assert_eq!(entries[0]["counterparty_name"], "Bobojon Qurbonov");
+    assert_eq!(entries[1]["kind"], "deposit");
+    assert_eq!(entries[1]["direction"], "credit");
+    // System counterparts expose nothing.
+    assert!(entries[1]["counterparty_phone"].is_null());
+    assert!(entries[1]["counterparty_name"].is_null());
+
+    // Bob's side of the same transfer: received from Alice, with her identity.
+    let (s, body) = send(
+        &app,
+        req(
+            "GET",
+            &format!("/v1/accounts/{bob_wallet}/transactions"),
+            Some(&bob_tok),
+            None,
+            Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "bob statement: {body}");
+    let entries = body["entries"].as_array().unwrap();
+    assert_eq!(entries[0]["kind"], "transfer");
+    assert_eq!(entries[0]["direction"], "credit");
+    assert_eq!(entries[0]["counterparty_phone"], json!(alice_phone));
+    assert_eq!(entries[0]["counterparty_name"], "Alice Statement");
+
+    // FX between Alice's own wallets is kind "fx" on both sides, no counterparty.
+    let (s, body) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/admin/fx-rates",
+            Some(&admin),
+            None,
+            json!({"base": "TJS", "quote": "USD", "rate_num": 917, "rate_den": 10_000}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "set rate: {body}");
+    let alice_usd = create_wallet_cur(&app, &alice_tok, "USD").await;
+    let (s, body) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/fx",
+            Some(&alice_tok),
+            Some(&Uuid::new_v4().to_string()),
+            json!({"from_account": alice_wallet, "to_account": alice_usd, "amount_minor": 1_000}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "fx: {body}");
+
+    for wallet in [&alice_wallet, &alice_usd] {
+        let (s, body) = send(
+            &app,
+            req(
+                "GET",
+                &format!("/v1/accounts/{wallet}/transactions?limit=1"),
+                Some(&alice_tok),
+                None,
+                Value::Null,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "fx statement: {body}");
+        let e = &body["entries"][0];
+        assert_eq!(e["kind"], "fx", "wallet {wallet}: {body}");
+        assert!(e["counterparty_phone"].is_null());
+        assert!(e["counterparty_name"].is_null());
+    }
+}
