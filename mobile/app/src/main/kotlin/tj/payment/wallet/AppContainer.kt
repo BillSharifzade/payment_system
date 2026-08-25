@@ -3,7 +3,9 @@ package tj.payment.wallet
 import android.content.Context
 import tj.payment.wallet.data.ApiClient
 import tj.payment.wallet.data.AuthRepository
+import tj.payment.wallet.data.PendingPaymentPrefsStore
 import tj.payment.wallet.data.SecureSession
+import tj.payment.wallet.data.WalletRepository
 
 /**
  * Manual dependency graph — deliberately no Hilt/Dagger. For an app this size,
@@ -15,8 +17,11 @@ import tj.payment.wallet.data.SecureSession
 class AppContainer(context: Context) {
     private val appContext = context.applicationContext
 
-    private val session: SecureSession by lazy { SecureSession(appContext) }
+    val session: SecureSession by lazy { SecureSession(appContext) }
     private val api: ApiClient by lazy { ApiClient(BuildConfig.API_BASE_URL, session) }
 
     val authRepository: AuthRepository by lazy { AuthRepository(api, session) }
+    val walletRepository: WalletRepository by lazy {
+        WalletRepository(api, PendingPaymentPrefsStore(appContext))
+    }
 }

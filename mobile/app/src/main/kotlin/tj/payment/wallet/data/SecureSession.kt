@@ -37,14 +37,21 @@ class SecureSession(context: Context) {
 
     fun refreshToken(): String? = prefs.getString(KEY_REFRESH, null)
     fun userId(): String? = prefs.getString(KEY_USER, null)
+    fun phone(): String? = prefs.getString(KEY_PHONE, null)
     fun hasPersistedSession(): Boolean = refreshToken() != null
 
-    /** Persist the durable half of a session (after login or a token rotation). */
-    fun persist(userId: String, refreshToken: String) {
+    /** Persist the rotating half of a session (login and every token rotation). */
+    fun persistTokens(userId: String, refreshToken: String) {
         prefs.edit()
             .putString(KEY_USER, userId)
             .putString(KEY_REFRESH, refreshToken)
             .apply()
+    }
+
+    /** The signed-in phone number (digits-only) — set at login/register, shown on
+     * the Receive screen so the user can tell a sender what to type. */
+    fun persistPhone(phone: String) {
+        prefs.edit().putString(KEY_PHONE, phone).apply()
     }
 
     /** Wipe everything — logout, or a refresh rejected as a revoked family. */
@@ -56,5 +63,6 @@ class SecureSession(context: Context) {
     private companion object {
         const val KEY_REFRESH = "refresh_token"
         const val KEY_USER = "user_id"
+        const val KEY_PHONE = "phone"
     }
 }

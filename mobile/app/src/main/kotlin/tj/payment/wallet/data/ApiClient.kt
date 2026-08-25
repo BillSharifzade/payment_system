@@ -8,20 +8,33 @@ import kotlinx.serialization.json.Json
 import okhttp3.Authenticator
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.Route
+import tj.payment.core.AccountResponse
 import tj.payment.core.ApiOutcome
+import tj.payment.core.ClientConfigResponse
+import tj.payment.core.CreateWalletRequest
 import tj.payment.core.CredentialsRequest
+import tj.payment.core.DocumentResponse
 import tj.payment.core.ErrorCode
 import tj.payment.core.ErrorEnvelope
-import tj.payment.core.map
+import tj.payment.core.FxRateDto
+import tj.payment.core.FxRequest
+import tj.payment.core.FxResponse
+import tj.payment.core.KycStatusResponse
+import tj.payment.core.PostResponse
 import tj.payment.core.RefreshRequest
 import tj.payment.core.ResolveResponse
+import tj.payment.core.StatementResponse
+import tj.payment.core.SubmitKycRequest
 import tj.payment.core.TokenResponse
+import tj.payment.core.TransferRequest
 import tj.payment.core.WalletDto
+import tj.payment.core.map
 
 /**
  * The single HTTP boundary to the payment backend. Thin on purpose: OkHttp +
@@ -53,22 +66,42 @@ class ApiClient(
     // --- Public endpoints (no bearer) ---
 
     suspend fun register(phone: String, password: String): ApiOutcome<TokenResponse> =
-        postJson("/v1/auth/register", CredentialsRequest(phone, password), authed = false)
-            .decode(TokenResponse.serializer())
+        postJson(
+            "/v1/auth/register",
+            json.encodeToString(CredentialsRequest.serializer(), CredentialsRequest(phone, password)),
+            authed = false,
+        ).decode(TokenResponse.serializer())
 
     suspend fun login(phone: String, password: String): ApiOutcome<TokenResponse> =
-        postJson("/v1/auth/login", CredentialsRequest(phone, password), authed = false)
-            .decode(TokenResponse.serializer())
-
-    // --- Authenticated endpoints ---
+        postJson(
+            "/v1/auth/login",
+            json.encodeToString(CredentialsRequest.serializer(), CredentialsRequest(phone, password)),
+            authed = false,
+        ).decode(TokenResponse.serializer())
 
     suspend fun logout(refreshToken: String): ApiOutcome<Unit> =
-        postJson("/v1/auth/logout", RefreshRequest(refreshToken), authed = false)
-            .map { }
+        postJson(
+            "/v1/auth/logout",
+            json.encodeToString(RefreshRequest.serializer(), RefreshRequest(refreshToken)),
+            authed = false,
+        ).map { }
+
+    // --- Authenticated endpoints ---
 
     suspend fun wallets(): ApiOutcome<List<WalletDto>> =
         get("/v1/wallets", authed = true)
             .decode(kotlinx.serialization.builtins.ListSerializer(WalletDto.serializer()))
+
+    suspend fun createWallet(currency: String): ApiOutcome<AccountResponse> =
+        postJson(
+            "/v1/wallets",
+            json.encodeToString(CreateWalletRequest.serializer(), CreateWalletRequest(currency)),
+            authed = true,
+        ).decode(AccountResponse.serializer())
+
+    suspend fun config(): ApiOutcome<ClientConfigResponse> =
+        get("/v1/config", authed = true)
+            .decode(ClientConfigResponse.serializer())
 
     /** The "check number" / QR-scan lookup used by the send flow. */
     suspend fun resolveByPhone(phone: String): ApiOutcome<ResolveResponse> =
@@ -79,24 +112,81 @@ class ApiClient(
         get("/v1/users/resolve?wallet=${walletId.urlEncode()}", authed = true)
             .decode(ResolveResponse.serializer())
 
+    /** One page of an account's statement, newest first. */
+    suspend fun statement(
+        accountId: String,
+        cursor: String?,
+        limit: Int,
+    ): ApiOutcome<StatementResponse> {
+        val query = buildString {
+            append("?limit=").append(limit)
+            if (cursor != null) append("&cursor=").append(cursor.urlEncode())
+        }
+        return get("/v1/accounts/${accountId.urlEncode()}/transactions$query", authed = true)
+            .decode(StatementResponse.serializer())
+    }
+
+    /** Post a transfer. [idempotencyKey] comes from the PaymentSubmitter — the
+     * same key MUST be resent on retries so the server charges at most once. */
+    suspend fun transfer(request: TransferRequest, idempotencyKey: String): ApiOutcome<PostResponse> =
+        postJson(
+            "/v1/transfers",
+            json.encodeToString(TransferRequest.serializer(), request),
+            authed = true,
+            idempotencyKey = idempotencyKey,
+        ).decode(PostResponse.serializer())
+
+    suspend fun kycStatus(): ApiOutcome<KycStatusResponse> =
+        get("/v1/kyc", authed = true)
+            .decode(KycStatusResponse.serializer())
+
+    /** Upload an identity document (multipart field `file`). */
+    suspend fun uploadKycDocument(bytes: ByteArray, mimeType: String): ApiOutcome<DocumentResponse> {
+        val body = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("file", "document", bytes.toRequestBody(mimeType.toMediaType()))
+            .build()
+        val request = Request.Builder().url("$baseUrl/v1/kyc/documents").post(body).build()
+        return execute(request).decode(DocumentResponse.serializer())
+    }
+
+    suspend fun submitKyc(request: SubmitKycRequest): ApiOutcome<tj.payment.core.KycSubmissionDto> =
+        postJson(
+            "/v1/kyc/submissions",
+            json.encodeToString(SubmitKycRequest.serializer(), request),
+            authed = true,
+        ).decode(tj.payment.core.KycSubmissionDto.serializer())
+
+    suspend fun fxRates(): ApiOutcome<List<FxRateDto>> =
+        get("/v1/fx/rates", authed = true)
+            .decode(kotlinx.serialization.builtins.ListSerializer(FxRateDto.serializer()))
+
+    /** Convert between the caller's own wallets. Same idempotency contract as [transfer]. */
+    suspend fun fx(request: FxRequest, idempotencyKey: String): ApiOutcome<FxResponse> =
+        postJson(
+            "/v1/fx",
+            json.encodeToString(FxRequest.serializer(), request),
+            authed = true,
+            idempotencyKey = idempotencyKey,
+        ).decode(FxResponse.serializer())
+
     // --- Plumbing ---
 
     private data class Raw(val status: Int, val body: String)
 
     private suspend fun postJson(
         path: String,
-        body: Any,
+        payload: String,
         authed: Boolean,
+        idempotencyKey: String? = null,
     ): ApiOutcome<Raw> {
-        val payload = when (body) {
-            is CredentialsRequest -> json.encodeToString(CredentialsRequest.serializer(), body)
-            is RefreshRequest -> json.encodeToString(RefreshRequest.serializer(), body)
-            else -> error("unsupported body type: ${body::class}")
-        }
         val request = Request.Builder()
             .url(baseUrl + path)
             .post(payload.toRequestBody(jsonMedia))
-            .apply { if (!authed) header(NO_AUTH_HEADER, "1") }
+            .apply {
+                if (!authed) header(NO_AUTH_HEADER, "1")
+                if (idempotencyKey != null) header("Idempotency-Key", idempotencyKey)
+            }
             .build()
         return execute(request)
     }
@@ -205,7 +295,7 @@ class ApiClient(
                     return null
                 }
                 session.setAccessToken(newTokens.accessToken)
-                session.persist(newTokens.userId, newTokens.refreshToken)
+                session.persistTokens(newTokens.userId, newTokens.refreshToken)
                 return response.request.withBearer(newTokens.accessToken)
             }
         }

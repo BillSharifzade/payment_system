@@ -26,6 +26,8 @@ android {
             // The emulator reaches services on the host machine at 10.0.2.2.
             buildConfigField("String", "API_BASE_URL", "\"http://10.0.2.2:8099\"")
             buildConfigField("boolean", "ALLOW_CLEARTEXT", "true")
+            // Screenshots allowed so the emulator QA loop (adb screencap) works.
+            buildConfigField("boolean", "SECURE_WINDOW", "false")
         }
         create("staging") {
             dimension = "env"
@@ -35,12 +37,16 @@ android {
             // on the same network. HTTP for now — a bare LAN IP can't get TLS.
             buildConfigField("String", "API_BASE_URL", "\"http://192.168.1.156:8099\"")
             buildConfigField("boolean", "ALLOW_CLEARTEXT", "true")
+            buildConfigField("boolean", "SECURE_WINDOW", "false")
         }
         create("prod") {
             dimension = "env"
             // Placeholder until a real (public, TLS) server exists; HTTPS + pinning only.
             buildConfigField("String", "API_BASE_URL", "\"https://api.example.tj\"")
             buildConfigField("boolean", "ALLOW_CLEARTEXT", "false")
+            // Real users' balances never appear in screenshots or app-switcher
+            // thumbnails.
+            buildConfigField("boolean", "SECURE_WINDOW", "true")
         }
     }
 

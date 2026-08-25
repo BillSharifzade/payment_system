@@ -16,10 +16,10 @@ class AuthRepository(
     fun hasPersistedSession(): Boolean = session.hasPersistedSession()
 
     suspend fun login(phone: String, password: String): ApiOutcome<Unit> =
-        adopt(api.login(phone, password))
+        adopt(api.login(phone, password), phone)
 
     suspend fun register(phone: String, password: String): ApiOutcome<Unit> =
-        adopt(api.register(phone, password))
+        adopt(api.register(phone, password), phone)
 
     /**
      * Re-establish a session at launch from the persisted refresh token. With no
@@ -50,11 +50,12 @@ class AuthRepository(
         session.clear()
     }
 
-    private fun adopt(outcome: ApiOutcome<TokenResponse>): ApiOutcome<Unit> = when (outcome) {
+    private fun adopt(outcome: ApiOutcome<TokenResponse>, phone: String): ApiOutcome<Unit> = when (outcome) {
         is ApiOutcome.Ok -> {
             val t = outcome.value
             session.setAccessToken(t.accessToken)
-            session.persist(t.userId, t.refreshToken)
+            session.persistTokens(t.userId, t.refreshToken)
+            session.persistPhone(phone)
             ApiOutcome.Ok(Unit)
         }
         is ApiOutcome.Failed -> ApiOutcome.Failed(outcome.code, outcome.httpStatus, outcome.serverMessage)

@@ -6,6 +6,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -37,7 +38,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import tj.payment.core.WalletDto
-import tj.payment.wallet.ui.theme.NegativeRed
+import tj.payment.wallet.ui.ActionButton
+import tj.payment.wallet.ui.ErrorRetry
+import tj.payment.wallet.ui.GlyphArrow
+import tj.payment.wallet.ui.GlyphList
+import tj.payment.wallet.ui.GlyphSwap
+import tj.payment.wallet.ui.TransactionRow
 import tj.payment.wallet.ui.theme.Rust
 import tj.payment.wallet.ui.theme.RustBright
 
@@ -45,6 +51,11 @@ import tj.payment.wallet.ui.theme.RustBright
 fun HomeScreen(
     viewModel: HomeViewModel,
     onLoggedOut: () -> Unit,
+    onSend: () -> Unit,
+    onReceive: () -> Unit,
+    onHistory: (walletId: String) -> Unit,
+    onConvert: () -> Unit,
+    onKyc: () -> Unit,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
 
@@ -53,58 +64,53 @@ fun HomeScreen(
         return
     }
 
-    Column(
+    LazyColumn(
         modifier = Modifier
             .fillMaxSize()
             .padding(horizontal = 20.dp),
     ) {
-        Spacer(Modifier.height(28.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                text = "Your wallets",
-                style = MaterialTheme.typography.headlineMedium,
-                color = MaterialTheme.colorScheme.onBackground,
-            )
-            TextButton(onClick = viewModel::logout) {
-                Text("Sign out", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        item(key = "header") {
+            Spacer(Modifier.height(24.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Your money",
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = MaterialTheme.colorScheme.onBackground,
+                )
+                TextButton(onClick = viewModel::logout) {
+                    Text("Sign out", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+        }
+
+        // Identity: nudge level-0 users toward verification, show review state.
+        if (state.kycLevel == 0) {
+            item(key = "kyc-banner") {
+                KycBanner(pending = state.kycPending, onClick = onKyc)
+                Spacer(Modifier.height(16.dp))
             }
         }
 
-        Spacer(Modifier.height(16.dp))
-
         when {
-            state.loading -> Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(180.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                CircularProgressIndicator(color = Rust)
+            state.loading && state.wallets.isEmpty() -> item(key = "loading") {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(180.dp),
+                    contentAlignment = Alignment.Center,
+                ) { CircularProgressIndicator(color = Rust) }
             }
 
-            state.error != null -> Column {
-                Text(
-                    state.error ?: "",
-                    color = NegativeRed,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Spacer(Modifier.height(8.dp))
-                TextButton(onClick = viewModel::refresh) {
-                    Text("Retry", color = Rust)
-                }
+            state.error != null -> item(key = "error") {
+                ErrorRetry(state.error ?: "", onRetry = viewModel::refresh)
             }
 
-            state.wallets.isEmpty() -> Text(
-                "No wallets yet.",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodyMedium,
-            )
-
-            else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            else -> {
                 itemsIndexed(state.wallets, key = { _, w -> w.id }) { index, wallet ->
                     val visible = remember {
                         MutableTransitionState(false).apply { targetState = true }
@@ -114,10 +120,88 @@ fun HomeScreen(
                         enter = fadeIn(tween(350, delayMillis = index * 60)) +
                             slideInVertically(tween(350, delayMillis = index * 60)) { it / 4 },
                     ) {
-                        WalletCard(wallet, primary = index == 0)
+                        Column {
+                            WalletCard(wallet, primary = index == 0)
+                            Spacer(Modifier.height(14.dp))
+                        }
                     }
                 }
+
+                item(key = "actions") {
+                    Spacer(Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                    ) {
+                        ActionButton("Send", onClick = onSend) { GlyphArrow(up = true) }
+                        ActionButton("Receive", onClick = onReceive) { GlyphArrow(up = false) }
+                        ActionButton("History", onClick = {
+                            state.primaryWallet?.let { onHistory(it.id) }
+                        }) { GlyphList() }
+                        ActionButton("Convert", onClick = onConvert) { GlyphSwap() }
+                    }
+                    Spacer(Modifier.height(24.dp))
+                }
+
+                if (state.recent.isNotEmpty()) {
+                    item(key = "recent-header") {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "Recent",
+                                style = MaterialTheme.typography.titleLarge,
+                                color = MaterialTheme.colorScheme.onBackground,
+                            )
+                            TextButton(onClick = {
+                                state.primaryWallet?.let { onHistory(it.id) }
+                            }) { Text("See all", color = Rust) }
+                        }
+                    }
+                    itemsIndexed(state.recent, key = { _, e -> e.entryId }) { _, entry ->
+                        TransactionRow(entry)
+                    }
+                    item(key = "recent-bottom") { Spacer(Modifier.height(24.dp)) }
+                }
             }
+        }
+    }
+}
+
+@Composable
+private fun KycBanner(pending: Boolean, onClick: () -> Unit) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = !pending, onClick = onClick),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (pending) {
+                MaterialTheme.colorScheme.surface
+            } else {
+                Rust.copy(alpha = 0.16f)
+            },
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text(
+                text = if (pending) "Verification under review" else "Verify your identity",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = if (pending) {
+                    "We're checking your document. This usually takes less than a day."
+                } else {
+                    "Sending money requires a one-time identity check. Tap to start."
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }

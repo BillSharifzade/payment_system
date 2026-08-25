@@ -60,3 +60,128 @@ data class ErrorEnvelope(val error: ErrorBody) {
         val message: String? = null,
     )
 }
+
+@Serializable
+data class CreateWalletRequest(val currency: String)
+
+@Serializable
+data class AccountResponse(
+    val id: String,
+    val currency: String,
+)
+
+/**
+ * One row of GET /v1/accounts/{id}/transactions. The server classifies the
+ * movement from this account's point of view ([kind]) and names the other user
+ * for transfers, so History can say who — not just debit/credit.
+ */
+@Serializable
+data class StatementEntryDto(
+    @SerialName("entry_id") val entryId: String,
+    @SerialName("transaction_id") val transactionId: String,
+    /** "debit" (money out) or "credit" (money in). */
+    val direction: String,
+    @SerialName("amount_minor") val amountMinor: Long,
+    val currency: String,
+    @SerialName("created_at_ms") val createdAtMs: Long,
+    /** "transfer" | "deposit" | "fx" | "fee" | "withdrawal" | "other". */
+    val kind: String = "other",
+    @SerialName("counterparty_phone") val counterpartyPhone: String? = null,
+    @SerialName("counterparty_name") val counterpartyName: String? = null,
+) {
+    val isCredit: Boolean get() = direction == "credit"
+
+    fun money(): Money = Money.ofMinor(amountMinor, Currency.of(currency))
+}
+
+@Serializable
+data class StatementResponse(
+    val entries: List<StatementEntryDto>,
+    /** Pass back as `cursor` for the next (older) page; null on the last page. */
+    @SerialName("next_cursor") val nextCursor: String? = null,
+)
+
+@Serializable
+data class TransferRequest(
+    @SerialName("from_account") val fromAccount: String,
+    @SerialName("to_account") val toAccount: String,
+    @SerialName("amount_minor") val amountMinor: Long,
+    val currency: String,
+)
+
+/** Response of POST /v1/transfers — "posted", or "already_posted" on a replay. */
+@Serializable
+data class PostResponse(
+    @SerialName("transaction_id") val transactionId: String,
+    val status: String,
+)
+
+@Serializable
+data class KycSubmissionDto(
+    val id: String,
+    /** "pending" | "approved" | "rejected". */
+    val status: String,
+    @SerialName("requested_level") val requestedLevel: Int,
+)
+
+@Serializable
+data class KycStatusResponse(
+    @SerialName("kyc_level") val kycLevel: Int,
+    @SerialName("latest_submission") val latestSubmission: KycSubmissionDto? = null,
+)
+
+@Serializable
+data class SubmitKycRequest(
+    @SerialName("requested_level") val requestedLevel: Int,
+    @SerialName("full_name") val fullName: String,
+    @SerialName("document_type") val documentType: String,
+    @SerialName("document_ref") val documentRef: String,
+)
+
+/** Response of POST /v1/kyc/documents (multipart upload). */
+@Serializable
+data class DocumentResponse(
+    @SerialName("document_ref") val documentRef: String,
+)
+
+/**
+ * One admin-set FX rate: `quote_minor = base_minor * rateNum / rateDen`,
+ * floored — integer math end to end, mirroring the backend exactly.
+ */
+@Serializable
+data class FxRateDto(
+    val base: String,
+    val quote: String,
+    @SerialName("rate_num") val rateNum: Long,
+    @SerialName("rate_den") val rateDen: Long,
+    @SerialName("updated_at_ms") val updatedAtMs: Long,
+) {
+    /** The floored conversion the backend will apply, or null on overflow. */
+    fun convert(baseMinor: Long): Long? = try {
+        Math.multiplyExact(baseMinor, rateNum) / rateDen
+    } catch (_: ArithmeticException) {
+        null
+    }
+}
+
+@Serializable
+data class FxRequest(
+    @SerialName("from_account") val fromAccount: String,
+    @SerialName("to_account") val toAccount: String,
+    @SerialName("amount_minor") val amountMinor: Long,
+)
+
+@Serializable
+data class FxResponse(
+    @SerialName("transaction_id") val transactionId: String,
+    @SerialName("debited_minor") val debitedMinor: Long,
+    @SerialName("credited_minor") val creditedMinor: Long,
+    @SerialName("from_currency") val fromCurrency: String,
+    @SerialName("to_currency") val toCurrency: String,
+)
+
+/** Response of GET /v1/config — server-owned pricing facts for previews. */
+@Serializable
+data class ClientConfigResponse(
+    @SerialName("transfer_fee_bps") val transferFeeBps: Int = 0,
+)

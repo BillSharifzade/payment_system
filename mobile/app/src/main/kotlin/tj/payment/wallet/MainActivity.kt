@@ -20,6 +20,16 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         requestHighestRefreshRate()
 
+        // Balances and payment details never appear in screenshots, screen
+        // recordings, or the recent-apps switcher on production builds. Test
+        // flavors keep screenshots so the emulator QA loop still works.
+        if (BuildConfig.SECURE_WINDOW) {
+            window.setFlags(
+                android.view.WindowManager.LayoutParams.FLAG_SECURE,
+                android.view.WindowManager.LayoutParams.FLAG_SECURE,
+            )
+        }
+
         val container = (application as PaymentApp).container
         setContent {
             PaymentTheme {
