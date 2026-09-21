@@ -19,7 +19,10 @@ ignore = [
 # Multiple versions of the same crate are a warning, not a hard failure (common
 # and usually benign in a large dependency tree).
 multiple-versions = "warn"
-wildcard = "deny"
+wildcards = "deny"
+# Our own crates depend on each other by workspace path (no version), which
+# cargo-deny would otherwise count as a wildcard requirement.
+allow-wildcard-paths = true
 
 [licenses]
 # Permissive licenses we accept for dependencies. Our own crates are proprietary.
@@ -35,6 +38,9 @@ allow = [
     "Zlib",
     "MPL-2.0",
     "CC0-1.0",
+    # webpki-roots: the Mozilla root-certificate bundle (data, not code) that
+    # rustls-based TLS in sqlx carries. Permissive data licence.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 # Our workspace crates are marked `license = "proprietary"`, which is not an SPDX
