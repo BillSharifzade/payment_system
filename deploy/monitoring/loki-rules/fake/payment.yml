@@ -1,0 +1,70 @@
+# Loki ruler: log-based alerts, evaluated by Loki and sent to Alertmanager.
+# Labels come from promtail (deploy/monitoring/promtail-config.yml):
+#   project = compose project ("payment"), service = compose service name.
+# The two integrity lines are the money-integrity tripwires from deploy/README.md.
+groups:
+  - name: payment-ledger-integrity
+    interval: 1m
+    rules:
+      - alert: ReconciliationFailed
+        expr: |
+          sum(count_over_time({project="payment", service="payment-workers"} |= "RECONCILIATION FAILED" [5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ledger reconciliation FAILED"
+          description: >-
+            payment-workers logged RECONCILIATION FAILED in the last 5 minutes:
+            balances no longer sum to zero per currency or do not match their
+            entries. Page a human. Do not restart anything before the ledger has
+            been inspected (deploy/restore-drill.sh runs the same checks against
+            the last backup).
+
+      - alert: ChainVerificationFailed
+        expr: |
+          sum(count_over_time({project="payment", service="payment-workers"} |= "CHAIN VERIFICATION FAILED" [5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Checkpoint chain verification FAILED (possible tampering)"
+          description: >-
+            A signed checkpoint failed the independent re-verification. Treat as a
+            security incident: preserve the database and logs before acting.
+
+      - alert: NoCheckpointsSealed
+        # The sealer only logs this line when it sealed at least one batch, so a
+        # genuinely idle ledger (no transactions for 15 min) also fires this. It
+        # is a liveness hint; the precise signal is the Prometheus alert
+        # LedgerSealingLagging (ledger_oldest_unsealed_age_seconds > 300).
+        expr: |
+          absent_over_time({project="payment", service="payment-workers"} |= "sealed new checkpoints" [15m]) == 1
+        labels:
+          severity: warning
+        annotations:
+          summary: "No 'sealed new checkpoints' log line for 15 minutes"
+          description: >-
+            payment-workers has not sealed a checkpoint in 15 minutes. Check
+            `docker compose logs payment-workers` and the ledger_unsealed_transactions
+            metric: harmless when there was no traffic, an outage otherwise.
+
+  - name: payment-containers
+    interval: 1m
+    rules:
+      - alert: ContainerRestarted
+        # Every service prints exactly one "ready" banner per start; seeing it
+        # more than once in 15 minutes means the container restarted (crash
+        # loop, OOM kill, ...). Postgres prints its banner twice on the very
+        # first initialisation of a fresh volume — a one-off false positive.
+        expr: |
+          sum by (service) (
+            count_over_time({project="payment"}
+              |~ "metrics exporter listening|database system is ready to accept connections|Ready to accept connections|Server is ready|serving initial configuration"
+            [15m])
+          ) > 1
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} restarted"
+          description: >-
+            {{ $labels.service }} started {{ $value }} times in the last 15 minutes.
+            `docker compose ps` + `docker compose logs --tail=200 {{ $labels.service }}`.

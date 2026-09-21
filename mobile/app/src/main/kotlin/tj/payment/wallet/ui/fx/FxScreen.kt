@@ -162,7 +162,13 @@ fun FxScreen(
 
                 state.actionError?.let {
                     Spacer(Modifier.height(10.dp))
-                    Text(it, color = NegativeRed, style = MaterialTheme.typography.bodyMedium)
+                    // An unknown outcome is a caution (check balances, same-key
+                    // retry is safe), not a refusal — rust, not red.
+                    Text(
+                        it,
+                        color = if (state.outcomeUnknown) Rust else NegativeRed,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
                 }
 
                 state.result?.let { r ->

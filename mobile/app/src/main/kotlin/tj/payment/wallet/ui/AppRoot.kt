@@ -12,6 +12,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.createSavedStateHandle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -50,6 +51,23 @@ private object Routes {
 fun AppRoot(container: AppContainer) {
     val nav = rememberNavController()
 
+    // Every sign-out — an explicit logout, or a refresh the server refused, from
+    // whichever thread noticed — routes to Login from here, once, in an effect.
+    // No screen navigates during composition.
+    LaunchedEffect(Unit) {
+        container.session.signedOut.collect { signedOut ->
+            if (!signedOut) return@collect
+            container.walletRepository.clearCache()
+            if (nav.currentBackStackEntry?.destination?.route != Routes.LOGIN) {
+                nav.navigate(Routes.LOGIN) {
+                    popUpTo(0) { inclusive = true }
+                    launchSingleTop = true
+                }
+            }
+            container.session.consumeSignedOut()
+        }
+    }
+
     val slideDuration = 300
     NavHost(
         navController = nav,
@@ -72,11 +90,20 @@ fun AppRoot(container: AppContainer) {
         composable(Routes.GATE) {
             GateScreen(
                 repo = container.authRepository,
+                signedOutPending = { container.session.signedOut.value },
+                // launchSingleTop: the signed-out observer above may already have
+                // routed to Login by the time restore() returns — never stack two.
                 toHome = {
-                    nav.navigate(Routes.HOME) { popUpTo(Routes.GATE) { inclusive = true } }
+                    nav.navigate(Routes.HOME) {
+                        popUpTo(Routes.GATE) { inclusive = true }
+                        launchSingleTop = true
+                    }
                 },
                 toLogin = {
-                    nav.navigate(Routes.LOGIN) { popUpTo(Routes.GATE) { inclusive = true } }
+                    nav.navigate(Routes.LOGIN) {
+                        popUpTo(Routes.GATE) { inclusive = true }
+                        launchSingleTop = true
+                    }
                 },
             )
         }
@@ -88,15 +115,16 @@ fun AppRoot(container: AppContainer) {
         }
         composable(Routes.HOME) {
             val vm = viewModel {
-                HomeViewModel(container.authRepository, container.walletRepository)
+                HomeViewModel(
+                    auth = container.authRepository,
+                    repo = container.walletRepository,
+                    consumeUnreadableRecordNotice = container.pendingStore::consumeUnreadableRecordNotice,
+                )
             }
-            // Coming back from Send/KYC/FX must show fresh balances & activity.
-            LaunchedEffect(Unit) { vm.refresh() }
+            // Refreshing on (re)entry and on return from the background lives in
+            // HomeScreen's LifecycleResumeEffect.
             HomeScreen(
                 viewModel = vm,
-                onLoggedOut = {
-                    nav.navigate(Routes.LOGIN) { popUpTo(Routes.HOME) { inclusive = true } }
-                },
                 onSend = { nav.navigate(Routes.SEND) },
                 onReceive = { nav.navigate(Routes.RECEIVE) },
                 onHistory = { walletId -> nav.navigate(Routes.history(walletId)) },
@@ -105,8 +133,16 @@ fun AppRoot(container: AppContainer) {
             )
         }
         composable(Routes.SEND) {
-            val vm = viewModel { SendViewModel(container.walletRepository) }
-            SendScreen(vm, onClose = { nav.popBackStack() })
+            // The typed phone/amount survive process death via the back-stack
+            // entry's SavedStateHandle; everything else is re-derived.
+            val vm = viewModel { SendViewModel(container.walletRepository, createSavedStateHandle()) }
+            SendScreen(
+                viewModel = vm,
+                onClose = { nav.popBackStack() },
+                // "Verify now" from a kyc_required refusal: Send is done for now,
+                // so it leaves the stack and Back from KYC returns to Home.
+                onVerifyIdentity = { nav.navigate(Routes.KYC) { popUpTo(Routes.HOME) } },
+            )
         }
         composable(Routes.RECEIVE) {
             ReceiveScreen(
@@ -132,10 +168,15 @@ fun AppRoot(container: AppContainer) {
     }
 }
 
-/** Launch splash: restore a persisted session, then route to home or login. */
+/**
+ * Launch splash: restore a persisted session with ONE refresh request, then
+ * route to home or login. Home paints its skeleton immediately and fetches its
+ * own data — nothing is fetched here only to be thrown away.
+ */
 @Composable
 private fun GateScreen(
     repo: AuthRepository,
+    signedOutPending: () -> Boolean,
     toHome: () -> Unit,
     toLogin: () -> Unit,
 ) {
@@ -151,7 +192,10 @@ private fun GateScreen(
             // (you can't sign in offline) and would hide a possibly-pending
             // payment behind a password prompt.
             is ApiOutcome.Offline -> toHome()
-            is ApiOutcome.Failed -> toLogin()
+            // The server refused the refresh token: the session was cleared and
+            // AppRoot's signed-out observer routes to Login (navigating here too
+            // would stack a second Login entry).
+            is ApiOutcome.Failed -> if (!signedOutPending()) toLogin()
         }
     }
 

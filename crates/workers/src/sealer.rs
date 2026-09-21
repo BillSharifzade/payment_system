@@ -1,23 +1,3 @@
-//! The checkpoint sealer and its verifier.
-//!
-//! The sealer batches not-yet-sealed transactions into a Merkle root, chains it
-//! to the previous checkpoint's hash, signs the result with Ed25519, and stores
-//! it. The verifier independently recomputes everything from the raw ledger and
-//! checks the signed chain — so tampering with any historical transaction, or
-//! with a checkpoint itself, is detected.
-//!
-//! # Why checkpoints range over `sealed_seq`, not `seq`
-//!
-//! `transactions.seq` is assigned at INSERT time, but rows *commit* in a
-//! different order, and the sealer can only see committed rows. Sealing by raw
-//! `seq` therefore races with in-flight posts: a transaction with a lower `seq`
-//! than a sealed checkpoint's upper bound can commit *after* sealing, landing
-//! inside a range whose Merkle root was computed without it — it would never be
-//! sealed, and verification would report false tampering. Instead, the sealer
-//! (a single writer by design) assigns each committed transaction a dense
-//! `sealed_seq` in the same database transaction that writes the checkpoint.
-//! A checkpoint's covered set is fixed forever at the moment it is created.
-
 use std::collections::HashMap;
 
 use crate::error::{Result, WorkerError};
@@ -25,7 +5,6 @@ use crypto::{leaf_hash, merkle_root, sha256, verify_hash, Hash, Sealer};
 use sqlx::{PgPool, Postgres, Row};
 use uuid::Uuid;
 
-/// Summary of a checkpoint that was just sealed.
 #[derive(Debug, Clone)]
 pub struct CheckpointSummary {
     pub seq: i64,
@@ -36,15 +15,12 @@ pub struct CheckpointSummary {
     pub checkpoint_hash_hex: String,
 }
 
-/// Result of verifying (part of) the checkpoint chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyReport {
     pub checkpoints_verified: u64,
     pub transactions_covered: u64,
 }
 
-/// Where a verification pass stopped: the last verified checkpoint's seq and
-/// hash. Feed it back into [`verify_chain_from`] to verify only what's new.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifyState {
     pub last_checkpoint_seq: i64,
@@ -52,7 +28,6 @@ pub struct VerifyState {
 }
 
 impl VerifyState {
-    /// The genesis state: nothing verified yet.
     pub fn genesis() -> Self {
         Self {
             last_checkpoint_seq: 0,
@@ -61,7 +36,6 @@ impl VerifyState {
     }
 }
 
-/// Bind together the bytes a checkpoint commits to, in a fixed layout, and hash.
 fn compute_checkpoint_hash(prev: &[u8; 32], root: &Hash, from_seq: i64, to_seq: i64) -> Hash {
     let mut buf = Vec::with_capacity(32 + 32 + 16);
     buf.extend_from_slice(prev);
@@ -71,12 +45,6 @@ fn compute_checkpoint_hash(prev: &[u8; 32], root: &Hash, from_seq: i64, to_seq: 
     sha256(&buf)
 }
 
-/// Compute the Merkle leaves for a batch of transactions (in the order given):
-/// each leaf hashes the transaction's id and all of its entries in a canonical
-/// (entry-id-ordered) layout. Any change to the postings changes the leaf.
-///
-/// One query for the whole batch — the per-transaction variant was an N+1 that
-/// made sealing O(batch) round trips.
 async fn transaction_leaves<'e, E>(executor: E, txn_ids: &[Uuid]) -> Result<Vec<Hash>>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
@@ -90,8 +58,6 @@ where
     .fetch_all(executor)
     .await?;
 
-    // Group each transaction's canonical byte buffer. Rows arrive ordered by
-    // entry id within a transaction, matching the layout sealed historically.
     let mut bufs: HashMap<Uuid, Vec<u8>> = HashMap::with_capacity(txn_ids.len());
     for row in rows {
         let txn_id: Uuid = row.try_get("transaction_id")?;
@@ -118,8 +84,6 @@ where
         .collect())
 }
 
-/// Read the latest checkpoint's (seq, to_txn_seq, checkpoint_hash), or the
-/// genesis defaults (0, 0, 32 zero bytes) if there are none yet.
 async fn latest_checkpoint(pool: &PgPool) -> Result<(i64, i64, [u8; 32])> {
     let row = sqlx::query(
         "SELECT seq, to_txn_seq, checkpoint_hash FROM checkpoints ORDER BY seq DESC LIMIT 1",
@@ -141,12 +105,6 @@ async fn latest_checkpoint(pool: &PgPool) -> Result<(i64, i64, [u8; 32])> {
     }
 }
 
-/// Seal the next batch (up to `batch_size` transactions). Returns `None` when
-/// there is nothing new to seal.
-///
-/// The `sealed_seq` assignment and the checkpoint row are written in ONE
-/// database transaction, so a crash can never leave transactions assigned but
-/// uncovered (or vice versa).
 pub async fn seal_next_batch(
     pool: &PgPool,
     sealer: &Sealer,
@@ -156,9 +114,6 @@ pub async fn seal_next_batch(
 
     let mut db = pool.begin().await?;
 
-    // Claim the next batch of committed-but-unsealed transactions, in insert
-    // order, assigning each a dense sealed_seq. Only committed rows are visible
-    // here, so the covered set is final the moment we commit.
     let rows = sqlx::query(
         "WITH batch AS (
              SELECT id, row_number() OVER (ORDER BY seq) AS rn
@@ -231,8 +186,6 @@ pub async fn seal_next_batch(
     }))
 }
 
-/// Seal everything outstanding, batch by batch. Returns the number of
-/// checkpoints written.
 pub async fn seal_all(pool: &PgPool, sealer: &Sealer, batch_size: i64) -> Result<u64> {
     let mut count = 0;
     while seal_next_batch(pool, sealer, batch_size).await?.is_some() {
@@ -241,21 +194,11 @@ pub async fn seal_all(pool: &PgPool, sealer: &Sealer, batch_size: i64) -> Result
     Ok(count)
 }
 
-/// Independently verify the entire checkpoint chain against the raw ledger,
-/// from genesis. See [`verify_chain_from`] for the incremental variant.
 pub async fn verify_chain(pool: &PgPool) -> Result<VerifyReport> {
     let (report, _) = verify_chain_from(pool, &VerifyState::genesis()).await?;
     Ok(report)
 }
 
-/// Verify every checkpoint after `state` against the raw ledger.
-///
-/// For each checkpoint, in order, this re-derives the Merkle root from the
-/// transactions it covers (by `sealed_seq`), recomputes the checkpoint hash,
-/// checks linkage to the previous checkpoint, and verifies the Ed25519
-/// signature. Any discrepancy is a [`WorkerError::ChainBroken`] — a tamper
-/// alarm. Returns the report plus the new [`VerifyState`], so callers can keep
-/// verification incremental instead of re-reading all of history every pass.
 pub async fn verify_chain_from(
     pool: &PgPool,
     state: &VerifyState,
@@ -296,7 +239,6 @@ pub async fn verify_chain_from(
             });
         }
 
-        // Re-derive the Merkle root from the actual transactions in range.
         let txn_rows = sqlx::query(
             "SELECT id FROM transactions WHERE sealed_seq BETWEEN $1 AND $2 ORDER BY sealed_seq",
         )
@@ -320,7 +262,6 @@ pub async fn verify_chain_from(
             });
         }
 
-        // Recompute and check the signed checkpoint hash.
         let prev_arr: [u8; 32] = prev
             .clone()
             .try_into()
@@ -334,7 +275,6 @@ pub async fn verify_chain_from(
             });
         }
 
-        // Verify the signature.
         let pk: [u8; 32] = public_key
             .try_into()
             .map_err(|_| WorkerError::DataIntegrity("public_key not 32 bytes".into()))?;

@@ -340,15 +340,19 @@ export function MixBar({
     return <div className="muted small">No transactions in the last 30 days.</div>;
   }
   const h = 30;
+  // Segment geometry up front (a plain loop, not a mutating map callback).
+  const segments: { x: number; w: number }[] = [];
   let acc = 0;
+  for (const s of slices) {
+    segments.push({ x: (acc / total) * W, w: (s.value / total) * W });
+    acc += s.value;
+  }
   return (
     <div className="chart-wrap">
       <svg viewBox={`0 0 ${W} ${h}`} role="img">
         {slices.map((s, i) => {
-          const x = (acc / total) * W;
-          acc += s.value;
-          const w = (s.value / total) * W;
           if (s.value === 0) return null;
+          const { x, w } = segments[i];
           return (
             <rect
               key={s.name}

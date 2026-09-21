@@ -1,0 +1,42 @@
+# Prometheus: scrapes the two app binaries' metrics listeners (METRICS_ADDR,
+# internal network only) and evaluates deploy/monitoring/prometheus-rules.yml.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # DNS discovery (type A) returns one target per replica, so
+  # `--scale payment-server=N` is scraped without touching this file.
+  - job_name: payment-server
+    dns_sd_configs:
+      - names: ["payment-server"]
+        type: A
+        port: 9100
+        refresh_interval: 30s
+
+  - job_name: payment-workers
+    dns_sd_configs:
+      - names: ["payment-workers"]
+        type: A
+        port: 9101
+        refresh_interval: 30s
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
+
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]

@@ -1,0 +1,89 @@
+# Prometheus alert rules for the payment stack. Metric names are the ones the
+# binaries export on METRICS_ADDR (see deploy/README.md "Metrics").
+groups:
+  - name: payment-api
+    rules:
+      - alert: HttpErrorRateHigh
+        expr: |
+          (
+            sum(rate(http_requests_total{job="payment-server", status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{job="payment-server"}[5m]))
+          ) > 0.01
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "API 5xx rate above 1% for 5 minutes"
+          description: "{{ $value | humanizePercentage }} of requests are failing. Check payment-server logs and /ready."
+
+      - alert: DbPoolExhausted
+        expr: db_pool_idle{job="payment-server"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Database pool has had no idle connection for 2 minutes"
+          description: "Requests are queueing for connections (DB_MAX_CONNECTIONS={{ with query \"db_pool_size\" }}{{ . | first | value }}{{ end }}). Look for slow queries (log_min_duration_statement) or lock waits."
+
+      - alert: RequestTimeouts
+        expr: increase(http_timeouts_total{job="payment-server"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Requests hit REQUEST_TIMEOUT_SECS in the last 10 minutes"
+
+  - name: payment-workers
+    rules:
+      - alert: OutboxRelayLagging
+        expr: outbox_oldest_unsent_age_seconds > 60
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Oldest unsent outbox event is older than 60 s"
+          description: "The outbox -> NATS relay is behind ({{ $value | humanizeDuration }}). Is NATS healthy? `docker compose logs payment-workers`."
+
+      - alert: LedgerSealingLagging
+        expr: ledger_oldest_unsealed_age_seconds > 300
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Transactions unsealed for more than 5 minutes"
+          description: "The checkpoint sealer is not keeping up or is down (oldest unsealed: {{ $value | humanizeDuration }}). Tamper-evidence coverage is lagging."
+
+      - alert: WorkerErrors
+        expr: increase(worker_errors_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "payment-workers duty '{{ $labels.duty }}' reported errors"
+          description: "{{ $value }} error(s) in 10 minutes for duty {{ $labels.duty }}."
+
+      - alert: ReconciliationUnhealthy
+        expr: reconciliation_healthy == 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ledger reconciliation reports UNHEALTHY"
+          description: "Balances do not sum to zero or do not match their entries. Page a human; see RECONCILIATION FAILED in the worker logs."
+
+      - alert: LedgerChainBroken
+        expr: ledger_chain_verified == 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Checkpoint chain verification FAILED"
+          description: "A signed checkpoint no longer verifies — possible tampering. Preserve the database and logs before doing anything else."
+
+  - name: payment-targets
+    rules:
+      - alert: MetricsTargetDown
+        expr: up{job=~"payment-server|payment-workers"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} is not answering on its metrics port"
+          description: "Container down, crash-looping, or METRICS_ADDR not bound to 0.0.0.0. `docker compose ps`."

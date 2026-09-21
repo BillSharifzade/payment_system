@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -27,6 +28,7 @@ import tj.payment.wallet.ui.ScreenHeader
 import tj.payment.wallet.ui.TransactionRow
 import tj.payment.wallet.ui.dayHeading
 import tj.payment.wallet.ui.localDate
+import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.Rust
 
 @Composable
@@ -95,6 +97,25 @@ fun HistoryScreen(
                         )
                     }
                     TransactionRow(entry)
+                }
+                // An older page failed to load: say so where the list stopped,
+                // with a retry, instead of an infinite scroll that silently ends.
+                state.loadMoreError?.let { message ->
+                    item(key = "load-more-error") {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 12.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Text(
+                                "Couldn't load older transactions. $message",
+                                color = NegativeRed,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            TextButton(onClick = viewModel::retryLoadMore) { Text("Retry", color = Rust) }
+                        }
+                    }
                 }
                 if (state.loadingMore) {
                     item(key = "loading-more") {

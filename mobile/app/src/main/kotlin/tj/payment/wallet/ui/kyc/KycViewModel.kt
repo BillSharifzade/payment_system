@@ -72,10 +72,19 @@ class KycViewModel(private val repo: WalletRepository) : ViewModel() {
         _state.value = _state.value.copy(documentType = value)
     }
 
-    /** Called with the picked file's bytes; enforces the server's 5 MB cap early. */
+    /**
+     * The picker refused the file before reading it (too large, unreadable).
+     * Surfaced like any other form error so the user can pick another one.
+     */
+    fun onDocumentRejected(reason: String) {
+        _state.value = _state.value.copy(formError = reason)
+    }
+
+    /** Called with the picked file's bytes; the picker already enforced the cap,
+     * this is the last line in case a caller bypasses it. */
     fun uploadDocument(bytes: ByteArray, mimeType: String) {
-        if (bytes.size > 5 * 1024 * 1024) {
-            _state.value = _state.value.copy(formError = "The file is over 5 MB. Pick a smaller one.")
+        if (bytes.size > MAX_DOCUMENT_BYTES) {
+            _state.value = _state.value.copy(formError = DOCUMENT_TOO_LARGE)
             return
         }
         _state.value = _state.value.copy(uploading = true, formError = null)
@@ -118,5 +127,11 @@ class KycViewModel(private val repo: WalletRepository) : ViewModel() {
                 )
             }
         }
+    }
+
+    companion object {
+        /** The server's upload cap; checked BEFORE the file is read into memory. */
+        const val MAX_DOCUMENT_BYTES = 5 * 1024 * 1024
+        const val DOCUMENT_TOO_LARGE = "The file is over 5 MB. Pick a smaller one."
     }
 }

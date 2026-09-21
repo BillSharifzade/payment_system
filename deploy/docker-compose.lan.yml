@@ -1,0 +1,321 @@
+# LAN test box (srv-dchr01-style): the same hardened stack as docker-compose.prod.yml
+# with a different edge topology, because 80/443 on that host belong to another
+# application and a bare LAN IP cannot get a public certificate:
+#
+#   API      published on host port 8099 -> payment-server:8080 (plain HTTP; the
+#            mobile `staging` flavour and curl talk to it directly)
+#   Console  published on host port 8088 -> caddy:80, serving /admin and
+#            proxying /v1, /health, /ready to the API (same-origin, no CORS)
+#
+# Images are NOT built here (2 vCPU): build on the dev box, then
+#   docker save payment-system:<tag> payment-console:<tag> | ssh box 'docker load'
+#   IMAGE_TAG=<tag> docker compose up -d           (or ./deploy.sh --no-build)
+# Ship this file, .env (COMPOSE_FILE=docker-compose.lan.yml, TRUST_PROXY=false
+# because the API port is reached directly) and secrets/ to ~/payment-deploy/.
+#
+# Everything else (secrets as files, hardening, healthchecks, limits, backups)
+# mirrors the production file — keep the two in sync when you change one.
+name: payment
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+      labels: "com.docker.compose.service,com.docker.compose.project"
+
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+
+x-app: &app
+  image: payment-system:${IMAGE_TAG:-latest}
+  restart: unless-stopped
+  env_file: [app.env]
+  <<: [*logging, *hardening]
+  read_only: true
+  tmpfs: [/tmp]
+  stop_grace_period: 30s
+
+services:
+  postgres:
+    image: postgres:16.15
+    restart: unless-stopped
+    <<: *logging
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: payment
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    secrets: [postgres_password]
+    # synchronous_commit=on: it is a ledger. Never turn it off, even on a test box.
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=384MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - wal_compression=on
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - log_min_duration_statement=250ms
+      - -c
+      - log_lock_waits=on
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - synchronous_commit=on
+    shm_size: 256m
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment -d payment"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    stop_signal: SIGINT
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+    expose: ["5432"]
+
+  redis:
+    image: redis:7.4.11-alpine
+    restart: unless-stopped
+    <<: [*logging, *hardening]
+    # Start directly as the image's `redis` user (uid 999, gid 1000): with every
+    # capability dropped the entrypoint cannot `setpriv` from root to redis.
+    user: "999:1000"
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 96mb
+      - --maxmemory-policy
+      - allkeys-lru
+    read_only: true
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          pids: 256
+    expose: ["6379"]
+
+  nats:
+    image: nats:2.11.17-alpine
+    restart: unless-stopped
+    <<: [*logging, *hardening]
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 256
+    expose: ["4222"]
+
+  payment-server:
+    <<: *app
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      METRICS_ADDR: 0.0.0.0:9100
+      DOCUMENT_STORE_DIR: /data/kyc-docs
+    secrets: [database_url, jwt_secret]
+    volumes:
+      - kycdocs:/data/kyc-docs
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      nats:     { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/payment-server", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
+    # The LAN-facing API port (plain HTTP). Metrics (9100) stay internal.
+    ports:
+      - "8099:8080"
+
+  payment-workers:
+    <<: *app
+    entrypoint: ["/usr/local/bin/payment-workers"]
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      WORKER_SIGNING_KEY_FILE: /run/secrets/worker_signing_key
+      METRICS_ADDR: 0.0.0.0:9101
+      DOCUMENT_STORE_DIR: /data/kyc-docs
+      WORKER_HEARTBEAT_FILE: /tmp/payment-workers.heartbeat
+    secrets: [database_url, worker_signing_key]
+    volumes:
+      - kycdocs:/data/kyc-docs
+    depends_on:
+      postgres: { condition: service_healthy }
+      nats:     { condition: service_healthy }
+      payment-server: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/payment-workers", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 512
+    expose: ["9101"]
+
+  caddy:
+    image: payment-console:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    <<: [*logging, *hardening]
+    cap_add: [NET_BIND_SERVICE]
+    # Plain HTTP on :80 inside, published as 8088. To get TLS on the LAN box
+    # instead, set SITE_ADDRESS=192.168.1.156:8443 (internal CA, auto-issued
+    # for an IP), publish "8443:8443" and trust Caddy's root CA on the clients
+    # (deploy/README.md "TLS on a LAN box").
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+      ADMIN_ALLOW_CIDR: ${ADMIN_ALLOW_CIDR:-0.0.0.0/0 ::/0}
+    ports:
+      - "8088:80"
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - caddydata:/data
+      - caddyconfig:/config
+    depends_on:
+      payment-server: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          pids: 256
+
+  postgres-backup:
+    image: prodrigestivill/postgres-backup-local:16-alpine-d257e5d
+    restart: unless-stopped
+    <<: [*logging, *hardening]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: payment
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_EXTRA_OPTS: "-Z6 --no-owner --no-privileges"
+      SCHEDULE: "@daily"
+      BACKUP_ON_START: "TRUE"
+      BACKUP_KEEP_DAYS: "14"
+      BACKUP_KEEP_WEEKS: "8"
+      BACKUP_KEEP_MONTHS: "12"
+      HEALTHCHECK_PORT: "8080"
+      TZ: ${TZ:-UTC}
+    secrets: [postgres_password]
+    volumes:
+      - backups:/backups
+    # After the SERVER is healthy, not just Postgres: the on-start dump must
+    # capture a migrated database (on a fresh deploy the schema arrives with the
+    # server's first boot).
+    depends_on:
+      postgres: { condition: service_healthy }
+      payment-server: { condition: service_healthy }
+    # The image's own check polls only every 5 min; this one makes
+    # `docker compose ps` truthful within a minute of start.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8080/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          pids: 128
+
+  kyc-backup:
+    image: alpine:3.24.2
+    restart: unless-stopped
+    <<: [*logging, *hardening]
+    cap_add: [DAC_READ_SEARCH]
+    command:
+      - /bin/sh
+      - -c
+      - printf '%s\n' '30 2 * * * /usr/local/bin/kyc-backup.sh' > /etc/crontabs/root && exec crond -f -d 8
+    environment:
+      KYC_BACKUP_KEEP_DAYS: "14"
+    read_only: true
+    tmpfs: [/tmp, /etc/crontabs]
+    volumes:
+      - kycdocs:/src:ro
+      - backups:/backups
+      - ./backup/kyc-backup.sh:/usr/local/bin/kyc-backup.sh:ro
+    healthcheck:
+      test: ["CMD", "pgrep", "crond"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          pids: 64
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+  database_url:
+    file: ./secrets/database_url
+  jwt_secret:
+    file: ./secrets/jwt_secret
+  worker_signing_key:
+    file: ./secrets/worker_signing_key
+
+volumes:
+  pgdata:
+  redisdata:
+  natsdata:
+  caddydata:
+  caddyconfig:
+  kycdocs:
+  backups:

@@ -1,11 +1,3 @@
-//! Integration tests for the sealer + verifier and reconciliation, against a
-//! real PostgreSQL.
-//!
-//! ```bash
-//! DATABASE_URL=postgres://payment:payment_dev_pw@localhost:5432/payment \
-//!   cargo test -p workers -- --include-ignored
-//! ```
-
 use crypto::Sealer;
 use ledger::{Account, AccountId, AccountType, Entry, Transaction};
 use money::{Currency, Money};
@@ -19,7 +11,6 @@ use workers::{
     PublishError, WorkerError,
 };
 
-/// A test publisher that records every event it is asked to publish.
 struct CapturingPublisher(Arc<Mutex<Vec<OutboxEvent>>>);
 
 impl EventPublisher for CapturingPublisher {
@@ -45,16 +36,11 @@ async fn setup() -> (PgPool, PostgresLedger) {
     (pool, ledger)
 }
 
-/// Seal everything, verify the chain, reconcile — then tamper with a committed
-/// entry and prove BOTH the cryptographic verifier and reconciliation detect it,
-/// and that restoring the data restores integrity.
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn seal_verify_and_detect_tampering() {
     let (pool, ledger) = setup().await;
 
-    // Create some activity to seal: a settlement account funds a user, who pays
-    // another user. Unique accounts so the test is independent of prior data.
     let settlement = AccountId::new();
     let alice = AccountId::new();
     let bob = AccountId::new();
@@ -83,22 +69,18 @@ async fn seal_verify_and_detect_tampering() {
         .await
         .unwrap();
 
-    // A transaction we will later tamper with.
     let target = Transaction::with_entries(vec![
         Entry::debit(alice, Money::from_minor(12_345, tjs())),
         Entry::credit(bob, Money::from_minor(12_345, tjs())),
     ]);
     ledger.post(&target).await.unwrap();
 
-    // Seal everything outstanding and verify the chain is sound.
     seal_all(&pool, &Sealer::generate(), 500).await.unwrap();
     let report = verify_chain(&pool).await.expect("chain should verify");
     assert!(report.checkpoints_verified >= 1);
 
-    // Reconciliation is healthy.
     assert!(reconcile(&pool).await.unwrap().is_healthy());
 
-    // --- Tamper: inflate the credit to Bob directly in the database. ---
     let row = sqlx::query(
         "SELECT id, amount_minor FROM entries
          WHERE transaction_id = $1 AND direction = 'credit'",
@@ -112,22 +94,19 @@ async fn seal_verify_and_detect_tampering() {
 
     sqlx::query("UPDATE entries SET amount_minor = $2 WHERE id = $1")
         .bind(entry_id)
-        .bind(original + 1) // forge one extra diram
+        .bind(original + 1)
         .execute(&pool)
         .await
         .unwrap();
 
-    // The cryptographic verifier detects the ledger tampering.
     match verify_chain(&pool).await {
         Err(WorkerError::ChainBroken { .. }) => {}
         other => panic!("expected ChainBroken, got {other:?}"),
     }
 
-    // And reconciliation flags the now-inconsistent balances.
     let tampered_report = reconcile(&pool).await.unwrap();
     assert!(!tampered_report.is_healthy());
 
-    // --- Restore the original value; integrity returns. ---
     sqlx::query("UPDATE entries SET amount_minor = $2 WHERE id = $1")
         .bind(entry_id)
         .bind(original)
@@ -141,8 +120,6 @@ async fn seal_verify_and_detect_tampering() {
     assert!(reconcile(&pool).await.unwrap().is_healthy());
 }
 
-/// Posting writes an outbox row in the same transaction; the relay then
-/// publishes it exactly once and marks it sent.
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn outbox_relay_publishes_posted_events() {
@@ -169,7 +146,6 @@ async fn outbox_relay_publishes_posted_events() {
     ]);
     ledger.post(&txn).await.unwrap();
 
-    // The outbox row exists and is unsent immediately after posting (atomic write).
     let unsent: bool =
         sqlx::query("SELECT sent_at IS NULL AS unsent FROM outbox WHERE aggregate_id = $1")
             .bind(txn.id.as_uuid())
@@ -180,7 +156,6 @@ async fn outbox_relay_publishes_posted_events() {
             .unwrap();
     assert!(unsent, "outbox row should exist and be unsent after post");
 
-    // Relay publishes it; our event must appear, with the right type and payload.
     let captured = Arc::new(Mutex::new(Vec::new()));
     let publisher = CapturingPublisher(captured.clone());
     let n = relay_all(&pool, &publisher, 100).await.unwrap();
@@ -197,7 +172,6 @@ async fn outbox_relay_publishes_posted_events() {
         assert_eq!(ours.payload["entries"].as_array().unwrap().len(), 2);
     }
 
-    // It is now marked sent, and a second relay does not re-publish it.
     let sent: bool =
         sqlx::query("SELECT sent_at IS NOT NULL AS sent FROM outbox WHERE aggregate_id = $1")
             .bind(txn.id.as_uuid())
@@ -222,11 +196,6 @@ async fn outbox_relay_publishes_posted_events() {
     );
 }
 
-/// `NatsPublisher` delivers an event to the right subject and a subscriber
-/// receives the JSON payload. Self-contained (no DB): the relay→outbox path is
-/// covered by `outbox_relay_publishes_posted_events`; here we isolate the NATS
-/// transport so concurrent tests draining the shared outbox can't interfere.
-/// Requires a NATS server; set NATS_URL (defaults to localhost).
 #[tokio::test]
 #[ignore = "requires NATS (docker compose up -d)"]
 async fn nats_publisher_delivers_events() {
@@ -237,7 +206,6 @@ async fn nats_publisher_delivers_events() {
     let nats_url =
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
 
-    // A unique subject prefix so this test is isolated from any other traffic.
     let prefix = format!("test-{}", Uuid::new_v4().simple());
     let subject = format!("{prefix}.transaction.posted");
 

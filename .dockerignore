@@ -1,6 +1,22 @@
+# Build context for BOTH images (deploy/Dockerfile and deploy/Dockerfile.console
+# use the repo root as context). Anything not COPY'd by a Dockerfile is excluded
+# so the context stays small and never carries secrets or dev artefacts.
 target/
 .git/
 .github/
-deploy/
+.claude/
 scratchpad/
+mobile/
+kyc-documents/
+console/node_modules/
+console/dist/
+**/node_modules/
 **/*.swp
+*.md
+.env
+.env.*
+# deploy/ is never part of an image, except the Caddyfile baked into the
+# console/edge image. deploy/secrets and deploy/backups must never reach a
+# build context.
+deploy/
+!deploy/Caddyfile

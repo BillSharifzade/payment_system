@@ -23,6 +23,10 @@ enum class ErrorCode(val wire: String) {
     LIMIT_EXCEEDED("limit_exceeded"),
     NOT_FOUND("not_found"),
     RATE_LIMITED("rate_limited"),
+    /** 503 from a lock/statement timeout on a money endpoint: same key, try again. */
+    RETRY_LATER("retry_later"),
+    /** 504: the money endpoint ran out of time server-side. Same key, try again. */
+    TIMEOUT("timeout"),
     UNAUTHORIZED("unauthorized"),
     UNKNOWN_ACCOUNT("unknown_account"),
     UNKNOWN_CURRENCY("unknown_currency"),

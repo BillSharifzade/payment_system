@@ -1,15 +1,32 @@
+# CI for the payment system: Rust (lint + unit + integration against real
+# Postgres/Redis/NATS), supply chain, the admin console, both container images
+# and the Android app's JVM tests.
+#
+# Third-party actions are pinned to full commit SHAs (the version in the comment
+# is what the SHA resolves to); bump deliberately.
 name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  lint-and-test:
+  rust:
+    name: Rust — lint, unit, integration
     runs-on: ubuntu-latest
+    timeout-minutes: 40
 
     services:
       postgres:
@@ -24,18 +41,59 @@ jobs:
           --health-cmd "pg_isready -U payment -d payment"
           --health-interval 3s
           --health-timeout 3s
-          --health-retries 10
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+      nats:
+        # JetStream is required: the workers create the PAYMENTS stream.
+        image: nats:2-alpine
+        ports:
+          - 4222:4222
+          - 8222:8222
+        options: >-
+          --health-cmd "wget -q -O /dev/null http://127.0.0.1:8222/healthz?js-enabled-only=true"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: postgres://payment:payment_dev_pw@localhost:5432/payment
+      REDIS_URL: redis://localhost:6379
+      NATS_URL: nats://localhost:4222
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (rust-toolchain.toml pins 1.98)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09
         with:
+          toolchain: "1.98"
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # GitHub's `services:` cannot pass a command, and the nats image only
+      # enables JetStream with the `-js` flag — so the service container is
+      # replaced by one started with the flag before the integration lane.
+      - name: Enable JetStream on the NATS service
+        run: |
+          set -euo pipefail
+          id=$(docker ps -q --filter "ancestor=nats:2-alpine" | head -n1)
+          docker rm -f "$id" >/dev/null
+          docker run -d --name nats-js -p 4222:4222 -p 8222:8222 nats:2-alpine -js -m 8222 >/dev/null
+          for i in $(seq 1 30); do
+            wget -q -O /dev/null "http://127.0.0.1:8222/healthz?js-enabled-only=true" && break
+            sleep 1
+          done
+          wget -q -O - "http://127.0.0.1:8222/healthz?js-enabled-only=true"
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -43,15 +101,108 @@ jobs:
       - name: Clippy (warnings = errors)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Dependency audit (cargo-deny)
-        uses: EmbarkStudios/cargo-deny-action@v2
+      - name: Unit & property tests (no infrastructure)
+        run: cargo test --workspace
+
+      # Integration lane, one crate at a time: they share one database and a
+      # global outbox, and cross-binary parallelism made the relay test flaky.
+      - name: Integration — storage
+        run: cargo test -p storage -- --ignored
+      - name: Integration — api
+        run: cargo test -p api -- --ignored
+      - name: Integration — workers
+        run: cargo test -p workers -- --ignored --test-threads=1
+
+      - name: Release build (what the image ships)
+        run: cargo build --release --locked --bin payment-server --bin payment-workers
+
+  deny:
+    name: Supply chain — cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Advisories, licenses, bans, sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
 
-      - name: Unit & property tests (no database)
-        run: cargo test --workspace
+  console:
+    name: Admin console — lint, test, build, audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - name: Runtime dependency audit
+        run: npm audit --omit=dev --audit-level=high
 
-      - name: Integration tests (against Postgres)
-        env:
-          DATABASE_URL: postgres://payment:payment_dev_pw@localhost:5432/payment
-        run: cargo test --workspace -- --include-ignored
+  docker:
+    name: Container images
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: payment-system (cargo-chef, distroless)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: false
+          tags: payment-system:ci
+          cache-from: type=gha,scope=payment-system
+          cache-to: type=gha,scope=payment-system,mode=max
+      - name: payment-console (Vite build + Caddy)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Dockerfile.console
+          push: false
+          tags: payment-console:ci
+          cache-from: type=gha,scope=payment-console
+          cache-to: type=gha,scope=payment-console,mode=max
+      - name: Compose files parse
+        run: |
+          cd deploy
+          printf 'GRAFANA_PASSWORD=ci\nALERT_WEBHOOK_URL=http://example/ci\n' > .env
+          mkdir -p secrets && for s in postgres_password database_url jwt_secret worker_signing_key pgbackrest.conf; do echo ci > "secrets/$s"; done
+          cp app.env.example app.env
+          docker compose -f docker-compose.prod.yml config -q
+          docker compose -f docker-compose.lan.yml config -q
+          docker compose -f docker-compose.prod.yml -f docker-compose.monitoring.yml config -q
+          docker compose -f docker-compose.prod.yml -f docker-compose.wal-archive.yml config -q
+          bash -n deploy.sh restore-drill.sh backup/kyc-backup.sh
+
+  mobile:
+    name: Android app — JVM tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          packages: platforms;android-36 build-tools;34.0.0 build-tools;35.0.0 build-tools;36.0.0
+      - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+      - name: Unit tests (:core pure JVM, :app MockWebServer)
+        run: ./gradlew :core:test :app:testDevDebugUnitTest --no-daemon --console=plain
+      - name: Release APK compiles (staging flavour; prod needs the upload key)
+        run: ./gradlew :app:assembleStagingRelease --no-daemon --console=plain

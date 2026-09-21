@@ -541,45 +541,42 @@ payment-backend/
 
 ## 17. Phased roadmap (so we ship, not just plan forever)
 
-> **Build status (live):**
-> - ✅ Workspace skeleton created (`Cargo.toml`).
-> - ✅ `money` crate — integer minor units, currency-safe, checked arithmetic. 9 tests + 2 property tests, clippy-clean.
-> - ✅ `ledger` crate — double-entry core: `Account`/`Entry`/`Transaction`, `LedgerEngine` trait, `InMemoryLedger` reference engine. Enforces balanced-transaction, no-overdraft, atomic+idempotent posting, and money conservation. 6 tests + 1 simulation property test, clippy-clean.
-> - ✅ `storage` crate — `PostgresLedger` (async `LedgerStore` trait) on real PostgreSQL: row-locked, deadlock-ordered, atomic, idempotent. Reuses the pure `ledger` validation. 2 integration tests **incl. a 200-way concurrent double-spend test** — pass against Postgres.
-> - ✅ `auth` crate — Argon2id password hashing, JWT access tokens, opaque+hashed revocable refresh tokens. 6 unit tests, clippy-clean.
-> - ✅ `api` crate — axum HTTP server (`payment-server`). Auth (`register`/`login`/`refresh`/`logout`), `POST /v1/wallets`, `GET /v1/accounts/{id}/balance`, **KYC** (`GET /v1/kyc`, `POST /v1/kyc/submissions`, admin `approve`/`reject`), admin **blocklist** (`POST`/`DELETE /v1/admin/blocks`), `POST /v1/deposits` (**admin-only**), `POST /v1/transfers` (**KYC-gated + AML-screened**), `GET /health`. Bearer-token auth + ownership enforcement, **admin role** (`AdminUser`, DB-checked), **KYC** (submission/review workflow, transfers require level ≥ 1), **AML screening** (blocklist + per-tx/rolling-24h/hourly-velocity limits tiered by KYC level, all decisions logged to `screening_events`), **rate limiting** (fixed-window per `X-Forwarded-For` — in-memory *or* Redis-backed, 429), per-endpoint **idempotency**, typed error→HTTP mapping, JSON logs. 10 HTTP integration tests.
-> - ✅ `crypto` crate — SHA-256 Merkle tree with inclusion proofs + Ed25519 signing. 9 unit tests.
-> - ✅ `workers` crate — checkpoint **sealer** (batched Merkle + signed chain), independent **chain verifier**, **reconciliation** (conservation + balance integrity), and the **outbox relay** (pluggable `EventPublisher` — `LoggingPublisher` *and* `NatsPublisher`; at-least-once, `FOR UPDATE SKIP LOCKED`). Binary `payment-workers` loops relay+seal+reconcile, publishing to NATS when `NATS_URL` is set. Integration tests prove seal→verify→**tamper-detected**→restore, post→outbox→relay-once-and-marked-sent, and **NATS publish→subscriber receives**.
-> - ✅ **Transactional outbox** (§5.4) — `PostgresLedger::post` writes a `transaction.posted` event in the *same* DB transaction as the entries (no dual write). Published by the relay; transport behind a trait (logging now, NATS later).
-> - ✅ Dev environment — `docker-compose.yml` (Postgres 16 + NATS + Redis) + `migrations/` (sqlx) + `README.md`. ✅ CI workflow (`.github/workflows/ci.yml`): fmt, clippy `-D warnings`, `cargo deny`, DB-less + Postgres integration tests.
-> - ✅ **Transfer fees** (§4.2) — configurable basis-points fee (`FeeConfig`, env `TRANSFER_FEE_BPS`, default 0) credited to a seeded fee-revenue account via the canonical three-entry double-entry transfer. Integration-tested.
-> - ✅ **FX / multi-currency** (§4.2) — `POST /v1/fx` converts between a caller's own wallets via a single transaction with one balanced leg per currency; admin-set integer-ratio rates (`fx_rates`, `POST /v1/admin/fx-rates`); USD added; per-currency FX-position accounts; floored conversion never creates money. Integration-tested (TJS→USD, both legs balance).
-> - ✅ **Security audit** — `cargo audit` / `cargo deny`: 4 fixable advisories (rustls-webpki via async-nats) **fixed** by upgrading async-nats 0.38→0.49; 1 unfixable transitive (`rsa`, Marvin) formally accepted in `deny.toml` with rationale (reachable only via the unused MySQL macro path; Postgres uses SCRAM). **Zero outstanding vulnerabilities.**
-> - ✅ **Performance** (release, single dev box) — `/health`: **~372k req/s**, p99 **0.89ms**; authenticated DB-backed balance read (JWT verify + ownership + balance query): **~23.7k req/s**, avg 2.1ms; both 100% success. Ledger correctness holds under 200-way concurrency (storage test). Rate-limit budget tunable via `RATE_LIMIT_MAX`/`RATE_LIMIT_WINDOW_SECS`.
-> - **Backend feature set is functionally complete:** double-entry ledger, auth, KYC, AML, fees, FX, idempotency, tamper-evidence, outbox→NATS, reconciliation, rate limiting. **48 tests** (30 unit/property/simulation + 18 DB/infra integration), all green; clippy + fmt clean; release build clean.
-> - ⏭️ Next: production deployment (§12 — Talos/k8s, Patroni Postgres HA, Vault, observability), NATS JetStream durability + a consumer, public-anchoring option (§6.4).
+> **Build status (live, refreshed 2026-09-21 after the full-stack hardening pass):**
+> - ✅ `money` crate — integer minor units, currency-safe, checked arithmetic; `from_major_minor` now enforces its minor-range contract. 9 tests + property tests.
+> - ✅ `ledger` crate — double-entry core, `LedgerEngine` trait, `InMemoryLedger`. Server-generated ids are **UUIDv7** (time-ordered B-tree inserts); client-supplied transaction ids stay as sent. 6 tests + simulation.
+> - ✅ `storage` crate — `PostgresLedger`: **five round trips per plain transfer** (BEGIN, claim id, lock wallets in ONE `ORDER BY id FOR UPDATE` statement, one CTE writing entries + balances + outbox + the API idempotency record, COMMIT). System accounts (settlement / fee / FX position, 16 shards each) are applied **last as additive deltas without an early lock**, so hot rows are held for one statement plus the commit. `PostOptions` carries a **pre-write guard** that runs inside the lock (the AML window check) and the idempotency record. `balances.min_raw` CHECK is the schema backstop for no-overdraft; currencies are cached in-process. 3 integration tests incl. the 200-way double-spend race and guard-rollback.
+> - ✅ `auth` crate — Argon2id, JWT (HS256, exp), opaque+hashed refresh tokens. 6 tests.
+> - ✅ `api` crate — split into modules (`session`, `payments`, `kyc`, `admin`, `reads`, `middleware`, `ratelimit`, `config`). Money endpoints run on **one pooled connection**: one context statement (user + status + KYC + both accounts + blocklist + FX rates + stored idempotent response), Rust checks, then `post_on` with the **AML daily/velocity guard inside the locked transaction** (proven exact under concurrency: 5 of 12 simultaneous transfers post against a 5 000 cap). Frozen users are refused on live tokens; refresh rotation is **atomic** (`FOR UPDATE`, conditional revoke) with a 30 s **reuse-grace window** for lost rotation responses (one hop, then family revoke); login throttle charges failures only; per-user recipient-resolution limiter; user-scoped idempotency fingerprints; KYC uploads content-sniffed and row-first; every admin mutation writes `admin_actions`. Plumbing: request ids (`X-Request-Id`, in every error body), INFO access log (path only), **504 timeout that clients treat as unsettled**, `Cache-Control: no-store`, `/health` + `/ready`, Prometheus on `METRICS_ADDR`, graceful SIGTERM drain, Argon2 concurrency bounded, Redis limiter bounded at 100 ms with in-memory fallback, strict env parsing (a typo refuses to boot; fee bps ≤ 10 000), `*_FILE` secrets, `payment-server healthcheck` subcommand. Postgres session GUCs: statement/lock/idle-in-transaction timeouts; transient SQLSTATEs → 503 `retry_later`. 29 HTTP integration tests.
+> - ✅ `crypto` crate — SHA-256 Merkle + Ed25519. 9 tests.
+> - ✅ `workers` crate — sealer / verifier unchanged; **reconciliation is incremental** (accounts touched since the last healthy pass, full pass daily); **outbox relay in its own task**, pipelined **JetStream** publish with `Nats-Msg-Id` dedup and server acks, one `UPDATE ... = ANY` per batch, bounded publish wait; lag gauges (`outbox_oldest_unsent_age_seconds`, `ledger_oldest_unsealed_age_seconds`), heartbeat file + `payment-workers healthcheck`, graceful stop, strict env, metrics on `METRICS_ADDR`. 3 integration tests (tamper detection, relay, JetStream delivery).
+> - ✅ Schema — migrations 0019–0021: redundant `idx_entries_account` dropped, outbox `sent_at` and `balances.updated_at` indexes, `balances` fillfactor 50, hot `entries.currency` FK dropped (KEY SHARE churn), `min_raw` backstop, `refresh_tokens.successor_id`/`grace_issued`, `admin_actions`, KYC queue keyset index, fee/FX/USD-settlement shards. (Concurrent index builds are deliberately NOT used in migrations: they deadlock against a second replica waiting on the migrator lock.)
+> - ✅ Supply chain — `cargo update` (103 crates incl. the rustls RUSTSEC-2026-0285 fix), toolchain pinned to 1.98 (`rust-toolchain.toml`); `cargo audit` shows only the accepted `rsa` advisory; clippy `-D warnings` + fmt clean.
+> - ✅ **Performance (release, one dev box, Docker Postgres with default settings, fees ON = 3-entry transfers + fee shard, AML guard, idempotency + audit rows in the transaction):** 64 senders, **~3 200 transfers/s at 64-way concurrency** (p50 18 ms, p99 95 ms with a 32-connection pool); **p99 20 ms at ~2 900 transfers/s** with the pool matched to a 32-way load; 0 errors across ~180 000 posts. Earlier reads: `/health` ~372k req/s, balance read ~23.7k req/s (now one round trip instead of two).
+> - ✅ Console (React) — pending deposit key in `localStorage` with balance re-check, confirm steps on KYC approve / FX rate, error boundary, abortable requests, keyset-paged KYC queue, counts from metrics, atomic reverse FX rates, request ids in errors, sandboxed PDF viewer, ESLint + Vitest (13 tests), CSP without `unsafe-inline` styles.
+> - ✅ Mobile (Kotlin/Compose) — unreadable-2xx and retried 401/403 are *unsettled* not rejected; tri-state refresh (transient failures never wipe the session); statement lookup before discard; FX key reuse; Keystore corruption recovery; global signed-out signal; direct refresh on cold start; stores warmed off-main; one shared OkHttp client with call timeouts and no redirects; lifecycle-aware polling; wallet/config cache; release signing config; `:app` MockWebServer tests. See FRONTEND.md §7.4.
+> - ✅ Ops — cargo-chef Dockerfile (rust 1.98 → distroless), console image, SHA image tags with rollback, compose hardening (no-new-privileges, cap_drop, read-only rootfs, log rotation, memory limits, healthchecks via the binaries' subcommands, healthy-ordered startup, 30 s stop grace), Postgres tuning, backup sidecars + restore drill, Loki retention + rules, Prometheus/Alertmanager rules, Caddy access log / cache headers / stricter CSP / `/ready` health checks; CI with Postgres + Redis + NATS services, per-crate integration lane, console/mobile/docker jobs. **CI still needs a git remote to run.**
+> - ⏭️ Next: push a remote; redeploy srv-dchr01 with the new image; money in/out rails (Phase 4); SMS OTP; public anchoring option (§6.4); TigerBeetle only when Postgres commit throughput (~3k/s per box today) is the bottleneck.
 
-**Phase 0 — Foundations (this is where coding starts, after we agree on this doc):**
-- ✅ Workspace skeleton. ⬜ config, Postgres connection, migrations, observability baseline, CI with `cargo audit`/`deny`.
+**Phase 0 — Foundations:**
+- ✅ Workspace skeleton, strict config, Postgres connection with bounded timeouts, migrations, observability baseline (JSON logs, request ids, Prometheus metrics), CI with `cargo deny` (needs a remote to run).
 
 **Phase 1 — Correct ledger core:**
-- ✅ `money` crate + ✅ `ledger` crate pure core (double-entry, idempotency, in-memory engine).
-- ⬜ `PostgresLedger` (row-locking, real persistence). ✅ Property tests + first simulation test. **Goal: provably correct transfers.**
+- ✅ `money` + `ledger` pure core. ✅ `PostgresLedger` (row-locking, real persistence, five round trips per transfer, sharded system accounts). ✅ Property tests + simulation + concurrent double-spend and AML-limit races. **Goal met: provably correct transfers.**
 
 **Phase 2 — API & auth:**
-- Register/login/refresh, accounts, transfers (idempotent), balances. mTLS scaffolding.
+- ✅ Register/login/refresh (atomic rotation + grace window), wallets, transfers (idempotent, AML-guarded inside the lock), balances, statements, FX. ⬜ mTLS scaffolding (deferred: TLS terminates at Caddy; revisit with the datacenter topology in §12).
 
 **Phase 3 — Tamper-evidence & events:**
-- Outbox relay, sealer (Merkle checkpoints + Ed25519 chain), audit log.
+- ✅ Outbox relay (JetStream, acked, deduplicated), sealer (Merkle checkpoints + Ed25519 chain), verifier, admin audit log (`admin_actions`).
 
 **Phase 4 — Money in/out:**
-- Partner-bank deposit/withdrawal integration, FX accounts, fees.
+- ✅ FX accounts, fees (sharded). ⬜ Partner-bank deposit/withdrawal integration — the biggest remaining product gap; deposits are admin-only today and there is no withdrawal endpoint.
 
 **Phase 5 — Compliance & ops hardening:**
-- KYC/AML subsystems, reconciliation job, DR drills, load tests, chaos tests.
+- ✅ KYC/AML subsystems, incremental reconciliation, load test (~3k transfers/s per box, p99 20 ms), backups + restore drill script, alert rules. ⬜ DR drill on real hardware, chaos tests.
 
 **Phase 6 — Scale (only if needed):**
-- Evaluate `TigerBeetleLedger`, read replicas, partitioning, multi-region.
+- ⬜ Evaluate `TigerBeetleLedger` (only once a single Postgres box's ~3k commits/s is the limit), read replicas, partitioning, multi-region.
 
 Each phase ends with: tests green, invariants holding under simulation, dashboards live.
 

@@ -18,6 +18,8 @@ data class HistoryUiState(
     val loading: Boolean = true,
     val loadingMore: Boolean = false,
     val error: String? = null,
+    /** The last "older page" fetch failed; a retry row is shown at the tail. */
+    val loadMoreError: String? = null,
     /** null after the last page — nothing older to fetch. */
     val nextCursor: String? = null,
     val endReached: Boolean = false,
@@ -53,11 +55,15 @@ class HistoryViewModel(
         }
     }
 
-    /** Fetch the next (older) page; keyset cursor makes this gap-free. */
+    /**
+     * Fetch the next (older) page; keyset cursor makes this gap-free. After a
+     * failure the scroll trigger stays quiet (no retry storm) until the user
+     * taps the retry row ([retryLoadMore]).
+     */
     fun loadMore() {
         val s = _state.value
         val cursor = s.nextCursor ?: return
-        if (s.loadingMore || s.loading) return
+        if (s.loadingMore || s.loading || s.loadMoreError != null) return
         _state.value = s.copy(loadingMore = true)
         viewModelScope.launch {
             when (val outcome = repo.statement(accountId, cursor = cursor)) {
@@ -67,9 +73,22 @@ class HistoryViewModel(
                     nextCursor = outcome.value.nextCursor,
                     endReached = outcome.value.nextCursor == null,
                 )
-                // A failed page-load isn't fatal — keep what we have, allow retry.
-                else -> _state.value = _state.value.copy(loadingMore = false)
+                // A failed page-load isn't fatal — keep what we have, show a
+                // visible retry row instead of silently stopping the list.
+                is ApiOutcome.Failed -> _state.value = _state.value.copy(
+                    loadingMore = false,
+                    loadMoreError = outcome.userMessage(),
+                )
+                is ApiOutcome.Offline -> _state.value = _state.value.copy(
+                    loadingMore = false,
+                    loadMoreError = OFFLINE_MESSAGE,
+                )
             }
         }
+    }
+
+    fun retryLoadMore() {
+        _state.value = _state.value.copy(loadMoreError = null)
+        loadMore()
     }
 }

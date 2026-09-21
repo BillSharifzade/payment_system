@@ -12,9 +12,29 @@ sealed interface ApiOutcome<out T> {
         val code: ErrorCode,
         val httpStatus: Int,
         val serverMessage: String?,
-    ) : ApiOutcome<Nothing>
+        /** Server-side correlation id (`error.request_id`), for support. */
+        val requestId: String? = null,
+    ) : ApiOutcome<Nothing> {
+        /**
+         * A 2xx whose body could not be read. The server ACCEPTED the request —
+         * we just never saw its answer. Never a refusal, never a reason to drop
+         * an idempotency key.
+         */
+        val serverAccepted: Boolean get() = httpStatus in 200..299
 
-    /** Never reached the server, or the response was unreadable. Safe to retry. */
+        /**
+         * The server did not rule on the request: it accepted it unreadably,
+         * was overloaded or timed out (any 5xx — incl. 503 `retry_later` and
+         * 504 `timeout`), or throttled us. The only safe next step is a retry
+         * with the SAME idempotency key.
+         */
+        val undetermined: Boolean
+            get() = serverAccepted || httpStatus >= 500 ||
+                code == ErrorCode.RATE_LIMITED || code == ErrorCode.RETRY_LATER ||
+                code == ErrorCode.TIMEOUT
+    }
+
+    /** Never reached the server, or the connection broke mid-flight. Safe to retry. */
     data class Offline(val cause: Throwable) : ApiOutcome<Nothing>
 }
 

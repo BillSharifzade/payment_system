@@ -11,6 +11,7 @@ mobile/.kotlin/
 mobile/build/
 mobile/*/build/
 mobile/local.properties
+mobile/keystore.properties
 mobile/captures/
 *.apk
 *.aab
@@ -20,6 +21,10 @@ kyc-documents/
 .env
 .env.*
 !.env.prod.example
+
+# Deployment state that lives only on the server
+deploy/secrets/
+deploy/backups/
 
 # Editors / OS
 .idea/

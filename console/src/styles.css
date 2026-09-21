@@ -1233,3 +1233,59 @@ button.primary.big {
 .fund-hint {
   margin-top: 0.8rem;
 }
+
+/* ----- Crash page (root errorElement) ------------------------------------- */
+
+.crash-wrap {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background:
+    radial-gradient(640px 320px at 50% -60px, var(--bad-soft), transparent),
+    var(--bg);
+}
+.crash-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 2rem;
+  width: 480px;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.75rem;
+  box-shadow: var(--shadow);
+}
+.crash-card > svg {
+  color: var(--bad);
+}
+.crash-card h1 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+.crash-card p {
+  margin: 0;
+}
+.crash-msg {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88rem;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+/* ----- Small layout helpers (classes instead of inline style attributes) --- */
+
+.docframe-pdf {
+  height: 480px;
+}
+.gap-10 {
+  height: 10px;
+}
+.gap-12 {
+  height: 12px;
+}
+.mb-05 {
+  margin-bottom: 0.5rem;
+}

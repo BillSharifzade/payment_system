@@ -1,3 +1,7 @@
+# promtail: tails every container's json-file log on the host and Caddy's
+# access log, labels streams with the compose service/project (stamped into the
+# log lines by the json-file `labels` option in the compose files — no Docker
+# socket needed), promotes the app's JSON `level`, and ships to Loki.
 server:
   http_listen_port: 9080
   grpc_listen_port: 0
@@ -9,7 +13,6 @@ clients:
   - url: http://loki:3100/loki/api/v1/push
 
 scrape_configs:
-  # Tail every container's JSON log file (Docker's default json-file driver).
   - job_name: docker
     static_configs:
       - targets: [localhost]
@@ -17,20 +20,41 @@ scrape_configs:
           job: docker
           __path__: /var/lib/docker/containers/*/*-json.log
     pipeline_stages:
-      # 1. Unwrap the Docker envelope to get the raw app log line.
+      # 1. Unwrap the Docker envelope: {"log": "...", "stream": "stdout",
+      #    "attrs": {"com.docker.compose.service": "...", ...}, "time": "..."}
       - json:
           expressions:
             log: log
             stream: stream
-      # 2. Parse our app's JSON logs to promote level/message/target to labels.
+            service: 'attrs."com.docker.compose.service"'
+            project: 'attrs."com.docker.compose.project"'
+      - labels:
+          stream:
+          service:
+          project:
+      # 2. Only this stack's containers (other projects on the host are dropped).
+      - match:
+          selector: '{project!="payment"}'
+          action: drop
+      # 3. The app logs JSON (tracing-subscriber): promote its level to a label
+      #    so `{service="payment-workers", level="ERROR"}` works. Non-JSON lines
+      #    (postgres, redis, nats, caddy) skip this stage harmlessly.
       - json:
           source: log
           expressions:
             level: level
-            target: target
-            message: fields.message
       - labels:
-          stream:
           level:
+      # 4. Store the raw app line, not the Docker envelope.
       - output:
           source: log
+
+  # Caddy's JSON access log (rolled by Caddy itself on the caddydata volume).
+  - job_name: caddy-access
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: caddy-access
+          project: payment
+          service: caddy-access
+          __path__: /caddy-data/access.log

@@ -1,0 +1,35 @@
+# Alertmanager: one webhook receiver. The URL is not in this file — it comes
+# from ALERT_WEBHOOK_URL in deploy/.env, which the compose overlay writes to
+# /etc/alertmanager/webhook_url (see `configs:` in docker-compose.monitoring.yml).
+# Point it at whatever pages you: a Slack/Mattermost incoming webhook via a
+# bridge, PagerDuty/Opsgenie events API, ntfy.sh, or your own tiny receiver.
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: ops-webhook
+  group_by: ["alertname", "service", "job"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Money-integrity and availability alerts nag every hour until resolved.
+    - matchers:
+        - severity="critical"
+      receiver: ops-webhook
+      repeat_interval: 1h
+
+receivers:
+  - name: ops-webhook
+    webhook_configs:
+      - url_file: /etc/alertmanager/webhook_url
+        send_resolved: true
+        max_alerts: 20
+
+inhibit_rules:
+  # A critical alert for a service silences its warnings.
+  - source_matchers:
+      - severity="critical"
+    target_matchers:
+      - severity="warning"
+    equal: ["service", "job"]

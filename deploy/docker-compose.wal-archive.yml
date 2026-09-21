@@ -1,0 +1,72 @@
+# OPT-IN overlay: continuous WAL archiving + base backups to an off-box
+# S3-compatible bucket with pgBackRest, i.e. point-in-time recovery instead of
+# "the last nightly dump". Layered on top of the prod (or lan) file:
+#
+#   1. cp pgbackrest/pgbackrest.conf.example secrets/pgbackrest.conf
+#      edit the CHANGE_ME lines (bucket, keys, cipher pass); chmod 644 secrets/pgbackrest.conf
+#   2. COMPOSE_FILE=docker-compose.prod.yml:docker-compose.wal-archive.yml  (in deploy/.env)
+#   3. ./deploy.sh                   builds payment-postgres (postgres + pgbackrest)
+#                                    and restarts postgres with archive_mode=on
+#   4. docker compose exec -u postgres postgres pgbackrest --stanza=payment stanza-create
+#      docker compose exec -u postgres postgres pgbackrest --stanza=payment check
+#   5. schedule base backups from the host crontab (see deploy/README.md):
+#      0 3 * * 0   cd ~/payment_system/deploy && docker compose exec -T -u postgres postgres pgbackrest --stanza=payment --type=full backup
+#      0 3 * * 1-6 cd ~/payment_system/deploy && docker compose exec -T -u postgres postgres pgbackrest --stanza=payment --type=diff backup
+#
+# The nightly logical dumps keep running: they are the simple, tool-free
+# fallback and what restore-drill.sh exercises.
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
+    image: payment-postgres:${IMAGE_TAG:-latest}
+    # `command` is replaced wholesale by an overlay, so the tuning from the base
+    # file is repeated here — keep the two lists in sync.
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=384MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - wal_compression=on
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - log_min_duration_statement=250ms
+      - -c
+      - log_lock_waits=on
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - synchronous_commit=on
+      # --- archiving ---
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=pgbackrest --stanza=payment archive-push %p
+      # Ship a partial segment at least every 5 minutes on a quiet system, so
+      # the recovery point is never older than that.
+      - -c
+      - archive_timeout=300
+    secrets:
+      - postgres_password
+      - source: pgbackrest_conf
+        target: /etc/pgbackrest/pgbackrest.conf
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - pgbackrest_spool:/var/spool/pgbackrest
+      - pgbackrest_log:/var/log/pgbackrest
+
+secrets:
+  pgbackrest_conf:
+    file: ./secrets/pgbackrest.conf
+
+volumes:
+  pgbackrest_spool:
+  pgbackrest_log:

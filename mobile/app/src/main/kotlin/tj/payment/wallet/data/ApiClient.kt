@@ -2,17 +2,29 @@ package tj.payment.wallet.data
 
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.KSerializer
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import okhttp3.Authenticator
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import okhttp3.Route
 import tj.payment.core.AccountResponse
 import tj.payment.core.ApiOutcome
@@ -26,6 +38,7 @@ import tj.payment.core.FxRateDto
 import tj.payment.core.FxRequest
 import tj.payment.core.FxResponse
 import tj.payment.core.KycStatusResponse
+import tj.payment.core.KycSubmissionDto
 import tj.payment.core.PostResponse
 import tj.payment.core.RefreshRequest
 import tj.payment.core.ResolveResponse
@@ -34,22 +47,55 @@ import tj.payment.core.SubmitKycRequest
 import tj.payment.core.TokenResponse
 import tj.payment.core.TransferRequest
 import tj.payment.core.WalletDto
-import tj.payment.core.map
 
 /**
  * The single HTTP boundary to the payment backend. Thin on purpose: OkHttp +
  * kotlinx-serialization, no Retrofit proxies or reflection — fast, small, and
  * every request path is explicit and auditable.
  *
- * Two cross-cutting behaviours live here so no call site can forget them:
- *  - an interceptor attaches the Bearer access token;
- *  - an [Authenticator] transparently refreshes a rotated/expired token on a
- *    401, single-flight, and retries the original request once.
+ * Cross-cutting behaviours live here so no call site can forget them:
+ *  - an interceptor attaches the Bearer access token, rotating it first when it
+ *    is near expiry (so the first request after idle never pays a 401 round trip);
+ *  - an [Authenticator] refreshes a rotated/expired token on a 401 — single-flight
+ *    — and retries the original request once;
+ *  - a refresh that cannot be completed (network, 5xx, unreadable body) is
+ *    reported as *offline*, never as *signed out*: only the server saying 401/403
+ *    to the refresh token ends a session. The backend keeps a short reuse-grace
+ *    window for a just-rotated refresh token, so a lost refresh answer recovers;
+ *  - a proactive rotation is scheduled at ~80% of `expires_in` while the app is
+ *    on screen.
+ *
+ * No Android types here: this class unit-tests on the JVM against MockWebServer.
  */
 class ApiClient(
     private val baseUrl: String,
-    private val session: SecureSession,
+    private val session: SessionStore,
+    timeouts: Timeouts = Timeouts(),
+    /** Whether the app is on screen; the proactive-refresh timer waits for it. */
+    private val foreground: StateFlow<Boolean> = MutableStateFlow(true),
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    private val clock: () -> Long = System::currentTimeMillis,
 ) {
+    data class Timeouts(
+        val connectMs: Long = 10_000,
+        val readMs: Long = 20_000,
+        val writeMs: Long = 20_000,
+        /** Ceiling on a whole call incl. the authenticator's refresh + retry. */
+        val callMs: Long = 45_000,
+    )
+
+    /** Outcome of exchanging the refresh token. Tri-state on purpose. */
+    sealed interface RefreshOutcome {
+        /** A usable access token is in the session (rotated by us, or by a concurrent caller). */
+        data class Refreshed(val accessToken: String) : RefreshOutcome
+
+        /** The server said 401/403 to the refresh token: the family is revoked or expired. Session cleared. */
+        data object Dead : RefreshOutcome
+
+        /** Transport failure, 5xx, or an unreadable body: unknown; the session is kept. */
+        data class Unreachable(val cause: IOException) : RefreshOutcome
+    }
+
     private val json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
@@ -57,88 +103,105 @@ class ApiClient(
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
 
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .addInterceptor(AuthHeaderInterceptor(session))
+        .connectTimeout(timeouts.connectMs, TimeUnit.MILLISECONDS)
+        .readTimeout(timeouts.readMs, TimeUnit.MILLISECONDS)
+        .writeTimeout(timeouts.writeMs, TimeUnit.MILLISECONDS)
+        .callTimeout(timeouts.callMs, TimeUnit.MILLISECONDS)
+        // A redirect would re-send the bearer (and a money-moving POST body)
+        // wherever it pointed. The API never redirects; treat one as an error.
+        .followRedirects(false)
+        .followSslRedirects(false)
+        // TODO(prod TLS): .certificatePinner(...) goes here — the bare client
+        // below derives from this one, so pinning applies to the refresh call too.
+        .addInterceptor(AuthHeaderInterceptor())
         .authenticator(RefreshAuthenticator())
         .build()
 
-    // --- Public endpoints (no bearer) ---
+    /**
+     * For the refresh call itself: the main client minus its auth plumbing (no
+     * recursion), sharing the connection pool, dispatcher, timeouts and any
+     * future pinner instead of standing up a second stack per refresh.
+     */
+    private val bareClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .authenticator(Authenticator.NONE)
+            .apply {
+                interceptors().clear()
+                networkInterceptors().clear()
+            }
+            .build()
+    }
+
+    // --- Public endpoints (no bearer; a 401 here is the answer, never a refresh trigger) ---
 
     suspend fun register(phone: String, password: String): ApiOutcome<TokenResponse> =
-        postJson(
-            "/v1/auth/register",
-            json.encodeToString(CredentialsRequest.serializer(), CredentialsRequest(phone, password)),
-            authed = false,
-        ).decode(TokenResponse.serializer())
+        call(
+            post("/v1/auth/register", CredentialsRequest.serializer(), CredentialsRequest(phone, password), authed = false),
+            TokenResponse.serializer(),
+        )
 
     suspend fun login(phone: String, password: String): ApiOutcome<TokenResponse> =
-        postJson(
-            "/v1/auth/login",
-            json.encodeToString(CredentialsRequest.serializer(), CredentialsRequest(phone, password)),
-            authed = false,
-        ).decode(TokenResponse.serializer())
+        call(
+            post("/v1/auth/login", CredentialsRequest.serializer(), CredentialsRequest(phone, password), authed = false),
+            TokenResponse.serializer(),
+        )
 
     suspend fun logout(refreshToken: String): ApiOutcome<Unit> =
-        postJson(
-            "/v1/auth/logout",
-            json.encodeToString(RefreshRequest.serializer(), RefreshRequest(refreshToken)),
-            authed = false,
-        ).map { }
+        callIgnoringBody(post("/v1/auth/logout", RefreshRequest.serializer(), RefreshRequest(refreshToken), authed = false))
+
+    /**
+     * Re-establish a session from the persisted refresh token in ONE request
+     * (launch restore). Adopts the new tokens; clears the session on [RefreshOutcome.Dead].
+     */
+    suspend fun refreshSession(): RefreshOutcome = withContext(Dispatchers.IO) {
+        ensureFreshToken(staleToken = session.accessToken())
+    }
+
+    /**
+     * Make [tokens] the session: refresh token persisted first (if we die right
+     * here, the next launch still holds the valid, newest one), then the access
+     * token in memory with its lifetime, then a proactive rotation scheduled.
+     */
+    fun adoptTokens(tokens: TokenResponse) {
+        session.persistTokens(tokens.userId, tokens.refreshToken)
+        session.setAccessToken(tokens.accessToken, tokens.expiresInSeconds, clock())
+        scheduleProactiveRefresh(tokens.accessToken, tokens.expiresInSeconds)
+    }
 
     // --- Authenticated endpoints ---
 
     suspend fun wallets(): ApiOutcome<List<WalletDto>> =
-        get("/v1/wallets", authed = true)
-            .decode(kotlinx.serialization.builtins.ListSerializer(WalletDto.serializer()))
+        call(get("/v1/wallets"), ListSerializer(WalletDto.serializer()))
 
     suspend fun createWallet(currency: String): ApiOutcome<AccountResponse> =
-        postJson(
-            "/v1/wallets",
-            json.encodeToString(CreateWalletRequest.serializer(), CreateWalletRequest(currency)),
-            authed = true,
-        ).decode(AccountResponse.serializer())
+        call(post("/v1/wallets", CreateWalletRequest.serializer(), CreateWalletRequest(currency)), AccountResponse.serializer())
 
     suspend fun config(): ApiOutcome<ClientConfigResponse> =
-        get("/v1/config", authed = true)
-            .decode(ClientConfigResponse.serializer())
+        call(get("/v1/config"), ClientConfigResponse.serializer())
 
     /** The "check number" / QR-scan lookup used by the send flow. */
     suspend fun resolveByPhone(phone: String): ApiOutcome<ResolveResponse> =
-        get("/v1/users/resolve?phone=${phone.urlEncode()}", authed = true)
-            .decode(ResolveResponse.serializer())
+        call(get("/v1/users/resolve?phone=${phone.urlEncode()}"), ResolveResponse.serializer())
 
     suspend fun resolveByWallet(walletId: String): ApiOutcome<ResolveResponse> =
-        get("/v1/users/resolve?wallet=${walletId.urlEncode()}", authed = true)
-            .decode(ResolveResponse.serializer())
+        call(get("/v1/users/resolve?wallet=${walletId.urlEncode()}"), ResolveResponse.serializer())
 
     /** One page of an account's statement, newest first. */
-    suspend fun statement(
-        accountId: String,
-        cursor: String?,
-        limit: Int,
-    ): ApiOutcome<StatementResponse> {
+    suspend fun statement(accountId: String, cursor: String?, limit: Int): ApiOutcome<StatementResponse> {
         val query = buildString {
             append("?limit=").append(limit)
             if (cursor != null) append("&cursor=").append(cursor.urlEncode())
         }
-        return get("/v1/accounts/${accountId.urlEncode()}/transactions$query", authed = true)
-            .decode(StatementResponse.serializer())
+        return call(get("/v1/accounts/${accountId.urlEncode()}/transactions$query"), StatementResponse.serializer())
     }
 
     /** Post a transfer. [idempotencyKey] comes from the PaymentSubmitter — the
      * same key MUST be resent on retries so the server charges at most once. */
     suspend fun transfer(request: TransferRequest, idempotencyKey: String): ApiOutcome<PostResponse> =
-        postJson(
-            "/v1/transfers",
-            json.encodeToString(TransferRequest.serializer(), request),
-            authed = true,
-            idempotencyKey = idempotencyKey,
-        ).decode(PostResponse.serializer())
+        call(post("/v1/transfers", TransferRequest.serializer(), request, idempotencyKey = idempotencyKey), PostResponse.serializer())
 
     suspend fun kycStatus(): ApiOutcome<KycStatusResponse> =
-        get("/v1/kyc", authed = true)
-            .decode(KycStatusResponse.serializer())
+        call(get("/v1/kyc"), KycStatusResponse.serializer())
 
     /** Upload an identity document (multipart field `file`). */
     suspend fun uploadKycDocument(bytes: ByteArray, mimeType: String): ApiOutcome<DocumentResponse> {
@@ -147,93 +210,85 @@ class ApiClient(
             .addFormDataPart("file", "document", bytes.toRequestBody(mimeType.toMediaType()))
             .build()
         val request = Request.Builder().url("$baseUrl/v1/kyc/documents").post(body).build()
-        return execute(request).decode(DocumentResponse.serializer())
+        return call(request, DocumentResponse.serializer())
     }
 
-    suspend fun submitKyc(request: SubmitKycRequest): ApiOutcome<tj.payment.core.KycSubmissionDto> =
-        postJson(
-            "/v1/kyc/submissions",
-            json.encodeToString(SubmitKycRequest.serializer(), request),
-            authed = true,
-        ).decode(tj.payment.core.KycSubmissionDto.serializer())
+    suspend fun submitKyc(request: SubmitKycRequest): ApiOutcome<KycSubmissionDto> =
+        call(post("/v1/kyc/submissions", SubmitKycRequest.serializer(), request), KycSubmissionDto.serializer())
 
     suspend fun fxRates(): ApiOutcome<List<FxRateDto>> =
-        get("/v1/fx/rates", authed = true)
-            .decode(kotlinx.serialization.builtins.ListSerializer(FxRateDto.serializer()))
+        call(get("/v1/fx/rates"), ListSerializer(FxRateDto.serializer()))
 
     /** Convert between the caller's own wallets. Same idempotency contract as [transfer]. */
     suspend fun fx(request: FxRequest, idempotencyKey: String): ApiOutcome<FxResponse> =
-        postJson(
-            "/v1/fx",
-            json.encodeToString(FxRequest.serializer(), request),
-            authed = true,
-            idempotencyKey = idempotencyKey,
-        ).decode(FxResponse.serializer())
+        call(post("/v1/fx", FxRequest.serializer(), request, idempotencyKey = idempotencyKey), FxResponse.serializer())
 
-    // --- Plumbing ---
+    // --- Request building ---
 
-    private data class Raw(val status: Int, val body: String)
+    /** Typed request tag: carries no bearer and must never enter the refresh path. */
+    private object NoAuth
 
-    private suspend fun postJson(
+    private fun <T> post(
         path: String,
-        payload: String,
-        authed: Boolean,
+        serializer: KSerializer<T>,
+        payload: T,
+        authed: Boolean = true,
         idempotencyKey: String? = null,
-    ): ApiOutcome<Raw> {
-        val request = Request.Builder()
-            .url(baseUrl + path)
-            .post(payload.toRequestBody(jsonMedia))
-            .apply {
-                if (!authed) header(NO_AUTH_HEADER, "1")
-                if (idempotencyKey != null) header("Idempotency-Key", idempotencyKey)
-            }
-            .build()
-        return execute(request)
-    }
+    ): Request = Request.Builder()
+        .url(baseUrl + path)
+        .post(json.encodeToString(serializer, payload).toRequestBody(jsonMedia))
+        .apply {
+            if (!authed) tag(NoAuth::class.java, NoAuth)
+            if (idempotencyKey != null) header("Idempotency-Key", idempotencyKey)
+        }
+        .build()
 
-    private suspend fun get(path: String, authed: Boolean): ApiOutcome<Raw> {
-        val request = Request.Builder()
-            .url(baseUrl + path)
-            .get()
-            .apply { if (!authed) header(NO_AUTH_HEADER, "1") }
-            .build()
-        return execute(request)
-    }
+    private fun get(path: String): Request = Request.Builder().url(baseUrl + path).get().build()
 
-    private suspend fun execute(request: Request): ApiOutcome<Raw> = withContext(Dispatchers.IO) {
-        try {
-            client.newCall(request).execute().use { resp ->
-                val bodyStr = resp.body?.string().orEmpty()
-                if (resp.isSuccessful) {
-                    ApiOutcome.Ok(Raw(resp.code, bodyStr))
-                } else {
-                    ApiOutcome.Failed(errorCodeOf(resp.code, bodyStr), resp.code, messageOf(bodyStr))
+    // --- Execution (everything — I/O and JSON decode — off the caller's thread) ---
+
+    private suspend fun <T> call(request: Request, serializer: KSerializer<T>): ApiOutcome<T> =
+        withContext(Dispatchers.IO) {
+            try {
+                client.newCall(request).execute().use { resp ->
+                    val body = resp.body?.string().orEmpty()
+                    if (resp.isSuccessful) decode(resp.code, body, serializer) else failure(resp.code, body)
                 }
+            } catch (e: IOException) {
+                ApiOutcome.Offline(e)
             }
-        } catch (e: IOException) {
-            ApiOutcome.Offline(e)
         }
+
+    private suspend fun callIgnoringBody(request: Request): ApiOutcome<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                client.newCall(request).execute().use { resp ->
+                    val body = resp.body?.string().orEmpty()
+                    if (resp.isSuccessful) ApiOutcome.Ok(Unit) else failure(resp.code, body)
+                }
+            } catch (e: IOException) {
+                ApiOutcome.Offline(e)
+            }
+        }
+
+    /**
+     * A 2xx we cannot read becomes `Failed` with the 2xx status — callers that
+     * move money (PaymentSubmitter) treat that as "accepted, answer lost", never
+     * as a refusal.
+     */
+    private fun <T> decode(status: Int, body: String, serializer: KSerializer<T>): ApiOutcome<T> = try {
+        if (body.isBlank()) {
+            ApiOutcome.Failed(ErrorCode.UNKNOWN, status, "empty response body")
+        } else {
+            ApiOutcome.Ok(json.decodeFromString(serializer, body))
+        }
+    } catch (e: Exception) {
+        ApiOutcome.Failed(ErrorCode.UNKNOWN, status, "malformed response: ${e.message}")
     }
 
-    private fun <T> ApiOutcome<Raw>.decode(
-        serializer: kotlinx.serialization.KSerializer<T>,
-    ): ApiOutcome<T> = when (this) {
-        is ApiOutcome.Ok -> try {
-            if (value.body.isBlank()) {
-                ApiOutcome.Failed(ErrorCode.UNKNOWN, value.status, "empty response body")
-            } else {
-                ApiOutcome.Ok(json.decodeFromString(serializer, value.body))
-            }
-        } catch (e: Exception) {
-            ApiOutcome.Failed(ErrorCode.UNKNOWN, value.status, "malformed response: ${e.message}")
-        }
-        is ApiOutcome.Failed -> this
-        is ApiOutcome.Offline -> this
-    }
-
-    private fun errorCodeOf(status: Int, body: String): ErrorCode {
-        parseEnvelope(body)?.error?.code?.let { return ErrorCode.fromWire(it) }
-        return when (status) {
+    private fun failure(status: Int, body: String): ApiOutcome.Failed {
+        val error = parseEnvelope(body)?.error
+        val code = error?.code?.let { ErrorCode.fromWire(it) } ?: when (status) {
             401 -> ErrorCode.UNAUTHORIZED
             403 -> ErrorCode.FORBIDDEN
             404 -> ErrorCode.NOT_FOUND
@@ -242,9 +297,8 @@ class ApiClient(
             429 -> ErrorCode.RATE_LIMITED
             else -> ErrorCode.UNKNOWN
         }
+        return ApiOutcome.Failed(code, status, error?.message, error?.requestId)
     }
-
-    private fun messageOf(body: String): String? = parseEnvelope(body)?.error?.message
 
     private fun parseEnvelope(body: String): ErrorEnvelope? = try {
         if (body.isBlank()) null else json.decodeFromString(ErrorEnvelope.serializer(), body)
@@ -252,58 +306,137 @@ class ApiClient(
         null
     }
 
-    /** Adds `Authorization: Bearer <access>` unless the request opts out. */
-    private class AuthHeaderInterceptor(private val session: SecureSession) : Interceptor {
+    // --- Token lifecycle ---
+
+    private val refreshLock = Any()
+
+    /**
+     * Single-flight rotation. [staleToken] is the access token the caller holds
+     * (null if none): when the session already holds a *different* one, another
+     * caller rotated while we waited for the lock and we simply reuse it.
+     * Blocking; call from an I/O thread. Applies the outcome to the session.
+     */
+    private fun ensureFreshToken(staleToken: String?): RefreshOutcome {
+        synchronized(refreshLock) {
+            val current = session.accessToken()
+            if (current != null && current != staleToken) return RefreshOutcome.Refreshed(current)
+            val refreshToken = session.refreshToken() ?: return RefreshOutcome.Dead
+            return when (val result = refreshBlocking(refreshToken)) {
+                is RefreshResult.Rotated -> {
+                    adoptTokens(result.tokens)
+                    RefreshOutcome.Refreshed(result.tokens.accessToken)
+                }
+                RefreshResult.Dead -> {
+                    session.clear()
+                    RefreshOutcome.Dead
+                }
+                is RefreshResult.Unreachable -> RefreshOutcome.Unreachable(result.cause)
+            }
+        }
+    }
+
+    private sealed interface RefreshResult {
+        data class Rotated(val tokens: TokenResponse) : RefreshResult
+        data object Dead : RefreshResult
+        data class Unreachable(val cause: IOException) : RefreshResult
+    }
+
+    /** Blocking refresh on the bare client — safe inside the Authenticator (no recursion). */
+    private fun refreshBlocking(refreshToken: String): RefreshResult {
+        val request = post("/v1/auth/refresh", RefreshRequest.serializer(), RefreshRequest(refreshToken), authed = false)
+        return try {
+            bareClient.newCall(request).execute().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                when {
+                    resp.code == 401 || resp.code == 403 -> RefreshResult.Dead
+                    !resp.isSuccessful -> RefreshResult.Unreachable(IOException("refresh answered HTTP ${resp.code}"))
+                    else -> try {
+                        RefreshResult.Rotated(json.decodeFromString(TokenResponse.serializer(), body))
+                    } catch (e: Exception) {
+                        // A malformed 200 used to escape the authenticator as a
+                        // SerializationException and crash the call.
+                        RefreshResult.Unreachable(IOException("refresh answered an unreadable body", e))
+                    }
+                }
+            }
+        } catch (e: IOException) {
+            RefreshResult.Unreachable(e)
+        }
+    }
+
+    private var refreshJob: Job? = null
+
+    /**
+     * Rotate at ~80% of the lifetime so the first request after idle finds a
+     * fresh token. Waits for the app to be on screen (a frozen/background app
+     * does no rotation; the interceptor's staleness check covers its return).
+     */
+    private fun scheduleProactiveRefresh(accessToken: String, expiresInSeconds: Long) {
+        synchronized(refreshLock) {
+            refreshJob?.cancel()
+            if (expiresInSeconds <= 0) {
+                refreshJob = null
+                return
+            }
+            refreshJob = scope.launch {
+                delay(expiresInSeconds * 1000L * PROACTIVE_AT_PERCENT / 100)
+                foreground.first { it }
+                if (session.accessToken() != accessToken) return@launch // already rotated
+                // Unreachable is ignored here: the interceptor / 401 path retries
+                // on the next real request, and Dead has already cleared the session.
+                withContext(Dispatchers.IO) { ensureFreshToken(accessToken) }
+            }
+        }
+    }
+
+    /**
+     * Adds `Authorization: Bearer <access>` unless the request is tagged
+     * [NoAuth]; a token past ~80% of its lifetime is rotated first.
+     */
+    private inner class AuthHeaderInterceptor : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
-            val original = chain.request()
-            if (original.header(NO_AUTH_HEADER) != null) {
-                return chain.proceed(original.newBuilder().removeHeader(NO_AUTH_HEADER).build())
+            val request = chain.request()
+            if (request.tag(NoAuth::class.java) != null) return chain.proceed(request)
+
+            var token = session.accessToken()
+            if (token != null && session.accessTokenStale(clock())) {
+                when (val fresh = ensureFreshToken(token)) {
+                    is RefreshOutcome.Refreshed -> token = fresh.accessToken
+                    // The session is gone; answer as the server would, without a
+                    // pointless round trip (the authenticator then finds no
+                    // refresh token and lets the 401 through).
+                    RefreshOutcome.Dead -> return syntheticUnauthorized(request)
+                    // Surfaces from execute() as Offline: the server was unreachable.
+                    is RefreshOutcome.Unreachable -> throw fresh.cause
+                }
             }
-            val token = session.accessToken()
-            val request = if (token != null) {
-                original.newBuilder().header("Authorization", "Bearer $token").build()
-            } else {
-                original
-            }
-            return chain.proceed(request)
+            return chain.proceed(if (token != null) request.withBearer(token) else request)
         }
     }
 
     /**
      * On a 401, mint a fresh access token from the refresh token and retry once.
-     * Single-flight: concurrent 401s serialize on [refreshLock]; a request that
-     * arrives after another thread already refreshed simply reuses the new token.
-     * A refresh that itself fails (revoked family / expired) wipes the session so
-     * the UI falls back to password login.
+     * Single-flight via [ensureFreshToken]. A refresh the server refuses (401/403)
+     * wipes the session so the UI falls back to password login; one that cannot
+     * be completed throws an [IOException] — allowed by the Authenticator
+     * contract — so the call fails as *offline* with the session intact.
      */
     private inner class RefreshAuthenticator : Authenticator {
-        private val refreshLock = Any()
-
+        @Throws(IOException::class)
         override fun authenticate(route: Route?, response: Response): Request? {
-            if (priorResponseCount(response) >= 2) return null // already retried once
-            val tokenThatFailed = authTokenOf(response.request)
+            // login/register/refresh/logout: a 401 is the answer, not a stale token.
+            if (response.request.tag(NoAuth::class.java) != null) return null
+            if (responseCount(response) >= 2) return null // already retried once
 
-            synchronized(refreshLock) {
-                val current = session.accessToken()
-                if (current != null && current != tokenThatFailed) {
-                    // Another thread refreshed while we waited; just use it.
-                    return response.request.withBearer(current)
-                }
-                val refresh = session.refreshToken() ?: return null
-                val newTokens = refreshBlocking(refresh) ?: run {
-                    session.clear()
-                    return null
-                }
-                session.setAccessToken(newTokens.accessToken)
-                session.persistTokens(newTokens.userId, newTokens.refreshToken)
-                return response.request.withBearer(newTokens.accessToken)
+            val failedToken = response.request.header("Authorization")?.removePrefix("Bearer ")
+            return when (val fresh = ensureFreshToken(failedToken)) {
+                is RefreshOutcome.Refreshed -> response.request.withBearer(fresh.accessToken)
+                RefreshOutcome.Dead -> null
+                is RefreshOutcome.Unreachable -> throw IOException("token refresh unreachable", fresh.cause)
             }
         }
 
-        private fun authTokenOf(request: Request): String? =
-            request.header("Authorization")?.removePrefix("Bearer ")
-
-        private fun priorResponseCount(response: Response): Int {
+        private fun responseCount(response: Response): Int {
             var count = 1
             var prior = response.priorResponse
             while (prior != null) {
@@ -314,35 +447,19 @@ class ApiClient(
         }
     }
 
-    /** Blocking refresh on a bare client (no auth/authenticator) — safe to call
-     * from inside the Authenticator without recursion. */
-    private fun refreshBlocking(refreshToken: String): TokenResponse? {
-        val bareClient = OkHttpClient.Builder()
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(20, TimeUnit.SECONDS)
-            .build()
-        val payload = json.encodeToString(RefreshRequest.serializer(), RefreshRequest(refreshToken))
-        val request = Request.Builder()
-            .url("$baseUrl/v1/auth/refresh")
-            .post(payload.toRequestBody(jsonMedia))
-            .build()
-        return try {
-            bareClient.newCall(request).execute().use { resp ->
-                if (!resp.isSuccessful) return null
-                val body = resp.body?.string().orEmpty()
-                if (body.isBlank()) null
-                else json.decodeFromString(TokenResponse.serializer(), body)
-            }
-        } catch (_: IOException) {
-            null
-        }
-    }
+    private fun syntheticUnauthorized(request: Request): Response = Response.Builder()
+        .request(request)
+        .protocol(Protocol.HTTP_1_1)
+        .code(401)
+        .message("session expired")
+        .body("".toResponseBody(null))
+        .build()
 
     private fun Request.withBearer(token: String): Request =
         newBuilder().header("Authorization", "Bearer $token").build()
 
     private companion object {
-        const val NO_AUTH_HEADER = "X-No-Auth"
+        const val PROACTIVE_AT_PERCENT = 80
     }
 }
 

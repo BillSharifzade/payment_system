@@ -24,6 +24,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -45,9 +46,10 @@ fun LoginScreen(
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
 
-    if (state.authenticated) {
-        onAuthenticated()
-        return
+    // Navigation is a side effect: run it once when the flag flips, never
+    // during composition (which can re-run any number of times).
+    LaunchedEffect(state.authenticated) {
+        if (state.authenticated) onAuthenticated()
     }
 
     val isRegister = state.mode == AuthMode.REGISTER

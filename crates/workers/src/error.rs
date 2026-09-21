@@ -1,4 +1,3 @@
-/// Errors from background workers.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
     #[error("database error: {0}")]
@@ -7,7 +6,6 @@ pub enum WorkerError {
     #[error("signing error: {0}")]
     Signing(#[from] crypto::SigningError),
 
-    /// The checkpoint chain failed verification — this is a tamper alarm.
     #[error("checkpoint chain broken at seq {seq}: {reason}")]
     ChainBroken { seq: i64, reason: String },
 

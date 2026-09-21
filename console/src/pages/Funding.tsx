@@ -1,21 +1,134 @@
-import { useState } from "react";
-import { AdminUser, ApiError, deposit, formatMinor, lookupUser, uuidv4 } from "../api";
+import { useEffect, useState } from "react";
+import {
+  AdminUser,
+  ApiError,
+  Wallet,
+  deposit,
+  describeError,
+  isAbort,
+  lookupUser,
+  uuidv4,
+} from "../api";
+import { formatMinor, toMinor } from "../money";
 import { Alert, Badge, Icon, IdChip, UserSearch, useToast } from "../ui";
 
 // The console's half of the idempotency contract: the key is created when the
 // operator confirms, persisted BEFORE the first request, and reused verbatim on
 // retry — so a timeout can never double-fund a wallet.
+//
+// It lives in localStorage, not sessionStorage: sessionStorage dies with the
+// tab, and a tab crash mid-request — after the server had already posted the
+// deposit — would leave no banner, inviting the operator to fund it again.
+// The record holds no secret (a random key, a wallet id, an amount), so
+// surviving the tab is exactly what we want.
 const PENDING_KEY = "console-pending-deposit";
 const QUICK_AMOUNTS = [100, 500, 1000, 5000];
 
 type Pending = { key: string; wallet: string; amount_minor: number; phone: string };
 
-// Parse operator-typed amount (accepts "1 500,50" or "1500.50") into minor units.
-function toMinor(raw: string): number | null {
-  const cleaned = raw.replace(/\s/g, "").replace(",", ".");
-  if (!/^\d+(\.\d{0,2})?$/.test(cleaned)) return null;
-  const minor = Math.round(parseFloat(cleaned) * 100);
-  return Number.isFinite(minor) && minor > 0 ? minor : null;
+function readPending(): Pending | null {
+  try {
+    const raw = localStorage.getItem(PENDING_KEY);
+    if (!raw) return null;
+    const p = JSON.parse(raw) as Partial<Pending>;
+    return typeof p.key === "string" &&
+      typeof p.wallet === "string" &&
+      typeof p.amount_minor === "number" &&
+      typeof p.phone === "string"
+      ? (p as Pending)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function writePending(p: Pending | null) {
+  try {
+    if (p) localStorage.setItem(PENDING_KEY, JSON.stringify(p));
+    else localStorage.removeItem(PENDING_KEY);
+  } catch {
+    /* storage unavailable (private mode / quota) — the in-memory copy still guards this tab */
+  }
+}
+
+/** The unresolved-deposit banner. Looks up the target wallet's balance so the
+ *  operator can see whether the deposit landed before deciding what to do. */
+function PendingBanner({
+  pending,
+  busy,
+  checkSeq,
+  onRecheck,
+  onRetry,
+  onDiscard,
+}: {
+  pending: Pending;
+  busy: boolean;
+  checkSeq: number;
+  onRecheck: () => void;
+  onRetry: () => void;
+  onDiscard: () => void;
+}) {
+  const [check, setCheck] = useState<{
+    seq: number;
+    wallet: Wallet | null;
+    error: string | null;
+  } | null>(null);
+
+  useEffect(() => {
+    const ac = new AbortController();
+    lookupUser(pending.phone, ac.signal)
+      .then((u) =>
+        setCheck({
+          seq: checkSeq,
+          wallet: u.wallets.find((w) => w.id === pending.wallet) ?? null,
+          error: null,
+        }),
+      )
+      .catch((e) => {
+        if (!isAbort(e)) setCheck({ seq: checkSeq, wallet: null, error: describeError(e) });
+      });
+    return () => ac.abort();
+  }, [pending.key, pending.phone, pending.wallet, checkSeq]);
+
+  const fresh = check?.seq === checkSeq ? check : null;
+
+  return (
+    <Alert kind="warning" title="A deposit is pending confirmation">
+      <div className="fund-pending">
+        <span>
+          {formatMinor(pending.amount_minor, "TJS")} → <IdChip id={pending.wallet} /> for{" "}
+          <span className="mono">{pending.phone}</span>. The request was sent but no answer
+          arrived, so it may or may not have been posted.
+        </span>
+        <span>
+          Wallet balance now:{" "}
+          {fresh === null ? (
+            <span className="muted">checking…</span>
+          ) : fresh.error ? (
+            <span className="bad">unavailable ({fresh.error})</span>
+          ) : fresh.wallet ? (
+            <strong>{fresh.wallet.display}</strong>
+          ) : (
+            <span className="bad">wallet not found on this user</span>
+          )}
+          . Retrying with the same key is always safe — the server de-duplicates on the key, so
+          a deposit that already landed is never applied twice.
+        </span>
+        <div className="row">
+          <button className="primary" disabled={busy} onClick={onRetry}>
+            <Icon name="refresh" size={14} />
+            {busy ? "Retrying…" : "Retry (same key)"}
+          </button>
+          <button className="quiet" disabled={busy} onClick={onRecheck}>
+            Re-check balance
+          </button>
+          <button className="quiet" disabled={busy} onClick={onDiscard}>
+            Discard
+          </button>
+        </div>
+      </div>
+    </Alert>
+  );
 }
 
 export default function Funding() {
@@ -25,10 +138,18 @@ export default function Funding() {
   const [result, setResult] = useState<{ txn: string; minor: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [pending, setPending] = useState<Pending | null>(() => {
-    const raw = sessionStorage.getItem(PENDING_KEY);
-    return raw ? (JSON.parse(raw) as Pending) : null;
-  });
+  const [pending, setPending] = useState<Pending | null>(readPending);
+  const [checkSeq, setCheckSeq] = useState(0);
+
+  // Another tab may resolve (or create) the pending record; mirror storage so
+  // this tab's banner is never stale.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === null || e.key === PENDING_KEY) setPending(readPending());
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
 
   const tjsWallet = user?.wallets.find((w) => w.currency === "TJS") ?? null;
   const minor = toMinor(amount);
@@ -42,7 +163,7 @@ export default function Funding() {
       setUser(await lookupUser(phone));
     } catch (err) {
       setUser(null);
-      setError(String((err as Error).message ?? err));
+      setError(describeError(err));
     }
   }
 
@@ -51,7 +172,7 @@ export default function Funding() {
     setError(null);
     try {
       const res = await deposit(p.wallet, p.amount_minor, p.key);
-      sessionStorage.removeItem(PENDING_KEY);
+      writePending(null);
       setPending(null);
       setResult({ txn: res.transaction_id, minor: p.amount_minor });
       setAmount("");
@@ -68,12 +189,13 @@ export default function Funding() {
       // retrying a refused request. Timeouts / 429 / 5xx keep the key: outcome
       // unknown, retry the SAME key.
       const definite = err instanceof ApiError && err.status < 500 && err.status !== 429;
-      const msg = String((err as Error).message ?? err);
+      const msg = describeError(err);
       if (definite) {
-        sessionStorage.removeItem(PENDING_KEY);
+        writePending(null);
         setPending(null);
         setError(`Deposit rejected: ${msg}`);
       } else {
+        setCheckSeq((s) => s + 1); // the banner re-reads the balance
         setError(`${msg} — not lost; use “Retry” above (same key) rather than depositing again.`);
       }
     } finally {
@@ -89,14 +211,14 @@ export default function Funding() {
       amount_minor: minor,
       phone: user!.phone,
     };
-    sessionStorage.setItem(PENDING_KEY, JSON.stringify(p));
+    writePending(p);
     setPending(p);
     setResult(null);
     void run(p);
   }
 
   function discardPending() {
-    sessionStorage.removeItem(PENDING_KEY);
+    writePending(null);
     setPending(null);
     setError(null);
   }
@@ -128,23 +250,14 @@ export default function Funding() {
       </header>
 
       {pending && (
-        <Alert kind="warning" title="A deposit is pending confirmation">
-          <div className="fund-pending">
-            <span>
-              {formatMinor(pending.amount_minor, "TJS")} → <IdChip id={pending.wallet} /> for{" "}
-              <span className="mono">{pending.phone}</span>. Its result is unknown.
-            </span>
-            <div className="row" style={{ gap: "0.5rem" }}>
-              <button className="primary" disabled={busy} onClick={() => run(pending)}>
-                <Icon name="refresh" size={14} />
-                {busy ? "Retrying…" : "Retry (same key)"}
-              </button>
-              <button className="quiet" disabled={busy} onClick={discardPending}>
-                Discard
-              </button>
-            </div>
-          </div>
-        </Alert>
+        <PendingBanner
+          pending={pending}
+          busy={busy}
+          checkSeq={checkSeq}
+          onRecheck={() => setCheckSeq((s) => s + 1)}
+          onRetry={() => void run(pending)}
+          onDiscard={discardPending}
+        />
       )}
 
       {/* Step 1 — customer */}

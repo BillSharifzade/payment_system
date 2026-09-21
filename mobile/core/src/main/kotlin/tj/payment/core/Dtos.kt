@@ -28,7 +28,9 @@ data class TokenResponse(
     @SerialName("refresh_token") val refreshToken: String,
     @SerialName("token_type") val tokenType: String = "Bearer",
     // Seconds; the server owns this — the client must not hardcode 15 minutes.
-    @SerialName("expires_in") val expiresInSeconds: Long,
+    // Defaulted so a server that stops sending it cannot break login; 0 means
+    // "unknown", which disables proactive refresh (the 401 path still works).
+    @SerialName("expires_in") val expiresInSeconds: Long = 0,
 )
 
 @Serializable
@@ -51,13 +53,15 @@ data class ResolveResponse(
     @SerialName("name_verified") val nameVerified: Boolean = false,
 )
 
-/** Error envelope: {"error": {"code": "...", "message": "..."}}. */
+/** Error envelope: {"error": {"code": "...", "message": "...", "request_id": "..."}}. */
 @Serializable
 data class ErrorEnvelope(val error: ErrorBody) {
     @Serializable
     data class ErrorBody(
         val code: String? = null,
         val message: String? = null,
+        /** Server correlation id — quote it to support; never shown as the error itself. */
+        @SerialName("request_id") val requestId: String? = null,
     )
 }
 
@@ -113,7 +117,9 @@ data class TransferRequest(
 @Serializable
 data class PostResponse(
     @SerialName("transaction_id") val transactionId: String,
-    val status: String,
+    // Defaulted: a 201 that omits it still means "posted". Only "already_posted"
+    // changes what the user sees.
+    val status: String = "posted",
 )
 
 @Serializable

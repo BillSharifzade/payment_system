@@ -4,7 +4,9 @@ import {
   ApiError,
   UserListItem,
   blockUser,
+  describeError,
   formatTime,
+  isAbort,
   listUsers,
   lookupUser,
   setUserStatus,
@@ -45,29 +47,43 @@ function StatusBadges({ u }: { u: { status: string; kyc_level: number; is_admin:
   );
 }
 
-/** Full profile + enforcement for one user (loaded by phone). */
-function UserDetail({ phone, onBack }: { phone: string; onBack: () => void }) {
+/** Full profile + enforcement for one user (loaded by phone). `onUser` fires
+ *  with every fresh profile — including after Freeze/Block/Unblock — so the
+ *  list behind this view can patch its row instead of showing stale badges. */
+function UserDetail({
+  phone,
+  onBack,
+  onUser,
+}: {
+  phone: string;
+  onBack: () => void;
+  onUser: (u: AdminUser) => void;
+}) {
   const toast = useToast();
   const [user, setUser] = useState<AdminUser | null>(null);
+  const [gen, setGen] = useState(0);
   const [blockReason, setBlockReason] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const load = useCallback(() => {
-    lookupUser(phone)
+  useEffect(() => {
+    const ac = new AbortController();
+    lookupUser(phone, ac.signal)
       .then((u) => {
         setUser(u);
         setError(null);
+        onUser(u);
       })
-      .catch((err) =>
+      .catch((err) => {
+        if (isAbort(err)) return;
         setError(
           err instanceof ApiError && err.status === 404
             ? "No user with that phone number."
-            : String((err as Error).message ?? err),
-        ),
-      );
-  }, [phone]);
-  useEffect(load, [load]);
+            : describeError(err),
+        );
+      });
+    return () => ac.abort();
+  }, [phone, gen, onUser]);
 
   async function act(fn: () => Promise<unknown>, done: string) {
     setBusy(true);
@@ -75,9 +91,9 @@ function UserDetail({ phone, onBack }: { phone: string; onBack: () => void }) {
     try {
       await fn();
       toast("success", done);
-      load();
+      setGen((g) => g + 1); // re-fetch; the effect above also patches the list row
     } catch (e) {
-      setError(String((e as Error).message ?? e));
+      setError(describeError(e));
     } finally {
       setBusy(false);
     }
@@ -96,7 +112,7 @@ function UserDetail({ phone, onBack }: { phone: string; onBack: () => void }) {
       {!user && !error && (
         <div className="panel">
           <Skeleton w="60%" h={22} />
-          <div style={{ height: 12 }} />
+          <div className="gap-12" />
           <Skeleton w="35%" h={14} />
         </div>
       )}
@@ -240,16 +256,19 @@ export default function Users() {
   const [error, setError] = useState<string | null>(null);
   const [openPhone, setOpenPhone] = useState<string | null>(null);
 
-  const loadFirst = useCallback(() => {
-    listUsers({ limit: 25 })
+  useEffect(() => {
+    const ac = new AbortController();
+    listUsers({ limit: 25, signal: ac.signal })
       .then((r) => {
         setRows(r.users);
         setCursor(r.next_cursor);
         setError(null);
       })
-      .catch((e) => setError(String((e as Error).message ?? e)));
+      .catch((e) => {
+        if (!isAbort(e)) setError(describeError(e));
+      });
+    return () => ac.abort();
   }, []);
-  useEffect(loadFirst, [loadFirst]);
 
   async function loadMore() {
     if (!cursor) return;
@@ -259,14 +278,34 @@ export default function Users() {
       setRows((prev) => [...(prev ?? []), ...r.users]);
       setCursor(r.next_cursor);
     } catch (e) {
-      setError(String((e as Error).message ?? e));
+      setError(describeError(e));
     } finally {
       setLoadingMore(false);
     }
   }
 
+  // Keep the list's row in step with what the detail view just learned, so
+  // "back" never shows a badge the operator has just changed.
+  const patchRow = useCallback((u: AdminUser) => {
+    setRows(
+      (prev) =>
+        prev &&
+        prev.map((r) =>
+          r.id === u.id
+            ? {
+                ...r,
+                status: u.status,
+                kyc_level: u.kyc_level,
+                is_admin: u.is_admin,
+                is_blocked: u.blocked_reason !== null,
+              }
+            : r,
+        ),
+    );
+  }, []);
+
   if (openPhone) {
-    return <UserDetail phone={openPhone} onBack={() => setOpenPhone(null)} />;
+    return <UserDetail phone={openPhone} onBack={() => setOpenPhone(null)} onUser={patchRow} />;
   }
 
   return (

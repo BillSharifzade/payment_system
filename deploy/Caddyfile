@@ -1,38 +1,93 @@
-# Reverse proxy + TLS. Set SITE_ADDRESS to your domain (e.g. payments.example.com)
-# in .env and Caddy provisions a Let's Encrypt certificate automatically. Left as
-# ":80" it serves plain HTTP for an initial IP-based smoke test only — use a
-# domain + HTTPS before real traffic.
-{$SITE_ADDRESS} {
+# Edge: TLS termination, reverse proxy for the API, static admin console.
+# Baked into the payment-console image (deploy/Dockerfile.console); the two
+# environment variables below are read when Caddy starts, so they live in
+# deploy/.env and need no rebuild.
+#
+# SITE_ADDRESS — the site address, three shapes:
+#   payments.example.com  public domain: automatic HTTPS (Let's Encrypt/ZeroSSL),
+#                         HTTP->HTTPS redirect, HSTS. Needs 80/443 reachable + DNS.
+#   192.168.1.156         bare IP (LAN box): Caddy cannot get a public cert for an
+#                         IP, so it issues one from its own internal CA
+#                         automatically (equivalent to writing `tls internal`).
+#                         Clients must trust that root CA — see deploy/README.md.
+#   :80                   plain HTTP (the default when unset). LAN smoke tests
+#                         only; no HSTS is emitted because @https never matches.
+# ADMIN_ALLOW_CIDR — space-separated IPs/CIDRs allowed to reach /admin. The
+#   compose files default it to "0.0.0.0/0 ::/0" (= everyone); the Caddyfile
+#   default below only covers build-time validation. NOTE: an EMPTY value does
+#   not fall back to the default — leave the variable unset instead.
+
+{$SITE_ADDRESS::80} {
 	encode zstd gzip
 
-	# Admin console: a static SPA served at /admin (auth happens in-app against
-	# the same-origin API, so no CORS). Tighten further by IP-allowlisting this
-	# block once you know your ops network.
-	handle_path /admin* {
-		root * /srv/admin
-		try_files {path} /index.html
-		file_server
-		header {
-			# blob: is needed for the KYC document viewer (documents are
-			# fetched with the Bearer token and rendered from object URLs).
-			# 'unsafe-inline' styles: React style={} attributes.
-			Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob:; frame-src blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
-			X-Frame-Options "DENY"
-			Referrer-Policy "no-referrer"
+	# JSON access log, rolled at 50 MB x 10 files, on the persistent /data volume
+	# (`docker compose exec caddy tail -f /data/access.log`). Caddy's own runtime
+	# log still goes to stderr -> docker json-file -> Loki.
+	log {
+		output file /data/access.log {
+			roll_size 50mb
+			roll_keep 10
 		}
+		format json
 	}
 
+	# HSTS only over TLS. A plain-HTTP deployment (SITE_ADDRESS=:80) must never
+	# send it: browsers would pin HTTPS for the host and lock themselves out.
+	@https protocol https
+	header @https Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+	# Baseline hardening on every response (API and console alike). Deleting
+	# Server makes Caddy defer the whole block until the upstream has answered.
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+	}
+
+	# ---- Admin console: static SPA at /admin --------------------------------
+	# Auth happens in-app against the same-origin API (no CORS). `handle_path`
+	# strips the /admin prefix, so inside the block paths are /index.html,
+	# /assets/... etc. (the SPA is built with base "/admin/").
+	redir /admin /admin/ 301
+	handle_path /admin/* {
+		# Optional IP allowlist. Caddy is the only proxy hop, so the TCP peer
+		# (remote_ip) IS the client; do not switch to client_ip unless you put
+		# another proxy in front and configure trusted_proxies.
+		@denied not remote_ip {$ADMIN_ALLOW_CIDR:0.0.0.0/0 ::/0}
+		respond @denied 403
+
+		root * /srv/admin
+		try_files {path} /index.html
+
+		# Vite emits content-hashed files under /assets -> cache forever. The
+		# HTML shell that references them must always be revalidated.
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+		@shell not path /assets/*
+		header @shell Cache-Control "no-cache"
+
+		# No 'unsafe-inline': the console has no inline scripts/styles (React
+		# sets style={} through the CSSOM, which CSP does not govern). blob: is
+		# for the KYC document viewer (documents are fetched with the Bearer
+		# token and rendered from object URLs in a sandboxed iframe); data: is
+		# the inline favicon.
+		header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; font-src 'self'; frame-src blob:; connect-src 'self'; form-action 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+
+		file_server
+	}
+
+	# ---- API: everything else (/v1, /health, /ready) ----------------------
 	# Load-balances across all payment-server replicas (Docker DNS returns one
-	# A record per replica; add more with `--scale payment-server=N`).
+	# A record per replica; add more with `--scale payment-server=N`). Active
+	# health checks use /ready, which turns 503 when the database is unreachable,
+	# so a replica that lost its DB is taken out of rotation. Caddy sets
+	# X-Forwarded-For; the app (TRUST_PROXY=true) reads the right-most hop.
 	reverse_proxy payment-server:8080 {
 		lb_policy round_robin
-		health_uri /health
+		health_uri /ready
 		health_interval 5s
 		health_timeout 2s
 	}
-
-	# Caddy sets X-Forwarded-For to the client IP automatically. Since it is the
-	# only proxy hop, the right-most value (what the app trusts) is the real client.
-	header -Server
-	header X-Content-Type-Options nosniff
 }

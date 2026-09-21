@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Metrics, formatMinor, getMetrics } from "../api";
 import { BarChart, MixBar, Sparkline, StackedBars, TrendArea, fmtCompact } from "../charts";
-import { Ago, Alert, Icon, Skeleton, StatTile, useAdminStatus } from "../ui";
+import { formatMinor } from "../money";
+import { useOps } from "../ops";
+import { Ago, Alert, Icon, Skeleton, StatTile } from "../ui";
 
 const SERIES = {
   transfer: "var(--series-transfer)",
@@ -27,26 +27,22 @@ function onDomain(domain: string[], rows: { date: string; value: number }[]) {
 }
 
 export default function Dashboard() {
-  const { status, error: statusError } = useAdminStatus(30_000);
-  const [metrics, setMetrics] = useState<Metrics | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [updatedAt, setUpdatedAt] = useState<number | null>(null);
+  // Status (30s) and metrics (60s) are polled once by the Shell's OpsProvider;
+  // this page only reads them.
+  const {
+    status,
+    statusError,
+    metrics,
+    metricsError: error,
+    metricsUpdatedAt: updatedAt,
+    refreshMetrics,
+    refreshStatus,
+  } = useOps();
 
-  const load = useCallback(() => {
-    getMetrics()
-      .then((m) => {
-        setMetrics(m);
-        setError(null);
-        setUpdatedAt(Date.now());
-      })
-      .catch((e) => setError(String((e as Error).message ?? e)));
-  }, []);
-
-  useEffect(() => {
-    load();
-    const t = setInterval(load, 60_000);
-    return () => clearInterval(t);
-  }, [load]);
+  const refresh = () => {
+    refreshMetrics();
+    refreshStatus();
+  };
 
   const conserved = status?.conservation.every((c) => c.net_minor === 0) ?? true;
 
@@ -103,7 +99,7 @@ export default function Dashboard() {
               updated <Ago ms={updatedAt} />
             </span>
           )}
-          <button className="quiet" onClick={load} aria-label="Refresh now">
+          <button className="quiet" onClick={refresh} aria-label="Refresh now">
             <Icon name="refresh" size={15} />
             Refresh
           </button>
@@ -122,7 +118,7 @@ export default function Dashboard() {
             {[0, 1, 2, 3, 4, 5].map((i) => (
               <div className="stat" key={i}>
                 <Skeleton w={100} h={12} />
-                <div style={{ height: 10 }} />
+                <div className="gap-10" />
                 <Skeleton w={70} h={24} />
               </div>
             ))}
@@ -266,7 +262,7 @@ export default function Dashboard() {
                 <Icon name="shield" size={13} />
                 KYC decisions per day · 14d
               </div>
-              <div className="row" style={{ marginBottom: "0.5rem" }}>
+              <div className="row mb-05">
                 <span className="badge warn">pending {metrics.kyc.pending}</span>
                 <span className="badge ok">approved {metrics.kyc.approved}</span>
                 <span className="badge bad">rejected {metrics.kyc.rejected}</span>
@@ -281,8 +277,9 @@ export default function Dashboard() {
 
           <p className="refresh-note">
             <Icon name="info" size={14} />
-            Auto-refreshes every 60s; integrity pill in the top bar updates every 30s. Deep
-            metrics live in Grafana (<code>ssh -L 3000:localhost:3000</code>).
+            Auto-refreshes every 60s while this tab is visible; the integrity pill in the top
+            bar updates every 30s. Deep metrics live in Grafana (
+            <code>ssh -L 3000:localhost:3000</code>).
           </p>
         </>
       ) : null}

@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
@@ -44,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import tj.payment.core.Currency
+import tj.payment.core.ErrorCode
 import tj.payment.core.Money
 import tj.payment.wallet.ui.KeyValueRow
 import tj.payment.wallet.ui.PrimaryButton
@@ -57,8 +59,36 @@ import tj.payment.wallet.ui.theme.Rust
 fun SendScreen(
     viewModel: SendViewModel,
     onClose: () -> Unit,
+    /** A `kyc_required` refusal offers "Verify now", which lands on the KYC screen. */
+    onVerifyIdentity: () -> Unit,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+
+    // Discard is the one action that can hide a payment's fate from the user:
+    // it is confirmed explicitly, and even then the statement is checked first.
+    if (state.confirmDiscard) {
+        AlertDialog(
+            onDismissRequest = viewModel::cancelDiscard,
+            containerColor = MaterialTheme.colorScheme.surface,
+            titleContentColor = MaterialTheme.colorScheme.onSurface,
+            textContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            title = { Text("Discard this payment?") },
+            text = {
+                Text(
+                    "We'll first check your history: if it already went through, it will be " +
+                        "shown as sent instead. If not, the record is removed and you can start over.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = viewModel::confirmDiscard) { Text("Discard", color = NegativeRed) }
+            },
+            dismissButton = {
+                TextButton(onClick = viewModel::cancelDiscard) {
+                    Text("Keep it", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            },
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -94,7 +124,7 @@ fun SendScreen(
                 SendStep.RECIPIENT -> RecipientStep(viewModel)
                 SendStep.AMOUNT -> AmountStep(viewModel)
                 SendStep.CONFIRM -> ConfirmStep(viewModel)
-                SendStep.RESULT -> ResultStep(viewModel, onClose)
+                SendStep.RESULT -> ResultStep(viewModel, onClose, onVerifyIdentity)
             }
         }
     }
@@ -128,18 +158,27 @@ private fun RecipientStep(viewModel: SendViewModel) {
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    state.pendingError?.let {
+                        Spacer(Modifier.height(8.dp))
+                        Text(it, color = NegativeRed, style = MaterialTheme.typography.bodyMedium)
+                    }
                     Spacer(Modifier.height(10.dp))
                     Row {
                         PrimaryButton(
                             text = "Finish it",
                             onClick = viewModel::resumePending,
+                            enabled = !state.discarding,
                             modifier = Modifier.weight(1f),
                         )
                         TextButton(
-                            onClick = viewModel::discardPending,
+                            onClick = viewModel::requestDiscard,
+                            enabled = !state.discarding,
                             modifier = Modifier.align(Alignment.CenterVertically),
                         ) {
-                            Text("Discard", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                if (state.discarding) "Checking…" else "Discard",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
                     }
                 }
@@ -416,7 +455,7 @@ private fun ConfirmStep(viewModel: SendViewModel) {
 // --- Step 4: outcome ---
 
 @Composable
-private fun ResultStep(viewModel: SendViewModel, onClose: () -> Unit) {
+private fun ResultStep(viewModel: SendViewModel, onClose: () -> Unit, onVerifyIdentity: () -> Unit) {
     val state by viewModel.state.collectAsStateWithLifecycle()
 
     Column(
@@ -471,11 +510,24 @@ private fun ResultStep(viewModel: SendViewModel, onClose: () -> Unit) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(Modifier.height(32.dp))
-                PrimaryButton(
-                    "Back",
-                    onClick = { viewModel.backTo(SendStep.AMOUNT) },
-                    modifier = Modifier.fillMaxWidth(),
-                )
+                if (outcome.code == ErrorCode.KYC_REQUIRED) {
+                    // The fix is one screen away: take the user there instead of
+                    // leaving them to find the banner on Home.
+                    PrimaryButton(
+                        "Verify now",
+                        onClick = onVerifyIdentity,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    TextButton(onClick = { viewModel.backTo(SendStep.AMOUNT) }) {
+                        Text("Back", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                } else {
+                    PrimaryButton(
+                        "Back",
+                        onClick = { viewModel.backTo(SendStep.AMOUNT) },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
             }
 
             is SendOutcome.Unsettled -> {

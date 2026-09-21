@@ -4,9 +4,8 @@
 # datacenter topology (§12.4) is a separate, later concern and lives nowhere
 # near this file. Bring it up with:  docker compose up -d
 #
-# Only Postgres is here today because it is the only dependency with a consumer
-# (the `storage` crate). Redis and NATS get added when the code that needs them
-# (rate limiting, the async workers) actually lands.
+# Postgres (the ledger), NATS with JetStream (the outbox relay's transport) and
+# Redis (shared rate-limit counters) — the same three dependencies as production.
 services:
   postgres:
     image: postgres:16-alpine
@@ -15,6 +14,26 @@ services:
       POSTGRES_USER: payment
       POSTGRES_PASSWORD: payment_dev_pw
       POSTGRES_DB: payment
+    # A lighter cut of the production tuning (deploy/docker-compose.prod.yml),
+    # so local benchmarks and slow-query logs behave like the real thing.
+    # synchronous_commit stays on: it is a ledger.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - wal_compression=on
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - log_min_duration_statement=250ms
+      - -c
+      - log_lock_waits=on
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+    shm_size: 256m
     ports:
       - "5432:5432"
     volumes:
@@ -29,7 +48,9 @@ services:
   nats:
     image: nats:2-alpine
     container_name: payment_nats_dev
-    command: ["-js"] # enable JetStream
+    command: ["-js", "-sd", "/data"] # JetStream with a durable store dir
+    volumes:
+      - nats_data:/data
     ports:
       - "4222:4222"
 
@@ -42,3 +63,4 @@ services:
 
 volumes:
   pg_data:
+  nats_data:

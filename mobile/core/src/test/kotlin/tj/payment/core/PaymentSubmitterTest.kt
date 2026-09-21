@@ -14,11 +14,13 @@ import org.junit.Test
  */
 class PaymentSubmitterTest {
 
-    private class FakeStore : PendingPaymentStore {
+    private class FakeStore(var persists: Boolean = true) : PendingPaymentStore {
         var stored: PendingPayment? = null
         override fun load(): PendingPayment? = stored
-        override fun save(payment: PendingPayment) {
+        override fun save(payment: PendingPayment): Boolean {
+            if (!persists) return false
             stored = payment
+            return true
         }
         override fun clear() {
             stored = null
@@ -31,8 +33,14 @@ class PaymentSubmitterTest {
     private fun submitter(
         store: FakeStore,
         keys: MutableList<String> = mutableListOf("key-1", "key-2"),
+        findPosted: suspend (PendingPayment) -> ApiOutcome<Boolean> = { ApiOutcome.Ok(false) },
         transfer: suspend (PendingPayment) -> ApiOutcome<PostResponse>,
-    ) = PaymentSubmitter(store, { keys.removeAt(0) }, transfer)
+    ) = PaymentSubmitter(store, { keys.removeAt(0) }, transfer, findPosted)
+
+    /** A store holding an unsettled payment from "a previous run". */
+    private fun storeWithPending(key: String = "key-1") = FakeStore().apply {
+        stored = PendingPayment(key, "from", "to", 100, "TJS", "x")
+    }
 
     @Test
     fun `success posts once and clears the pending payment`() = runBlocking {
@@ -67,6 +75,25 @@ class PaymentSubmitterTest {
     }
 
     @Test
+    fun `a persist failure never reaches the network`() = runBlocking {
+        val store = FakeStore(persists = false)
+        var networkCalls = 0
+        val s = submitter(store) { _ ->
+            networkCalls++
+            posted()
+        }
+
+        val result = s.submitNew("from", "to", 100, "TJS", "x")
+
+        assertEquals(SubmitResult.NotStarted, result)
+        assertEquals("no request may go out without a durable key", 0, networkCalls)
+        assertNull(store.stored)
+        // Nothing stored, so the user can simply try again (with a new key).
+        store.persists = true
+        assertTrue(s.submitNew("from", "to", 100, "TJS", "x") is SubmitResult.Posted)
+    }
+
+    @Test
     fun `offline keeps the payment and retry reuses the SAME key`() = runBlocking {
         val store = FakeStore()
         val seenKeys = mutableListOf<String>()
@@ -89,12 +116,19 @@ class PaymentSubmitterTest {
     }
 
     @Test
-    fun `rate limited and 5xx keep the key, definitive 4xx clears it`() = runBlocking {
+    fun `rate limited, 5xx, retry_later and timeout keep the key, definitive 4xx clears it`() = runBlocking {
         for ((outcome, kept) in listOf(
             ApiOutcome.Failed(ErrorCode.RATE_LIMITED, 429, null) to true,
             ApiOutcome.Failed(ErrorCode.INTERNAL_ERROR, 500, null) to true,
+            // The backend's money endpoints answer 503 retry_later (+Retry-After)
+            // and 504 timeout: exactly like any other 5xx, same key on retry.
+            ApiOutcome.Failed(ErrorCode.RETRY_LATER, 503, null) to true,
+            ApiOutcome.Failed(ErrorCode.TIMEOUT, 504, null) to true,
+            ApiOutcome.Failed(ErrorCode.UNKNOWN, 502, null) to true,
             ApiOutcome.Failed(ErrorCode.INSUFFICIENT_FUNDS, 422, null) to false,
             ApiOutcome.Failed(ErrorCode.BAD_REQUEST, 400, null) to false,
+            ApiOutcome.Failed(ErrorCode.UNAUTHORIZED, 401, null) to false,
+            ApiOutcome.Failed(ErrorCode.KYC_REQUIRED, 403, null) to false,
         )) {
             val store = FakeStore()
             val s = submitter(store) { outcome }
@@ -107,6 +141,73 @@ class PaymentSubmitterTest {
                 assertNull("expected key cleared for $outcome", store.stored)
             }
         }
+    }
+
+    @Test
+    fun `a 2xx whose body could not be read is Unsettled, never Rejected`() = runBlocking {
+        // ApiClient.decode() produces exactly this when a 201 comes back blank
+        // or as HTML (proxy, captive portal): the server ACCEPTED the transfer.
+        for (status in listOf(200, 201, 204)) {
+            val store = FakeStore()
+            val s = submitter(store) { ApiOutcome.Failed(ErrorCode.UNKNOWN, status, "malformed response") }
+            val result = s.submitNew("from", "to", 100, "TJS", "x")
+            assertEquals("status $status", SubmitResult.Unsettled(offline = false), result)
+            assertNotNull("key must survive a lost $status answer", store.stored)
+        }
+    }
+
+    @Test
+    fun `on a retry, auth and KYC gate errors are Unsettled and keep the key`() = runBlocking {
+        // The gate answers before the idempotency replay, so a 401/403 on the
+        // RETRY says nothing about whether the FIRST attempt posted.
+        for (outcome in listOf(
+            ApiOutcome.Failed(ErrorCode.UNAUTHORIZED, 401, null),
+            ApiOutcome.Failed(ErrorCode.FORBIDDEN, 403, null),
+            ApiOutcome.Failed(ErrorCode.KYC_REQUIRED, 403, null),
+        )) {
+            val store = storeWithPending()
+            var lookups = 0
+            val s = submitter(store, findPosted = { lookups++; ApiOutcome.Ok(false) }) { outcome }
+            assertEquals("$outcome", SubmitResult.Unsettled(offline = false), s.retryPending())
+            assertNotNull("key must be kept for $outcome", store.stored)
+            assertEquals("no statement check needed for a gate error", 0, lookups)
+        }
+    }
+
+    @Test
+    fun `a definitive rejection of a retry is confirmed against the statement`() = runBlocking {
+        val refusal = ApiOutcome.Failed(ErrorCode.INSUFFICIENT_FUNDS, 422, "no funds")
+
+        // Statement shows the key: the first attempt DID post -> resolved as sent.
+        val postedStore = storeWithPending("key-7")
+        val looked = mutableListOf<String>()
+        val s1 = submitter(postedStore, findPosted = { p -> looked += p.idempotencyKey; ApiOutcome.Ok(true) }) { refusal }
+        assertEquals(SubmitResult.Posted("key-7", alreadyPosted = true), s1.retryPending())
+        assertNull(postedStore.stored)
+        assertEquals(listOf("key-7"), looked)
+
+        // Statement agrees it never posted: the refusal stands, key cleared.
+        val cleanStore = storeWithPending()
+        val s2 = submitter(cleanStore, findPosted = { ApiOutcome.Ok(false) }) { refusal }
+        assertEquals(SubmitResult.Rejected(ErrorCode.INSUFFICIENT_FUNDS, "no funds"), s2.retryPending())
+        assertNull(cleanStore.stored)
+
+        // Statement unreadable: never forget a key on a hunch.
+        val unsureStore = storeWithPending()
+        val s3 = submitter(unsureStore, findPosted = { ApiOutcome.Offline(RuntimeException("down")) }) { refusal }
+        assertEquals(SubmitResult.Unsettled(offline = true), s3.retryPending())
+        assertNotNull(unsureStore.stored)
+    }
+
+    @Test
+    fun `a first-attempt rejection needs no statement check`() = runBlocking {
+        val store = FakeStore()
+        var lookups = 0
+        val s = submitter(store, findPosted = { lookups++; ApiOutcome.Ok(true) }) {
+            ApiOutcome.Failed(ErrorCode.INSUFFICIENT_FUNDS, 422, null)
+        }
+        assertTrue(s.submitNew("from", "to", 100, "TJS", "x") is SubmitResult.Rejected)
+        assertEquals(0, lookups)
     }
 
     @Test
@@ -128,10 +229,10 @@ class PaymentSubmitterTest {
 
         // "Restart": a fresh submitter over the same durable store.
         val seenKeys = mutableListOf<String>()
-        val after = PaymentSubmitter(store, { "MUST-NOT-BE-USED" }) { p ->
+        val after = PaymentSubmitter(store, { "MUST-NOT-BE-USED" }, { p ->
             seenKeys += p.idempotencyKey
             ApiOutcome.Ok(PostResponse("txn-9", status = "already_posted"))
-        }
+        })
 
         assertEquals("992901234567", after.pending()?.recipientLabel)
         val result = after.retryPending()
@@ -144,15 +245,27 @@ class PaymentSubmitterTest {
     fun `retry with nothing pending is a no-op`() = runBlocking {
         val s = submitter(FakeStore()) { posted() }
         assertNull(s.retryPending())
+        assertNull(s.discardPending())
     }
 
     @Test
-    fun `abandon drops the pending payment`() = runBlocking {
-        val store = FakeStore()
-        val s = submitter(store) { ApiOutcome.Offline(RuntimeException("down")) }
-        s.submitNew("from", "to", 100, "TJS", "x")
-
-        s.abandonPending()
+    fun `discard drops the payment only once the statement says it never posted`() = runBlocking {
+        // Not in the statement: honoured.
+        val store = storeWithPending()
+        val s = submitter(store, findPosted = { ApiOutcome.Ok(false) }) { posted() }
+        assertEquals(DiscardResult.Discarded, s.discardPending())
         assertNull(s.pending())
+
+        // In the statement: the money moved — resolved as sent, not discarded.
+        val postedStore = storeWithPending("key-3")
+        val s2 = submitter(postedStore, findPosted = { ApiOutcome.Ok(true) }) { posted() }
+        assertEquals(DiscardResult.WasPosted("key-3"), s2.discardPending())
+        assertNull(postedStore.stored)
+
+        // Statement unreachable: refuse to drop blind, keep the record.
+        val unsureStore = storeWithPending()
+        val s3 = submitter(unsureStore, findPosted = { ApiOutcome.Failed(ErrorCode.INTERNAL_ERROR, 500, null) }) { posted() }
+        assertEquals(DiscardResult.CouldNotVerify(offline = false), s3.discardPending())
+        assertNotNull(unsureStore.stored)
     }
 }

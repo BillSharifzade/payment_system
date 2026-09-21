@@ -36,6 +36,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import tj.payment.core.WalletDto
 import tj.payment.wallet.ui.ActionButton
@@ -44,13 +45,13 @@ import tj.payment.wallet.ui.GlyphArrow
 import tj.payment.wallet.ui.GlyphList
 import tj.payment.wallet.ui.GlyphSwap
 import tj.payment.wallet.ui.TransactionRow
+import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.Rust
 import tj.payment.wallet.ui.theme.RustBright
 
 @Composable
 fun HomeScreen(
     viewModel: HomeViewModel,
-    onLoggedOut: () -> Unit,
     onSend: () -> Unit,
     onReceive: () -> Unit,
     onHistory: (walletId: String) -> Unit,
@@ -59,9 +60,11 @@ fun HomeScreen(
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
 
-    if (state.loggedOut) {
-        onLoggedOut()
-        return
+    // Fresh balances whenever Home comes (back) on screen — first entry, return
+    // from Send/KYC/FX, return from the background — rate-limited in the VM.
+    LifecycleResumeEffect(Unit) {
+        viewModel.refreshIfDue()
+        onPauseOrDispose { }
     }
 
     LazyColumn(
@@ -88,6 +91,21 @@ fun HomeScreen(
             Spacer(Modifier.height(12.dp))
         }
 
+        // Shown once after secure storage had to be rebuilt: a payment may have
+        // been in flight and its record is gone — History is the truth.
+        if (state.unreadableRecordNotice) {
+            item(key = "unreadable-notice") {
+                NoticeCard(
+                    title = "Check your history before sending",
+                    body = "An earlier payment record on this device was unreadable and had to be " +
+                        "removed. If you were in the middle of a payment, check History to see " +
+                        "whether it went through before sending it again.",
+                    onDismiss = viewModel::dismissUnreadableRecordNotice,
+                )
+                Spacer(Modifier.height(16.dp))
+            }
+        }
+
         // Identity: nudge level-0 users toward verification, show review state.
         if (state.kycLevel == 0) {
             item(key = "kyc-banner") {
@@ -106,11 +124,19 @@ fun HomeScreen(
                 ) { CircularProgressIndicator(color = Rust) }
             }
 
-            state.error != null -> item(key = "error") {
+            state.error != null && state.wallets.isEmpty() -> item(key = "error") {
                 ErrorRetry(state.error ?: "", onRetry = viewModel::refresh)
             }
 
             else -> {
+                // A failed refresh over cached balances: say so, keep showing them.
+                if (state.error != null) {
+                    item(key = "stale-error") {
+                        ErrorRetry(state.error ?: "", onRetry = viewModel::refresh)
+                        Spacer(Modifier.height(12.dp))
+                    }
+                }
+
                 itemsIndexed(state.wallets, key = { _, w -> w.id }) { index, wallet ->
                     val visible = remember {
                         MutableTransitionState(false).apply { targetState = true }
@@ -165,6 +191,33 @@ fun HomeScreen(
                     }
                     item(key = "recent-bottom") { Spacer(Modifier.height(24.dp)) }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NoticeCard(title: String, body: String, onDismiss: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = NegativeRed.copy(alpha = 0.14f)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = body,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            TextButton(onClick = onDismiss, modifier = Modifier.align(Alignment.End)) {
+                Text("Got it", color = Rust)
             }
         }
     }

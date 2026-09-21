@@ -1,7 +1,6 @@
 use sha2::{Digest, Sha256};
 use std::fmt;
 
-/// A 32-byte SHA-256 digest. `Copy` and cheap to pass around.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Hash([u8; 32]);
 
@@ -18,7 +17,6 @@ impl Hash {
         hex::encode(self.0)
     }
 
-    /// Parse from a 64-char hex string.
     pub fn from_hex(s: &str) -> Option<Self> {
         let bytes = hex::decode(s).ok()?;
         let arr: [u8; 32] = bytes.try_into().ok()?;
@@ -26,7 +24,6 @@ impl Hash {
     }
 }
 
-/// SHA-256 over a single byte slice.
 pub fn sha256(data: &[u8]) -> Hash {
     let mut hasher = Sha256::new();
     hasher.update(data);

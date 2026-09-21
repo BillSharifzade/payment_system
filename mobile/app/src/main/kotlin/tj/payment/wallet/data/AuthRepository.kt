@@ -1,8 +1,8 @@
 package tj.payment.wallet.data
 
 import tj.payment.core.ApiOutcome
+import tj.payment.core.ErrorCode
 import tj.payment.core.TokenResponse
-import tj.payment.core.WalletDto
 
 /**
  * The one place session state is written. Screens never touch [SecureSession] or
@@ -22,43 +22,46 @@ class AuthRepository(
         adopt(api.register(phone, password), phone)
 
     /**
-     * Re-establish a session at launch from the persisted refresh token. With no
-     * in-memory access token, this wallets probe returns 401, which drives the
-     * ApiClient's refresh path: success mints a fresh access token (we're signed
-     * in); a 401 that survives means the refresh token is dead (cleared → login).
-     * Offline leaves the session intact so a flaky network doesn't sign the user
-     * out.
+     * Re-establish a session at launch in ONE request: `POST /v1/auth/refresh`
+     * with the persisted refresh token (no probing an authed endpoint into a
+     * 401 first, no discarded payload — Home fetches its own data next). The
+     * server refusing the token (401/403) means the session is dead: it is
+     * cleared and the caller routes to login. Anything else — offline, 5xx, an
+     * unreadable answer — keeps the session so a flaky network never signs the
+     * user out; the caller lands on Home in its offline state.
      */
     suspend fun restore(): ApiOutcome<Unit> {
-        if (session.refreshToken() == null) {
-            return ApiOutcome.Failed(tj.payment.core.ErrorCode.UNAUTHORIZED, 401, "no session")
+        if (!session.hasPersistedSession()) {
+            return ApiOutcome.Failed(ErrorCode.UNAUTHORIZED, 401, "no session")
         }
-        return when (val probe = api.wallets()) {
-            is ApiOutcome.Ok -> ApiOutcome.Ok(Unit)
-            is ApiOutcome.Offline -> ApiOutcome.Offline(probe.cause)
-            is ApiOutcome.Failed -> {
-                if (probe.httpStatus == 401) session.clear()
-                ApiOutcome.Failed(probe.code, probe.httpStatus, probe.serverMessage)
-            }
+        if (session.accessToken() != null) return ApiOutcome.Ok(Unit)
+        return when (val outcome = api.refreshSession()) {
+            is ApiClient.RefreshOutcome.Refreshed -> ApiOutcome.Ok(Unit)
+            ApiClient.RefreshOutcome.Dead -> ApiOutcome.Failed(ErrorCode.UNAUTHORIZED, 401, "session revoked")
+            is ApiClient.RefreshOutcome.Unreachable -> ApiOutcome.Offline(outcome.cause)
         }
     }
 
-    suspend fun wallets(): ApiOutcome<List<WalletDto>> = api.wallets()
-
+    /**
+     * Local sign-out is immediate — the session is wiped (which flips
+     * `signedOut`, so the UI leaves Home at once) BEFORE the best-effort
+     * server-side revocation, which may be slow or impossible offline. A
+     * revocation that never arrives costs nothing: the refresh token is gone
+     * from the device either way, and the server expires it on its own.
+     */
     suspend fun logout() {
-        session.refreshToken()?.let { api.logout(it) }
+        val refreshToken = session.refreshToken()
         session.clear()
+        if (refreshToken != null) api.logout(refreshToken)
     }
 
     private fun adopt(outcome: ApiOutcome<TokenResponse>, phone: String): ApiOutcome<Unit> = when (outcome) {
         is ApiOutcome.Ok -> {
-            val t = outcome.value
-            session.setAccessToken(t.accessToken)
-            session.persistTokens(t.userId, t.refreshToken)
+            api.adoptTokens(outcome.value)
             session.persistPhone(phone)
             ApiOutcome.Ok(Unit)
         }
-        is ApiOutcome.Failed -> ApiOutcome.Failed(outcome.code, outcome.httpStatus, outcome.serverMessage)
-        is ApiOutcome.Offline -> ApiOutcome.Offline(outcome.cause)
+        is ApiOutcome.Failed -> outcome
+        is ApiOutcome.Offline -> outcome
     }
 }

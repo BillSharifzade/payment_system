@@ -1,28 +1,12 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { FxRate, getFxRates, setFxRate } from "../api";
-import { Ago, Alert, EmptyState, Icon, Select, Skeleton, useToast } from "../ui";
-
-function gcd(a: number, b: number): number {
-  return b === 0 ? a : gcd(b, a % b);
-}
-
-/** "10.90" → { num: 109, den: 10 } — the exact reduced fraction of the input.
- *  Returns null for anything that isn't a positive decimal. */
-function decimalToFraction(s: string): { num: number; den: number } | null {
-  const m = s.trim().match(/^(\d+)(?:\.(\d{1,8}))?$/);
-  if (!m) return null;
-  const whole = m[1];
-  const frac = m[2] ?? "";
-  const num = Number(whole + frac);
-  const den = Math.pow(10, frac.length);
-  if (!Number.isSafeInteger(num) || num <= 0) return null;
-  const g = gcd(num, den);
-  return { num: num / g, den: den / g };
-}
+import { useEffect, useMemo, useState } from "react";
+import { FxRate, describeError, getFxRates, isAbort, setFxRate } from "../api";
+import { decimalToFraction, describeRateChange } from "../money";
+import { Ago, Alert, ConfirmButton, EmptyState, Icon, Select, Skeleton, useToast } from "../ui";
 
 export default function FxRates() {
   const toast = useToast();
   const [rates, setRates] = useState<FxRate[] | null>(null);
+  const [gen, setGen] = useState(0);
   const [base, setBase] = useState("USD");
   const [quote, setQuote] = useState("TJS");
   const [rateStr, setRateStr] = useState("");
@@ -30,12 +14,16 @@ export default function FxRates() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const reload = useCallback(() => {
-    getFxRates()
+  useEffect(() => {
+    const ac = new AbortController();
+    getFxRates(ac.signal)
       .then(setRates)
-      .catch((e) => setError(String((e as Error).message ?? e)));
-  }, []);
-  useEffect(reload, [reload]);
+      .catch((e) => {
+        if (!isAbort(e)) setError(describeError(e));
+      });
+    return () => ac.abort();
+  }, [gen]);
+  const reload = () => setGen((g) => g + 1);
 
   // Currencies the platform knows about (from configured rates, plus the
   // launch pair) — the pickers never need free-text codes.
@@ -55,26 +43,34 @@ export default function FxRates() {
     (r) => !(rates ?? []).some((o) => o.base === r.quote && o.quote === r.base),
   );
 
-  async function submit(e: FormEvent) {
-    e.preventDefault();
-    if (!valid || !frac) return;
+  // What the confirm click will replace — shown as a delta so a fat-fingered
+  // 109.0 instead of 10.90 is obvious before it goes live.
+  const current = (rates ?? []).find((r) => r.base === base && r.quote === quote) ?? null;
+  const confirmLabel = frac
+    ? `Confirm ${describeRateChange(
+        current ? { num: current.rate_num, den: current.rate_den } : null,
+        frac,
+      )}?`
+    : "Confirm?";
+
+  async function submit() {
+    if (!valid || !frac || busy) return;
     setBusy(true);
     setError(null);
     try {
-      await setFxRate(base, quote, frac.num, frac.den);
-      if (alsoInverse) {
-        await setFxRate(quote, base, frac.den, frac.num);
-      }
+      // One request: with alsoInverse the backend upserts both directions in
+      // a single transaction, so the pair can never be left half-updated.
+      await setFxRate(base, quote, frac.num, frac.den, alsoInverse);
       toast(
         "success",
         alsoInverse ? `${base}↔${quote} rates updated` : `${base}→${quote} rate updated`,
       );
       setRateStr("");
-      reload();
     } catch (err) {
-      setError(String((err as Error).message ?? err));
+      setError(describeError(err));
     } finally {
       setBusy(false);
+      reload(); // whatever happened, show what the server actually holds
     }
   }
 
@@ -111,7 +107,7 @@ export default function FxRates() {
           {[0, 1].map((i) => (
             <div className="fx-card" key={i}>
               <Skeleton w={90} h={12} />
-              <div style={{ height: 10 }} />
+              <div className="gap-10" />
               <Skeleton w={170} h={24} />
             </div>
           ))}
@@ -149,7 +145,8 @@ export default function FxRates() {
         </div>
       )}
 
-      <form className="panel" onSubmit={submit}>
+      {/* Enter never submits: a live rate needs the two-click confirmation. */}
+      <form className="panel" onSubmit={(e) => e.preventDefault()}>
         <div className="panel-title">
           <Icon name="exchange" size={13} />
           Set a rate
@@ -188,9 +185,14 @@ export default function FxRates() {
               <span className="muted">{quote}</span>
             </div>
           </label>
-          <button className="primary" disabled={busy || !valid}>
+          <ConfirmButton
+            className="primary"
+            disabled={busy || !valid}
+            confirmLabel={confirmLabel}
+            onConfirm={() => void submit()}
+          >
             {busy ? "Saving…" : "Set rate"}
-          </button>
+          </ConfirmButton>
         </div>
         <label
           className="row small"
@@ -202,7 +204,8 @@ export default function FxRates() {
             onChange={(e) => setAlsoInverse(e.target.checked)}
             style={{ width: "auto" }}
           />
-          Also set the reverse rate ({quote} → {base}) as the exact inverse
+          Also set the reverse rate ({quote} → {base}) as the exact inverse — both written in
+          one transaction
         </label>
         {frac && base !== quote && (
           <div className="muted small" style={{ marginTop: "0.55rem" }}>
@@ -213,6 +216,12 @@ export default function FxRates() {
                 {" "}
                 and 1 {quote} = {(frac.den / frac.num).toFixed(6)} {base} (
                 {frac.den.toLocaleString()} ⁄ {frac.num.toLocaleString()})
+              </>
+            )}
+            {current && (
+              <>
+                {" "}
+                · currently {(current.rate_num / current.rate_den).toFixed(4)}
               </>
             )}
           </div>

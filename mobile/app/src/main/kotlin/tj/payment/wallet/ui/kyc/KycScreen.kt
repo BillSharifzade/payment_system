@@ -1,6 +1,9 @@
 package tj.payment.wallet.ui.kyc
 
+import android.content.ContentResolver
+import android.content.res.AssetFileDescriptor
 import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -30,7 +33,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.repeatOnLifecycle
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -51,13 +59,18 @@ fun KycScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     // While a submission is under review, quietly re-check so approval shows up
-    // without the user hammering refresh.
-    LaunchedEffect(state.underReview) {
-        while (state.underReview) {
-            delay(10_000)
-            viewModel.refresh(silent = true)
+    // without the user hammering refresh — but only while the screen is
+    // STARTED: in the background the loop is suspended, not polling.
+    LaunchedEffect(state.underReview, lifecycleOwner) {
+        if (!state.underReview) return@LaunchedEffect
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                delay(10_000)
+                viewModel.refresh(silent = true)
+            }
         }
     }
 
@@ -66,11 +79,11 @@ fun KycScreen(
     ) { uri: Uri? ->
         uri ?: return@rememberLauncherForActivityResult
         scope.launch {
-            val (bytes, mime) = withContext(Dispatchers.IO) {
-                val b = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                b to (context.contentResolver.getType(uri) ?: "image/jpeg")
+            val picked = withContext(Dispatchers.IO) { readDocument(context.contentResolver, uri) }
+            when (picked) {
+                is PickedDocument.Ready -> viewModel.uploadDocument(picked.bytes, picked.mimeType)
+                is PickedDocument.Rejected -> viewModel.onDocumentRejected(picked.reason)
             }
-            if (bytes != null) viewModel.uploadDocument(bytes, mime)
         }
     }
 
@@ -202,6 +215,71 @@ fun KycScreen(
             }
         }
     }
+}
+
+private sealed interface PickedDocument {
+    class Ready(val bytes: ByteArray, val mimeType: String) : PickedDocument
+    class Rejected(val reason: String) : PickedDocument
+}
+
+/**
+ * Read a picked document into memory — but only after checking its size. A
+ * content provider is asked for OpenableColumns.SIZE (or the asset fd length)
+ * first, so an oversized pick (a 40 MB photo, a video) is refused before a
+ * single byte is allocated; the read itself is then bounded to the cap as well,
+ * because providers may report no size (or lie).
+ */
+private fun readDocument(resolver: ContentResolver, uri: Uri): PickedDocument {
+    val max = KycViewModel.MAX_DOCUMENT_BYTES
+    val declared = documentSize(resolver, uri)
+    if (declared != null && declared > max) return PickedDocument.Rejected(KycViewModel.DOCUMENT_TOO_LARGE)
+
+    val bytes = try {
+        resolver.openInputStream(uri)?.use { readBounded(it, max, initialCapacity = declared) }
+    } catch (_: Exception) {
+        null
+    } ?: return PickedDocument.Rejected("Couldn't read that file. Try another one.")
+    if (bytes.size > max) return PickedDocument.Rejected(KycViewModel.DOCUMENT_TOO_LARGE)
+    if (bytes.isEmpty()) return PickedDocument.Rejected("That file is empty. Try another one.")
+    return PickedDocument.Ready(bytes, resolver.getType(uri) ?: "image/jpeg")
+}
+
+/** Size in bytes as the provider declares it, or null when it won't say. */
+private fun documentSize(resolver: ContentResolver, uri: Uri): Long? {
+    try {
+        resolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+            val column = cursor.getColumnIndex(OpenableColumns.SIZE)
+            if (column >= 0 && cursor.moveToFirst() && !cursor.isNull(column)) {
+                return cursor.getLong(column)
+            }
+        }
+    } catch (_: Exception) {
+        // Fall through to the descriptor length.
+    }
+    return try {
+        resolver.openAssetFileDescriptor(uri, "r")?.use { fd ->
+            fd.length.takeIf { it != AssetFileDescriptor.UNKNOWN_LENGTH }
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+/** Reads at most `max + 1` bytes (the extra one proves the file is too big). */
+private fun readBounded(input: InputStream, max: Int, initialCapacity: Long?): ByteArray {
+    val capacity = initialCapacity?.coerceIn(0L, max.toLong())?.toInt() ?: (256 * 1024)
+    val out = ByteArrayOutputStream(capacity)
+    val buffer = ByteArray(32 * 1024)
+    var total = 0
+    while (true) {
+        val n = input.read(buffer)
+        if (n < 0) break
+        val take = minOf(n, max + 1 - total)
+        out.write(buffer, 0, take)
+        total += take
+        if (total > max) break
+    }
+    return out.toByteArray()
 }
 
 @Composable

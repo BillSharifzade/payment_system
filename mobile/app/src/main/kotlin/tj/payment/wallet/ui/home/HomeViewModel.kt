@@ -2,10 +2,12 @@ package tj.payment.wallet.ui.home
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import tj.payment.core.ApiOutcome
 import tj.payment.core.StatementEntryDto
@@ -24,7 +26,8 @@ data class HomeUiState(
     /** First few movements of the primary wallet — the at-a-glance activity. */
     val recent: List<StatementEntryDto> = emptyList(),
     val error: String? = null,
-    val loggedOut: Boolean = false,
+    /** One-time: an earlier payment record on this device could not be read. */
+    val unreadableRecordNotice: Boolean = false,
 ) {
     val primaryWallet: WalletDto? get() = wallets.firstOrNull()
 }
@@ -32,20 +35,53 @@ data class HomeUiState(
 class HomeViewModel(
     private val auth: AuthRepository,
     private val repo: WalletRepository,
+    consumeUnreadableRecordNotice: () -> Boolean = { false },
+    private val clock: () -> Long = System::currentTimeMillis,
 ) : ViewModel() {
 
-    private val _state = MutableStateFlow(HomeUiState())
+    private val _state = MutableStateFlow(
+        HomeUiState(
+            // Cached balances paint at once; the skeleton only shows on a cold session.
+            wallets = repo.wallets.value.orEmpty(),
+            loading = repo.wallets.value == null,
+            unreadableRecordNotice = consumeUnreadableRecordNotice(),
+        ),
+    )
     val state: StateFlow<HomeUiState> = _state.asStateFlow()
 
-    // No init{refresh()}: the screen triggers a refresh on every (re)entry, so
-    // balances are fresh after returning from Send/KYC/FX without a double
-    // fetch on first composition.
+    private var refreshJob: Job? = null
+    private var lastSuccessAtMs = 0L
+
+    init {
+        // Balances are shared with Send/FX: whoever fetched last, Home shows it.
+        viewModelScope.launch {
+            repo.wallets.collect { wallets ->
+                if (wallets != null) _state.update { it.copy(wallets = wallets) }
+            }
+        }
+    }
+
+    /**
+     * Called on every resume (first entry, back from Send/KYC/FX, back from the
+     * background). Refreshes when money moved since the last render, when the
+     * last attempt failed, or when the render is older than [MIN_REFRESH_INTERVAL_MS];
+     * otherwise the cached render stands — no wave of requests per screen flip.
+     */
+    fun refreshIfDue() {
+        val s = _state.value
+        val due = repo.walletsAreStale || s.error != null || lastSuccessAtMs == 0L ||
+            clock() - lastSuccessAtMs >= MIN_REFRESH_INTERVAL_MS
+        if (due) refresh()
+    }
 
     fun refresh() {
-        _state.value = _state.value.copy(loading = true, error = null)
-        viewModelScope.launch {
+        // A newer refresh supersedes an in-flight one, so a slow old answer can
+        // never overwrite a fresh one.
+        refreshJob?.cancel()
+        _state.update { it.copy(loading = true, error = null) }
+        refreshJob = viewModelScope.launch {
             // Wallets and KYC in parallel; the statement needs the wallet id.
-            val walletsDeferred = async { repo.wallets() }
+            val walletsDeferred = async { repo.refreshWallets() }
             val kycDeferred = async { repo.kycStatus() }
 
             val wallets = when (val outcome = walletsDeferred.await()) {
@@ -53,15 +89,15 @@ class HomeViewModel(
                 // predates that (or the auto-create failed), heal it here.
                 is ApiOutcome.Ok -> outcome.value.ifEmpty {
                     repo.createWallet("TJS")
-                    (repo.wallets() as? ApiOutcome.Ok)?.value.orEmpty()
+                    (repo.refreshWallets() as? ApiOutcome.Ok)?.value.orEmpty()
                 }
                 is ApiOutcome.Failed -> {
-                    _state.value = _state.value.copy(loading = false, error = outcome.userMessage())
+                    _state.update { it.copy(loading = false, error = outcome.userMessage()) }
                     kycDeferred.await()
                     return@launch
                 }
                 is ApiOutcome.Offline -> {
-                    _state.value = _state.value.copy(loading = false, error = OFFLINE_MESSAGE)
+                    _state.update { it.copy(loading = false, error = OFFLINE_MESSAGE) }
                     kycDeferred.await()
                     return@launch
                 }
@@ -80,21 +116,30 @@ class HomeViewModel(
                 }
             }.orEmpty()
 
-            _state.value = _state.value.copy(
-                loading = false,
-                wallets = wallets,
-                kycLevel = kycLevel,
-                kycPending = kycPending,
-                recent = recent,
-                error = null,
-            )
+            lastSuccessAtMs = clock()
+            _state.update {
+                it.copy(
+                    loading = false,
+                    wallets = wallets,
+                    kycLevel = kycLevel,
+                    kycPending = kycPending,
+                    recent = recent,
+                    error = null,
+                )
+            }
         }
     }
 
+    fun dismissUnreadableRecordNotice() {
+        _state.update { it.copy(unreadableRecordNotice = false) }
+    }
+
+    /** Navigation follows from SecureSession.signedOut, observed in AppRoot. */
     fun logout() {
-        viewModelScope.launch {
-            auth.logout()
-            _state.value = _state.value.copy(loggedOut = true)
-        }
+        viewModelScope.launch { auth.logout() }
+    }
+
+    private companion object {
+        const val MIN_REFRESH_INTERVAL_MS = 15_000L
     }
 }

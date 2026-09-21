@@ -313,21 +313,58 @@ clarity).
   minSdk 26** (Android 8: covers the vast majority of the low-end TJ install base
   while keeping Keystore-backed `EncryptedSharedPreferences` and `BiometricPrompt`
   first-class; StrongBox used opportunistically where 28+).
-- **DI** Hilt · **async** coroutines + Flow · **network** Retrofit + OkHttp +
-  kotlinx-serialization, OkHttp `Authenticator`/`Interceptor` for the
-  single-flight refresh and `Idempotency-Key` header · **secure storage**
-  androidx.security-crypto (`EncryptedSharedPreferences`) for the refresh token ·
-  **local db** Room for txn cache + pending payments.
+- **What is actually in the tree (2026-09-21), and why it differs from the
+  original plan.** The plan said Hilt + Retrofit + Room; the app ships with
+  **none of them**, deliberately:
+  - **DI: a hand-wired `AppContainer`** (`mobile/app/.../AppContainer.kt`),
+    constructed once in `PaymentApp.onCreate`, exposing lazy singletons
+    (`SecureSession`, `PendingPaymentPrefsStore`, `ApiClient`, the two
+    repositories) that screens receive through `viewModel { ... }` factories in
+    `AppRoot`. Eight classes do not justify an annotation processor: no kapt/KSP
+    step, no generated graph to debug, and the whole dependency chain is
+    readable in one file. Revisit only if the graph stops fitting on a screen.
+  - **Network: raw OkHttp + kotlinx-serialization** (`ApiClient.kt`), no
+    Retrofit. The API surface is ~15 endpoints; each is an explicit, auditable
+    function. This keeps the cross-cutting money rules in one place — the
+    `Authenticator` does the **single-flight refresh** with a **tri-state
+    outcome** (rotated / dead / unreachable: only a server 401/403 to the
+    refresh token signs the user out, anything else is *offline*), no-auth
+    requests are tagged so they never enter the refresh path, the
+    `Idempotency-Key` header is set by the one `transfer`/`fx` call site, a
+    2xx with an unreadable body is reported as *accepted-answer-lost* (never a
+    refusal), and redirects are disabled so a bearer or POST body is never
+    replayed elsewhere. It also makes the client a plain JVM class: the refresh
+    and idempotency paths are tested with MockWebServer, no device.
+  - **Persistence: `EncryptedSharedPreferences` only** (two Keystore-backed
+    files, one for the session, one for the single pending payment), no Room.
+    The app persists exactly two things — the refresh token and the in-flight
+    payment with its key — and both must be written **synchronously and
+    encrypted** before a request goes out. A relational cache of the statement
+    was never needed: history is paged from the server. Opening either store is
+    guarded (a corrupt keyset is wiped and recreated rather than crash-looping;
+    the user is told once if a payment record was lost).
+  - **Async:** coroutines + `StateFlow` per ViewModel; wallets and `/v1/config`
+    are cached in `WalletRepository` and shared by Home/Send/FX, invalidated by
+    any money move.
 - **DTOs hand-written for MVP** (no utoipa/OpenAPI yet — gap item 8). The DTO
   set is small and pinned by §7.1; revisit codegen if/when a second client (iOS)
-  appears.
-- **Module layout** (per §3): `core/` and `feature/*` split, with
-  **Money / PaymentSubmitter / repositories in a pure-Kotlin module (no Android
-  imports)** so they unit-test on the JVM and stay KMP-portable.
+  appears. Error envelope is `{"error":{"code","message","request_id"}}`; only
+  `code` is mapped to copy, `request_id` is quoted as "Ref: …" on 5xx.
+- **Module layout:** two Gradle modules. **`:core` is pure Kotlin/JVM (no
+  Android imports)** — `Money`, the DTOs, `ErrorCode`, `ApiOutcome`, fees, and
+  the `PaymentSubmitter` idempotency state machine, all unit-tested on the JVM
+  in milliseconds and KMP-portable. **`:app`** is Compose UI, `ApiClient`, the
+  secure stores, repositories and ViewModels (with their own JVM tests for the
+  HTTP layer). The `feature/*` split from §3 is deferred until there is enough
+  UI to warrant it.
 - **Build flavors:** `dev` → `http://10.0.2.2:8099` (local payment-server as seen
-  from the emulator), cert-pinning off, cleartext allowed for that host only via
-  a debug network-security-config; `prod` → HTTPS base URL (placeholder until a
-  server exists), pinning on, no cleartext.
+  from the emulator), cleartext allowed for that host only via a flavor
+  network-security-config; `staging` → the LAN deployment on `192.168.1.156:8099`
+  (same cleartext carve-out, for a real phone on the LAN); `prod` → HTTPS base URL
+  (placeholder until a server exists), no cleartext, a ready-to-fill `<pin-set>`
+  in its network-security-config, `FLAG_SECURE`, and a release build that
+  **refuses to package without an upload key** (`keystore.properties` or
+  `KEYSTORE_*` env vars — dev/staging stay debug-signed).
 
 ### 7.5 The build/test loop on this dev box
 

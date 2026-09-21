@@ -10,7 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { AdminStatus, UserListItem, getStatus, listUsers } from "./api";
+import { UserListItem, describeError, isAbort, listUsers } from "./api";
 
 // ----- Icons (inline, stroke-based) -------------------------------------------
 
@@ -287,6 +287,9 @@ export function Modal({
 
 // ----- Confirm button (two-click, disarms after 3s) --------------------------------
 
+/** First click arms and swaps the label for `confirmLabel`; a second click
+ *  within 3s fires `onConfirm`. Always type="button", so it can live inside a
+ *  <form> without the arming click also submitting the form. */
 export function ConfirmButton({
   onConfirm,
   confirmLabel = "Confirm?",
@@ -308,6 +311,7 @@ export function ConfirmButton({
   }, [armed]);
   return (
     <button
+      type="button"
       className={className}
       disabled={disabled}
       onClick={() => {
@@ -417,7 +421,8 @@ function copyText(text: string): Promise<void> {
       ta.select();
       const ok = document.execCommand("copy");
       document.body.removeChild(ta);
-      ok ? resolve() : reject(new Error("copy rejected"));
+      if (ok) resolve();
+      else reject(new Error("copy rejected"));
     } catch (e) {
       reject(e);
     }
@@ -578,31 +583,42 @@ export function UserSearch({
   const wrap = useRef<HTMLDivElement>(null);
   useClickOutside(wrap, () => setOpen(false));
 
-  // Debounced server search on digits.
+  // Debounced server search on digits. The previous request is aborted when
+  // the query changes, so a slow "992" response can never overwrite the
+  // results for "99290" that arrived first.
+  const digits = q.replace(/\D/g, "");
+  const searching = digits.length >= 3;
+  // Set when a result is picked: the input now holds that phone, and
+  // re-searching it would only re-open the popover over the form.
+  const pickedRef = useRef<string | null>(null);
   useEffect(() => {
-    const digits = q.replace(/\D/g, "");
-    if (digits.length < 3) {
-      setResults([]);
-      setBusy(false);
-      return;
-    }
-    setBusy(true);
+    if (!searching || pickedRef.current === digits) return;
+    const ac = new AbortController();
     const t = setTimeout(() => {
-      listUsers({ q: digits, limit: 8 })
+      listUsers({ q: digits, limit: 8, signal: ac.signal })
         .then((r) => {
           setResults(r.users);
           setActive(0);
           setOpen(true);
+          setBusy(false);
         })
-        .catch(() => setResults([]))
-        .finally(() => setBusy(false));
+        .catch((e) => {
+          if (isAbort(e)) return;
+          setResults([]);
+          setBusy(false);
+        });
     }, 220);
-    return () => clearTimeout(t);
-  }, [q]);
+    return () => {
+      clearTimeout(t);
+      ac.abort();
+    };
+  }, [digits, searching]);
 
   function pick(u: UserListItem) {
+    pickedRef.current = u.phone.replace(/\D/g, "");
     setOpen(false);
     setQ(u.phone);
+    setBusy(false);
     onSelect(u);
   }
 
@@ -628,7 +644,18 @@ export function UserSearch({
         placeholder={placeholder}
         value={q}
         autoFocus={autoFocus}
-        onChange={(e) => setQ(e.target.value)}
+        onChange={(e) => {
+          const next = e.target.value;
+          const nextDigits = next.replace(/\D/g, "");
+          pickedRef.current = null;
+          setQ(next);
+          if (nextDigits.length < 3) {
+            setBusy(false);
+            setResults([]);
+          } else if (nextDigits !== digits) {
+            setBusy(true); // a new search is about to start (debounced)
+          }
+        }}
         onFocus={() => results.length > 0 && setOpen(true)}
         onKeyDown={onKey}
         role="combobox"
@@ -665,35 +692,56 @@ export function UserSearch({
   );
 }
 
-// ----- Shared admin-status polling ----------------------------------------------------
+// ----- Polling ---------------------------------------------------------------------------
 
-export function useAdminStatus(intervalMs: number) {
-  const [status, setStatus] = useState<AdminStatus | null>(null);
+/** Poll `fetcher` every `intervalMs` while the tab is visible. Ticks are
+ *  skipped while document.hidden (nobody is looking, and background tabs
+ *  would otherwise keep hitting the admin endpoints), and one fires as soon
+ *  as the tab is shown again if a tick was missed. Each tick aborts the
+ *  previous in-flight request so a slow response can never land on top of a
+ *  newer one. `fetcher` must be referentially stable (a module-level fn). */
+export function usePoll<T>(fetcher: (signal: AbortSignal) => Promise<T>, intervalMs: number) {
+  const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
   const [bump, setBump] = useState(0);
 
   useEffect(() => {
-    let live = true;
-    const tick = () =>
-      getStatus()
-        .then((s) => {
-          if (!live) return;
-          setStatus(s);
+    let inflight: AbortController | null = null;
+    let lastRun = 0;
+    const tick = () => {
+      if (document.hidden) return;
+      inflight?.abort();
+      const ac = new AbortController();
+      inflight = ac;
+      lastRun = Date.now();
+      fetcher(ac.signal)
+        .then((d) => {
+          if (ac.signal.aborted) return;
+          setData(d);
           setError(null);
           setUpdatedAt(Date.now());
         })
-        .catch((e) => live && setError(String((e as Error).message ?? e)));
+        .catch((e) => {
+          if (ac.signal.aborted || isAbort(e)) return;
+          setError(describeError(e));
+        });
+    };
+    const onVisibility = () => {
+      if (!document.hidden && Date.now() - lastRun >= intervalMs) tick();
+    };
     tick();
     const t = setInterval(tick, intervalMs);
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
-      live = false;
       clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisibility);
+      inflight?.abort();
     };
-  }, [intervalMs, bump]);
+  }, [fetcher, intervalMs, bump]);
 
   const refresh = useCallback(() => setBump((b) => b + 1), []);
-  return { status, error, updatedAt, refresh };
+  return { data, error, updatedAt, refresh };
 }
 
 // ----- Sortable table headers ---------------------------------------------------------

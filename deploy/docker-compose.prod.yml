@@ -1,21 +1,92 @@
-# Production stack for a single server. Structured so each piece can later be
-# lifted to the multi-node HA design (k3s for the app tier, Patroni for Postgres)
-# without changing the app. Run:  ./deploy.sh   (or: docker compose -f deploy/docker-compose.prod.yml up -d --build)
+# Production stack for a single ~4 GB server. Structured so each piece can later
+# be lifted to the multi-node HA design (k3s for the app tier, Patroni for
+# Postgres) without changing the app.
+#
+#   ./deploy.sh                      build (tagged with the git SHA) + roll out
+#   docker compose ps / logs -f ...  (run from deploy/; COMPOSE_FILE in .env
+#                                     selects this file and any overlays)
+#   IMAGE_TAG=<old-sha> docker compose up -d      roll back the app images
+#
+# Secrets are files under deploy/secrets/ (written by deploy.sh, never in .env):
+# the app reads *_FILE variants, Postgres reads POSTGRES_PASSWORD_FILE. The
+# non-secret settings come from deploy/.env (see .env.prod.example).
+#
+# Hardening applied to every service: pinned image tags, json-file logging
+# capped at 50 MB x 5, memory limits, restart unless-stopped, healthchecks,
+# no-new-privileges + all capabilities dropped (except where noted), read-only
+# root filesystems with explicit writable mounts, graceful stop periods.
 name: payment
 
-x-app-env: &app-env
-  env_file: [.env]
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+      # Stamp each line with the compose service/project so promtail can label
+      # streams without access to the Docker socket (see monitoring overlay).
+      labels: "com.docker.compose.service,com.docker.compose.project"
+
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+
+# Everything the two app binaries share. IMAGE_TAG is set by deploy.sh from
+# `git rev-parse --short HEAD`; `latest` is also tagged on every build.
+x-app: &app
+  image: payment-system:${IMAGE_TAG:-latest}
+  restart: unless-stopped
+  env_file: [app.env]
+  <<: [*logging, *hardening]
+  read_only: true
+  tmpfs: [/tmp]
+  stop_grace_period: 30s
 
 services:
   postgres:
-    image: postgres:16
+    image: postgres:16.15
     restart: unless-stopped
+    <<: *logging
+    security_opt: ["no-new-privileges:true"]
+    # The official entrypoint starts as root, fixes volume ownership, then
+    # drops to `postgres` via gosu — so capabilities are NOT dropped here.
     environment:
       POSTGRES_USER: payment
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       POSTGRES_DB: payment
-    # Durability: real fsync + a named volume that survives restarts.
-    command: ["postgres", "-c", "max_connections=200"]
+      # Page checksums catch silent disk corruption. Only applied when the data
+      # volume is first initialised.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    secrets: [postgres_password]
+    # Server-level tuning for a ~4 GB box that also runs the app (the app sets
+    # its own per-session GUCs: statement/lock/idle timeouts).
+    #   synchronous_commit=on   this is a ledger: a COMMIT must be on disk before
+    #                           the client hears about it. NEVER turn this off.
+    #   pg_stat_statements      `CREATE EXTENSION pg_stat_statements;` once to
+    #                           query it (collection is on regardless).
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=384MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - wal_compression=on
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - log_min_duration_statement=250ms
+      - -c
+      - log_lock_waits=on
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - synchronous_commit=on
+    # Parallel query workers and shared_buffers live in shared memory; the
+    # Docker default of 64 MB is too small for a 384 MB shared_buffers.
+    shm_size: 256m
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -23,13 +94,41 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+      start_period: 20s
+    # SIGINT = "fast shutdown": abort open transactions, checkpoint, exit
+    # cleanly. (The default SIGTERM is "smart" mode, which waits for every
+    # client to disconnect and would hit the kill timeout under the app's
+    # long-lived pool connections, forcing crash recovery on the next start.)
+    stop_signal: SIGINT
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
     # Not published to the host: only reachable on the internal network.
     expose: ["5432"]
+    # --- WAL archiving / point-in-time recovery -----------------------------
+    # Ready to enable: see docker-compose.wal-archive.yml (pgBackRest to an
+    # off-box S3-compatible bucket) and deploy/README.md "WAL archiving".
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.11-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    <<: [*logging, *hardening]
+    # Start directly as the image's `redis` user (uid 999, gid 1000): with every
+    # capability dropped the entrypoint cannot `setpriv` from root to redis.
+    user: "999:1000"
+    # Rate-limit counters only: bounded memory, LRU eviction, AOF so a restart
+    # does not reset every window at once.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 96mb
+      - --maxmemory-policy
+      - allkeys-lru
+    read_only: true
     volumes:
       - redisdata:/data
     healthcheck:
@@ -37,72 +136,239 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          pids: 256
     expose: ["6379"]
 
   nats:
-    image: nats:2
+    image: nats:2.11.17-alpine
     restart: unless-stopped
-    command: ["-js", "-sd", "/data"]   # JetStream, durable store dir
+    <<: [*logging, *hardening]
+    # JetStream with a durable store dir (the workers create the PAYMENTS
+    # stream). -m 8222 is the monitoring endpoint used only by the healthcheck;
+    # it is not published.
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    read_only: true
+    tmpfs: [/tmp]
     volumes:
       - natsdata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 256
     expose: ["4222"]
 
   payment-server:
+    <<: *app
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    image: payment-system:latest
-    restart: unless-stopped
-    <<: *app-env
     # Migrations run automatically on startup (sqlx holds an advisory lock, so
     # scaling to >1 replica is safe). Scale with:  --scale payment-server=2
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      # Prometheus metrics on a second listener: reachable from the monitoring
+      # overlay on the internal network, never published to the host.
+      METRICS_ADDR: 0.0.0.0:9100
+      # Uploaded KYC documents (served only via the admin endpoint).
+      DOCUMENT_STORE_DIR: /data/kyc-docs
+    secrets: [database_url, jwt_secret]
+    volumes:
+      - kycdocs:/data/kyc-docs
     depends_on:
       postgres: { condition: service_healthy }
       redis:    { condition: service_healthy }
-    expose: ["8080"]
-    # Uploaded KYC documents (served only via the admin endpoint).
-    environment:
-      DOCUMENT_STORE_DIR: /data/kyc-docs
-    volumes:
-      - kycdocs:/data/kyc-docs
+      nats:     { condition: service_healthy }
+    # Distroless image: no shell, no curl. The binary probes its own /ready
+    # (503 while the database ping fails).
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/payment-server", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
+    expose: ["8080", "9100"]
 
   payment-workers:
-    image: payment-system:latest
-    restart: unless-stopped
-    <<: *app-env
+    <<: *app
     entrypoint: ["/usr/local/bin/payment-workers"]
     # Run EXACTLY ONE instance: the sealer assigns sequential checkpoint ids and
     # is not safe to run concurrently (the outbox relay would be, via SKIP LOCKED).
-    depends_on:
-      postgres: { condition: service_healthy }
-      nats:     { condition: service_started }
-      payment-server: { condition: service_started }   # let the server migrate first
-    # Retention prunes orphaned KYC documents, so it needs the same volume the
-    # API writes them to.
     environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      WORKER_SIGNING_KEY_FILE: /run/secrets/worker_signing_key
+      METRICS_ADDR: 0.0.0.0:9101
+      # Retention prunes orphaned KYC documents, so it needs the same volume the
+      # API writes them to.
       DOCUMENT_STORE_DIR: /data/kyc-docs
+      # Touched every tick; the healthcheck fails when it is older than
+      # max(30 s, 3 x WORKER_INTERVAL_SECS). Lives on the tmpfs above.
+      WORKER_HEARTBEAT_FILE: /tmp/payment-workers.heartbeat
+    secrets: [database_url, worker_signing_key]
     volumes:
       - kycdocs:/data/kyc-docs
+    depends_on:
+      postgres: { condition: service_healthy }
+      nats:     { condition: service_healthy }
+      payment-server: { condition: service_healthy }   # the server migrates first
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/payment-workers", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      # The full checkpoint chain is re-verified from genesis on every start.
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 512
+    expose: ["9101"]
 
   caddy:
-    image: caddy:2
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.console
+    image: payment-console:${IMAGE_TAG:-latest}
     restart: unless-stopped
+    <<: [*logging, *hardening]
+    # Caddy runs as root inside the container only to bind 80/443.
+    cap_add: [NET_BIND_SERVICE]
     # TLS terminates here; Caddy sets X-Forwarded-For to the real client IP
     # (the app runs with TRUST_PROXY=true and reads the right-most hop).
+    # Both variables must be non-empty (an empty value disables the Caddyfile
+    # default), hence the compose-level defaults.
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+      ADMIN_ALLOW_CIDR: ${ADMIN_ALLOW_CIDR:-0.0.0.0/0 ::/0}
     ports:
       - "80:80"
       - "443:443"
+      - "443:443/udp"   # HTTP/3
+    read_only: true
+    tmpfs: [/tmp]
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      # Admin console static build (run `npm run build` in console/ first;
-      # Caddy serves it at /admin).
-      - ../console/dist:/srv/admin:ro
-      - caddydata:/data
+      - caddydata:/data       # certificates, internal CA, access log
       - caddyconfig:/config
     depends_on:
-      payment-server: { condition: service_started }
+      payment-server: { condition: service_healthy }
+    # Liveness of the Caddy process itself via its localhost-only admin API
+    # (upstream health is Caddy's own job: see health_uri in the Caddyfile).
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          pids: 256
+
+  # ---- Backups (both into the `backups` volume; copy it off-box!) ----------
+  # Daily logical dump of the ledger with rotation (14 daily / 8 weekly / 12
+  # monthly) + a dump on every (re)start, i.e. before each deploy. Restore
+  # drill: ./restore-drill.sh
+  postgres-backup:
+    image: prodrigestivill/postgres-backup-local:16-alpine-d257e5d
+    restart: unless-stopped
+    <<: [*logging, *hardening]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: payment
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      # Plain SQL, gzip level 6, no role/ACL statements (restores anywhere).
+      POSTGRES_EXTRA_OPTS: "-Z6 --no-owner --no-privileges"
+      SCHEDULE: "@daily"
+      BACKUP_ON_START: "TRUE"
+      BACKUP_KEEP_DAYS: "14"
+      BACKUP_KEEP_WEEKS: "8"
+      BACKUP_KEEP_MONTHS: "12"
+      HEALTHCHECK_PORT: "8080"
+      TZ: ${TZ:-UTC}
+    secrets: [postgres_password]
+    volumes:
+      - backups:/backups
+    # After the SERVER is healthy, not just Postgres: the on-start dump must
+    # capture a migrated database (on a fresh deploy the schema arrives with the
+    # server's first boot).
+    depends_on:
+      postgres: { condition: service_healthy }
+      payment-server: { condition: service_healthy }
+    # The image's own check polls only every 5 min; this one makes
+    # `docker compose ps` truthful within a minute of start.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8080/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          pids: 128
+
+  # Nightly tarball of the uploaded KYC documents (02:30 UTC), 14-day retention.
+  kyc-backup:
+    image: alpine:3.24.2
+    restart: unless-stopped
+    <<: [*logging, *hardening]
+    # DAC_READ_SEARCH lets the (root, capability-less) cron read documents
+    # whatever mode the server wrote them with.
+    cap_add: [DAC_READ_SEARCH]
+    command:
+      - /bin/sh
+      - -c
+      - printf '%s\n' '30 2 * * * /usr/local/bin/kyc-backup.sh' > /etc/crontabs/root && exec crond -f -d 8
+    environment:
+      KYC_BACKUP_KEEP_DAYS: "14"
+    read_only: true
+    tmpfs: [/tmp, /etc/crontabs]
+    volumes:
+      - kycdocs:/src:ro
+      - backups:/backups
+      - ./backup/kyc-backup.sh:/usr/local/bin/kyc-backup.sh:ro
+    healthcheck:
+      test: ["CMD", "pgrep", "crond"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          pids: 64
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+  database_url:
+    file: ./secrets/database_url
+  jwt_secret:
+    file: ./secrets/jwt_secret
+  worker_signing_key:
+    file: ./secrets/worker_signing_key
 
 volumes:
   pgdata:
@@ -111,3 +377,4 @@ volumes:
   caddydata:
   caddyconfig:
   kycdocs:
+  backups:

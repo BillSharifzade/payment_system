@@ -1,46 +1,178 @@
-# Optional monitoring overlay: ships the app's structured JSON logs to Loki and
-# serves Grafana dashboards. Start alongside the core stack:
-#   docker compose -f docker-compose.prod.yml -f docker-compose.monitoring.yml up -d
+# Optional monitoring overlay: logs (promtail -> Loki), metrics (Prometheus
+# scraping the two app binaries), alerting (Loki ruler + Prometheus rules ->
+# Alertmanager -> your webhook) and Grafana dashboards. Layer it on the core
+# stack by listing both files in deploy/.env:
+#
+#   COMPOSE_FILE=docker-compose.prod.yml:docker-compose.monitoring.yml
+#   GRAFANA_PASSWORD=...            required, no default
+#   ALERT_WEBHOOK_URL=https://...   required: where alerts are POSTed
+#                                   (Slack/Mattermost/Telegram bridge, PagerDuty
+#                                   events API, ntfy, ...)
 #
 # Grafana binds to 127.0.0.1 only — reach it via SSH tunnel:
 #   ssh -L 3000:localhost:3000 user@server   then open http://localhost:3000
+# Nothing else publishes a port; Prometheus/Loki/Alertmanager are reachable
+# only on the internal network (Grafana, or `docker compose exec`).
 name: payment
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+      labels: "com.docker.compose.service,com.docker.compose.project"
+
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
 
 services:
   loki:
-    image: grafana/loki:2.9.8
+    image: grafana/loki:3.7.8
     restart: unless-stopped
-    command: ["-config.file=/etc/loki/local-config.yaml"]
+    <<: [*logging, *hardening]
+    command: ["-config.file=/etc/loki/loki.yml"]
+    read_only: true
+    tmpfs: [/tmp]
     volumes:
+      - ./monitoring/loki-config.yml:/etc/loki/loki.yml:ro
+      # Ruler rules: <dir>/<tenant>/<file>. Single-tenant mode = tenant "fake".
+      - ./monitoring/loki-rules:/etc/loki/rules:ro
       - lokidata:/loki
     expose: ["3100"]
+    # No healthcheck: the image is distroless (no shell or wget). promtail and
+    # Grafana simply retry until it answers.
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 256
 
   promtail:
-    image: grafana/promtail:2.9.8
+    image: grafana/promtail:3.6.11
     restart: unless-stopped
+    <<: [*logging, *hardening]
     command: ["-config.file=/etc/promtail/config.yml"]
+    read_only: true
     volumes:
       - ./monitoring/promtail-config.yml:/etc/promtail/config.yml:ro
+      # Every container's json-file log (root-owned; promtail runs as root in
+      # its own namespace and needs no Docker socket).
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      # Caddy's JSON access log lives on the caddydata volume.
+      - caddydata:/caddy-data:ro
       - promtailpos:/tmp
-    depends_on:
-      - loki
+    depends_on: [loki]
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          pids: 128
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    restart: unless-stopped
+    <<: [*logging, *hardening]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --storage.tsdb.retention.size=2GB
+      - --web.listen-address=0.0.0.0:9090
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus-rules.yml:/etc/prometheus/rules/payment.yml:ro
+      - promdata:/prometheus
+    expose: ["9090"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 256
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.1
+    restart: unless-stopped
+    <<: [*logging, *hardening]
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=0.0.0.0:9093
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - amdata:/alertmanager
+    # The webhook URL comes from the environment (ALERT_WEBHOOK_URL in .env) via
+    # an inline compose config -> file -> `url_file` in alertmanager.yml, so the
+    # URL (often a bearer secret) never sits in a committed file.
+    configs:
+      - source: alert_webhook_url
+        target: /etc/alertmanager/webhook_url
+    expose: ["9093"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9093/-/ready"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          pids: 128
 
   grafana:
-    image: grafana/grafana:11.1.0
+    image: grafana/grafana:13.2.2
     restart: unless-stopped
+    <<: [*logging, *hardening]
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in deploy/.env}
       GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SECURITY_COOKIE_SECURE: "false"   # reached over the SSH tunnel (plain http://localhost)
+    read_only: true
+    tmpfs: [/tmp]
     volumes:
-      - ./monitoring/grafana-datasources.yml:/etc/grafana/provisioning/datasources/loki.yml:ro
+      - ./monitoring/grafana-datasources.yml:/etc/grafana/provisioning/datasources/payment.yml:ro
       - grafanadata:/var/lib/grafana
     ports:
       - "127.0.0.1:3000:3000"
-    depends_on:
-      - loki
+    depends_on: [loki, prometheus]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 256
+
+configs:
+  alert_webhook_url:
+    content: ${ALERT_WEBHOOK_URL:?set ALERT_WEBHOOK_URL in deploy/.env (alerts are POSTed there)}
 
 volumes:
   lokidata:
-  grafanadata:
   promtailpos:
+  promdata:
+  amdata:
+  grafanadata:
+  # Declared in the core file; repeated here so promtail can tail the access log.
+  caddydata:

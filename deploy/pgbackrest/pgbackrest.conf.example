@@ -1,0 +1,48 @@
+# pgBackRest configuration for the WAL-archiving overlay
+# (docker-compose.wal-archive.yml). Copy to deploy/secrets/pgbackrest.conf,
+# fill in the S3 placeholders, chmod 644 (the postgres container user must read
+# it; the secrets/ directory itself is 0700). It contains credentials and the
+# encryption passphrase: it is a secret, never commit it.
+#
+# Repository layout in the bucket: <repo1-path>/archive/payment/... (WAL) and
+# <repo1-path>/backup/payment/... (base backups). Everything is encrypted
+# client-side with repo1-cipher-pass before it leaves the box.
+
+[global]
+repo1-type=s3
+repo1-path=/payment-pgbackrest
+# Off-box, S3-compatible target (AWS S3, Backblaze B2, Wasabi, MinIO, ...).
+# Host only, no scheme; use repo1-storage-port for a non-443 port.
+repo1-s3-endpoint=s3.eu-central-003.backblazeb2.com
+repo1-s3-bucket=CHANGE_ME_bucket
+repo1-s3-region=CHANGE_ME_region
+repo1-s3-key=CHANGE_ME_access_key_id
+repo1-s3-key-secret=CHANGE_ME_secret_access_key
+# path-style URLs work everywhere (MinIO needs them); switch to host for AWS.
+repo1-s3-uri-style=path
+# Encryption at rest, client-side. Generate: openssl rand -hex 32
+# LOSING THIS PASSPHRASE MAKES EVERY BACKUP UNREADABLE — escrow it with the
+# WORKER_SIGNING_KEY.
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=CHANGE_ME_openssl_rand_hex_32
+# Keep 4 full backups (weekly) and the differentials in between.
+repo1-retention-full=4
+repo1-retention-diff=14
+repo1-bundle=y
+repo1-block=y
+
+# WAL segments are queued locally and shipped in the background, so a slow or
+# briefly unreachable bucket never stalls a COMMIT.
+archive-async=y
+spool-path=/var/spool/pgbackrest
+log-path=/var/log/pgbackrest
+log-level-console=info
+log-level-file=detail
+process-max=2
+compress-type=zst
+compress-level=3
+
+[payment]
+pg1-path=/var/lib/postgresql/data
+pg1-port=5432
+pg1-socket-path=/var/run/postgresql

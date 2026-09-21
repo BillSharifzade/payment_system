@@ -1,12 +1,3 @@
-//! HTTP-level integration tests, driving the real router against a real
-//! PostgreSQL via `tower::oneshot` (no sockets).
-//!
-//! Requires a database:
-//! ```bash
-//! DATABASE_URL=postgres://payment:payment_dev_pw@localhost:5432/payment \
-//!   cargo test -p api -- --include-ignored
-//! ```
-
 use api::{build_router, AmlConfig, AppState, AuthConfig, FeeConfig, Limits, RateLimitState};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -45,6 +36,19 @@ fn router_full(
     router_full_quota(pool, rate_limit, aml, fees, 10_000)
 }
 
+const PNG_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR-test-bytes";
+
+fn router_with_auth(pool: PgPool, auth: AuthConfig) -> axum::Router {
+    router_custom(
+        pool,
+        RateLimitState::default(),
+        AmlConfig::default(),
+        FeeConfig::default(),
+        10_000,
+        auth,
+    )
+}
+
 fn router_full_quota(
     pool: PgPool,
     rate_limit: RateLimitState,
@@ -52,31 +56,45 @@ fn router_full_quota(
     fees: FeeConfig,
     kyc_upload_daily_max: i64,
 ) -> axum::Router {
+    router_custom(
+        pool,
+        rate_limit,
+        aml,
+        fees,
+        kyc_upload_daily_max,
+        AuthConfig::default(),
+    )
+}
+
+fn router_custom(
+    pool: PgPool,
+    rate_limit: RateLimitState,
+    aml: AmlConfig,
+    fees: FeeConfig,
+    kyc_upload_daily_max: i64,
+    auth: AuthConfig,
+) -> axum::Router {
     let ledger = PostgresLedger::new(pool);
     build_router(AppState {
         ledger,
-        auth: AuthConfig::default(),
+        auth,
         rate_limit,
-        // Generous so ordinary tests never trip the per-account throttle.
         login_limit: RateLimitState::new(10_000, std::time::Duration::from_secs(60)),
+        resolve_limit: RateLimitState::new(10_000, std::time::Duration::from_secs(60)),
         aml,
         fees,
-        // Tests drive the limiter via X-Forwarded-For over `oneshot` (no socket).
         trust_proxy: true,
         document_dir: std::env::temp_dir().join("payment-kyc-docs-test"),
         kyc_upload_daily_max,
     })
 }
 
-/// Standard app with a generous rate limit. Returns the router and the pool (so
-/// tests can promote a user to admin directly).
 async fn app() -> (axum::Router, PgPool) {
     let pool = connect().await;
     PostgresLedger::new(pool.clone()).migrate().await.unwrap();
     (router_with(pool.clone(), RateLimitState::default()), pool)
 }
 
-/// Register a user and promote them to admin (via direct DB write, as ops would).
 async fn admin_token(app: &axum::Router, pool: &PgPool) -> String {
     let (uid, tok) = register(app).await;
     sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
@@ -87,7 +105,6 @@ async fn admin_token(app: &axum::Router, pool: &PgPool) -> String {
     tok
 }
 
-/// Mark a user KYC-verified (level 1) directly, as an approved review would.
 async fn verify_kyc(pool: &PgPool, user_id: &str) {
     sqlx::query("UPDATE users SET kyc_level = 1 WHERE id = $1")
         .bind(Uuid::parse_str(user_id).unwrap())
@@ -96,7 +113,6 @@ async fn verify_kyc(pool: &PgPool, user_id: &str) {
         .unwrap();
 }
 
-/// Deposit `amount_minor` into `account`, authorised by an admin token.
 async fn admin_deposit(app: &axum::Router, admin_tok: &str, account: &str, amount_minor: i64) {
     let (status, body) = send(
         app,
@@ -124,7 +140,6 @@ async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, body)
 }
 
-/// Build a request. `auth` adds a Bearer header; `key` adds an Idempotency-Key.
 fn req(
     method: &str,
     uri: &str,
@@ -150,7 +165,6 @@ fn req(
     b.body(body).unwrap()
 }
 
-/// Register a fresh user; returns (user_id, access_token).
 async fn register(app: &axum::Router) -> (String, String) {
     let phone = format!("+992{:09}", Uuid::new_v4().as_u128() % 1_000_000_000);
     let (status, body) = send(
@@ -171,8 +185,6 @@ async fn register(app: &axum::Router) -> (String, String) {
     )
 }
 
-/// The user's TJS wallet — auto-created at registration, so this reads the
-/// wallet list rather than opening a second one.
 async fn create_wallet(app: &axum::Router, token: &str) -> String {
     let (status, body) = send(
         app,
@@ -197,14 +209,11 @@ async fn full_authenticated_payment_flow() {
     let alice = create_wallet(&app, &alice_tok).await;
     let bob = create_wallet(&app, &bob_tok).await;
 
-    // Alice must be KYC-verified to send.
     verify_kyc(&pool, &alice_id).await;
 
-    // An admin funds Alice's wallet with 100.00 (deposits are admin-only).
     let admin = admin_token(&app, &pool).await;
     admin_deposit(&app, &admin, &alice, 10_000).await;
 
-    // Alice transfers 35.00 to Bob.
     let (status, body) = send(
         &app,
         req(
@@ -218,7 +227,6 @@ async fn full_authenticated_payment_flow() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "transfer: {body}");
 
-    // Balances reflect it (each reads their own).
     let (_, a_bal) = send(
         &app,
         req(
@@ -245,8 +253,6 @@ async fn full_authenticated_payment_flow() {
     .await;
     assert_eq!(b_bal["balance_minor"], 3_500);
 
-    // Overdraft → 422 insufficient_funds. (50_000 is under the AML per-tx limit
-    // but over Alice's 6_500 balance, so it reaches the ledger's funds check.)
     let (status, body) = send(
         &app,
         req(
@@ -271,11 +277,9 @@ async fn authorization_is_enforced() {
     let alice = create_wallet(&app, &alice_tok).await;
     let bob = create_wallet(&app, &bob_tok).await;
 
-    // No token → 401.
     let (status, _) = send(&app, req("POST", "/v1/wallets", None, None, json!({}))).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // Bob cannot read Alice's balance → 403.
     let (status, _) = send(
         &app,
         req(
@@ -289,7 +293,6 @@ async fn authorization_is_enforced() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // Bob cannot spend from Alice's wallet → 403 (even before funds are checked).
     let (status, _) = send(
         &app,
         req(
@@ -345,7 +348,6 @@ async fn idempotent_replay_and_conflict() {
     assert_eq!(s2, StatusCode::CREATED);
     assert_eq!(first["transaction_id"], replay["transaction_id"]);
 
-    // Same key, different body → 409.
     let (s3, conflict) = send(
         &app,
         req(
@@ -360,7 +362,6 @@ async fn idempotent_replay_and_conflict() {
     assert_eq!(s3, StatusCode::CONFLICT);
     assert_eq!(conflict["error"]["code"], "idempotency_conflict");
 
-    // Only one 20.00 transfer applied.
     let (_, a_bal) = send(
         &app,
         req(
@@ -381,7 +382,6 @@ async fn login_and_refresh_flow() {
     let (app, _pool) = app().await;
     let phone = format!("+992{:09}", Uuid::new_v4().as_u128() % 1_000_000_000);
 
-    // Register.
     let (status, reg) = send(
         &app,
         req(
@@ -396,7 +396,6 @@ async fn login_and_refresh_flow() {
     assert_eq!(status, StatusCode::CREATED);
     let refresh_token = reg["refresh_token"].as_str().unwrap().to_string();
 
-    // Wrong password → 401.
     let (status, _) = send(
         &app,
         req(
@@ -410,7 +409,6 @@ async fn login_and_refresh_flow() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // Correct login → 200 with tokens.
     let (status, _) = send(
         &app,
         req(
@@ -424,7 +422,6 @@ async fn login_and_refresh_flow() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // Refresh rotates: the old token works once, then is revoked.
     let (status, refreshed) = send(
         &app,
         req(
@@ -439,8 +436,9 @@ async fn login_and_refresh_flow() {
     assert_eq!(status, StatusCode::OK);
     assert!(refreshed["access_token"].is_string());
 
-    // Reusing the now-rotated (revoked) refresh token → 401.
-    let (status, _) = send(
+    let successor = refreshed["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, grace) = send(
         &app,
         req(
             "POST",
@@ -448,6 +446,101 @@ async fn login_and_refresh_flow() {
             None,
             None,
             json!({"refresh_token": refresh_token}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grace reuse: {grace}");
+    let grace_token = grace["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, _) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/auth/refresh",
+            None,
+            None,
+            json!({"refresh_token": successor}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/auth/refresh",
+            None,
+            None,
+            json!({"refresh_token": grace_token}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "family revoked after replay"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL (docker compose up -d)"]
+async fn refresh_replay_without_grace_revokes_family() {
+    let pool = connect().await;
+    PostgresLedger::new(pool.clone()).migrate().await.unwrap();
+    let app = router_with_auth(
+        pool,
+        AuthConfig {
+            refresh_reuse_grace_secs: 0,
+            ..AuthConfig::default()
+        },
+    );
+    let phone = format!("+992{:09}", Uuid::new_v4().as_u128() % 1_000_000_000);
+    let (_, reg) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/auth/register",
+            None,
+            None,
+            json!({"phone": phone, "password": "password123"}),
+        ),
+    )
+    .await;
+    let first = reg["refresh_token"].as_str().unwrap().to_string();
+    let (status, rotated) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/auth/refresh",
+            None,
+            None,
+            json!({"refresh_token": first}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let second = rotated["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, _) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/auth/refresh",
+            None,
+            None,
+            json!({"refresh_token": first}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/auth/refresh",
+            None,
+            None,
+            json!({"refresh_token": second}),
         ),
     )
     .await;
@@ -461,7 +554,6 @@ async fn deposits_require_admin() {
     let (_id, user_tok) = register(&app).await;
     let wallet = create_wallet(&app, &user_tok).await;
 
-    // A normal user cannot deposit (fund) — 403.
     let (status, body) = send(
         &app,
         req(
@@ -476,7 +568,6 @@ async fn deposits_require_admin() {
     assert_eq!(status, StatusCode::FORBIDDEN, "non-admin deposit: {body}");
     assert_eq!(body["error"]["code"], "forbidden");
 
-    // An admin can fund the same wallet.
     let admin = admin_token(&app, &pool).await;
     admin_deposit(&app, &admin, &wallet, 5_000).await;
     let (_, bal) = send(
@@ -496,7 +587,6 @@ async fn deposits_require_admin() {
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn rate_limiter_returns_429() {
-    // Tight limit: 3 requests per long window, so the 4th from the same client trips.
     let pool = connect().await;
     PostgresLedger::new(pool.clone()).migrate().await.unwrap();
     let app = router_with(pool, RateLimitState::new(3, Duration::from_secs(60)));
@@ -506,25 +596,35 @@ async fn rate_limiter_returns_429() {
     for _ in 0..4 {
         let request = Request::builder()
             .method("GET")
-            .uri("/health")
+            .uri("/v1/config")
             .header("x-forwarded-for", client_ip)
             .body(Body::empty())
             .unwrap();
         statuses.push(app.clone().oneshot(request).await.unwrap().status());
     }
-    assert_eq!(statuses[0], StatusCode::OK);
-    assert_eq!(statuses[2], StatusCode::OK);
+    assert_eq!(statuses[0], StatusCode::UNAUTHORIZED);
+    assert_eq!(statuses[2], StatusCode::UNAUTHORIZED);
     assert_eq!(statuses[3], StatusCode::TOO_MANY_REQUESTS);
 
-    // A different client is unaffected (separate bucket).
     let other = Request::builder()
         .method("GET")
-        .uri("/health")
+        .uri("/v1/config")
         .header("x-forwarded-for", "198.51.100.9")
         .body(Body::empty())
         .unwrap();
     assert_eq!(
         app.clone().oneshot(other).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let probe = Request::builder()
+        .method("GET")
+        .uri("/ready")
+        .header("x-forwarded-for", client_ip)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(probe).await.unwrap().status(),
         StatusCode::OK
     );
 }
@@ -540,7 +640,6 @@ async fn kyc_gates_transfers_and_supports_review() {
     let admin = admin_token(&app, &pool).await;
     admin_deposit(&app, &admin, &alice, 10_000).await;
 
-    // Unverified Alice cannot transfer → 403 kyc_required.
     let (status, body) = send(
         &app,
         req(
@@ -555,7 +654,6 @@ async fn kyc_gates_transfers_and_supports_review() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"]["code"], "kyc_required");
 
-    // Alice submits KYC → pending.
     let submit = json!({
         "requested_level": 1, "full_name": "Alice A",
         "document_type": "passport", "document_ref": "obj://doc/alice"
@@ -574,7 +672,6 @@ async fn kyc_gates_transfers_and_supports_review() {
     assert_eq!(status, StatusCode::CREATED);
     let submission_id = sub["id"].as_str().unwrap().to_string();
 
-    // A second pending submission is rejected → 409.
     let (status, _) = send(
         &app,
         req(
@@ -588,7 +685,6 @@ async fn kyc_gates_transfers_and_supports_review() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
 
-    // A normal user cannot approve KYC → 403.
     let (status, _) = send(
         &app,
         req(
@@ -602,7 +698,6 @@ async fn kyc_gates_transfers_and_supports_review() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // Admin approves → Alice is level 1.
     let (status, _) = send(
         &app,
         req(
@@ -624,7 +719,6 @@ async fn kyc_gates_transfers_and_supports_review() {
     assert_eq!(kyc["kyc_level"], 1);
     assert_eq!(kyc["latest_submission"]["status"], "approved");
 
-    // Now Alice's transfer succeeds.
     let (status, _) = send(
         &app,
         req(
@@ -638,7 +732,6 @@ async fn kyc_gates_transfers_and_supports_review() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // Rejection path: a new user's submission can be rejected, leaving them unverified.
     let (_carol_id, carol_tok) = register(&app).await;
     let (_, csub) = send(
         &app,
@@ -689,7 +782,6 @@ async fn aml_blocklist_enforced() {
     let xfer =
         |amount: i64| json!({"from_account": alice, "to_account": bob, "amount_minor": amount});
 
-    // Block the recipient → sender's transfer is refused.
     let (status, _) = send(
         &app,
         req(
@@ -717,7 +809,6 @@ async fn aml_blocklist_enforced() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"]["code"], "account_blocked");
 
-    // Unblock the recipient → transfer succeeds.
     let (status, _) = send(
         &app,
         req(
@@ -743,7 +834,6 @@ async fn aml_blocklist_enforced() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // Block the sender → their transfers are refused too.
     send(
         &app,
         req(
@@ -773,7 +863,6 @@ async fn aml_blocklist_enforced() {
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn aml_limits_and_velocity_enforced() {
-    // Tight limits so small amounts exercise the rules.
     let tight = AmlConfig {
         level1: Limits {
             per_tx_minor: 1_000,
@@ -810,12 +899,10 @@ async fn aml_limits_and_velocity_enforced() {
         )
     };
 
-    // Over the per-transaction limit → 422 limit_exceeded.
     let (status, body) = send(&app, post(2_000, &alice_tok)).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body["error"]["code"], "limit_exceeded");
 
-    // Two transfers within limits succeed (velocity budget = 2/hour).
     assert_eq!(
         send(&app, post(500, &alice_tok)).await.0,
         StatusCode::CREATED
@@ -825,7 +912,6 @@ async fn aml_limits_and_velocity_enforced() {
         StatusCode::CREATED
     );
 
-    // Third trips velocity (or daily) → 422.
     let (status, body) = send(&app, post(100, &alice_tok)).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body["error"]["code"], "limit_exceeded");
@@ -841,37 +927,38 @@ async fn redis_rate_limiter_returns_429() {
         .create_pool(Some(deadpool_redis::Runtime::Tokio1))
         .unwrap();
 
-    // 3 requests per window, backed by Redis.
     let app = router_with(
         pool,
         RateLimitState::redis(redis_pool, 3, Duration::from_secs(60)),
     );
 
-    // Unique client key so the test is independent of previous runs.
     let client = format!("test-{}", Uuid::new_v4());
     let mut statuses = Vec::new();
     for _ in 0..4 {
         let request = Request::builder()
             .method("GET")
-            .uri("/health")
+            .uri("/v1/config")
             .header("x-forwarded-for", &client)
             .body(Body::empty())
             .unwrap();
         statuses.push(app.clone().oneshot(request).await.unwrap().status());
     }
-    assert_eq!(statuses[0], StatusCode::OK);
-    assert_eq!(statuses[2], StatusCode::OK);
+    assert_eq!(statuses[0], StatusCode::UNAUTHORIZED);
+    assert_eq!(statuses[2], StatusCode::UNAUTHORIZED);
     assert_eq!(statuses[3], StatusCode::TOO_MANY_REQUESTS);
 }
 
-/// Read a system account's raw (signed) balance directly, for assertions on
-/// accounts the API won't expose to a normal user (e.g. the fee-revenue account).
-async fn raw_balance(pool: &PgPool, account_id: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT raw_minor FROM balances WHERE account_id = $1")
-        .bind(account_id)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+async fn system_total(pool: &PgPool, account_type: &str, currency: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COALESCE(SUM(b.raw_minor), 0)::BIGINT
+         FROM balances b JOIN accounts a ON a.id = b.account_id
+         WHERE a.account_type = $1 AND a.currency = $2",
+    )
+    .bind(account_type)
+    .bind(currency)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -879,7 +966,6 @@ async fn raw_balance(pool: &PgPool, account_id: Uuid) -> i64 {
 async fn transfer_fee_is_charged_as_three_entries() {
     let pool = connect().await;
     PostgresLedger::new(pool.clone()).migrate().await.unwrap();
-    // 1% transfer fee.
     let app = router_full(
         pool.clone(),
         RateLimitState::default(),
@@ -895,11 +981,8 @@ async fn transfer_fee_is_charged_as_three_entries() {
     let admin = admin_token(&app, &pool).await;
     admin_deposit(&app, &admin, &alice, 100_000).await;
 
-    // The fee-revenue account (Uuid::from_u128(2)) is shared, so measure a delta.
-    let fee_account = Uuid::from_u128(2);
-    let fee_before = raw_balance(&pool, fee_account).await;
+    let fee_before = system_total(&pool, "system_fee_revenue", "TJS").await;
 
-    // Transfer 10_000 (100 TJS) → 1% fee = 100.
     let (status, _) = send(
         &app,
         req(
@@ -913,7 +996,6 @@ async fn transfer_fee_is_charged_as_three_entries() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // Sender debited the full amount; recipient receives amount − fee.
     let (_, a_bal) = send(
         &app,
         req(
@@ -936,11 +1018,10 @@ async fn transfer_fee_is_charged_as_three_entries() {
         ),
     )
     .await;
-    assert_eq!(a_bal["balance_minor"], 90_000); // 100_000 − 10_000
-    assert_eq!(b_bal["balance_minor"], 9_900); //  10_000 − 100 fee
+    assert_eq!(a_bal["balance_minor"], 90_000);
+    assert_eq!(b_bal["balance_minor"], 9_900);
 
-    // The fee-revenue account gained exactly the fee.
-    let fee_after = raw_balance(&pool, fee_account).await;
+    let fee_after = system_total(&pool, "system_fee_revenue", "TJS").await;
     assert_eq!(fee_after - fee_before, 100);
 }
 
@@ -964,9 +1045,6 @@ async fn create_wallet_cur(app: &axum::Router, token: &str, currency: &str) -> S
     body["id"].as_str().unwrap().to_string()
 }
 
-/// `fx_rates` is one global table and tests run in parallel: every test that
-/// WRITES the TJS→USD rate must hold this lock, or two of them interleave and
-/// one asserts against the other's rate.
 static FX_RATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
@@ -975,13 +1053,12 @@ async fn fx_conversion_balances_both_legs() {
     let _fx = FX_RATE_LOCK.lock().await;
     let (app, pool) = app().await;
     let (uid, tok) = register(&app).await;
-    let tjs = create_wallet(&app, &tok).await; // default TJS
+    let tjs = create_wallet(&app, &tok).await;
     let usd = create_wallet_cur(&app, &tok, "USD").await;
     verify_kyc(&pool, &uid).await;
     let admin = admin_token(&app, &pool).await;
-    admin_deposit(&app, &admin, &tjs, 10_000).await; // 100.00 TJS
+    admin_deposit(&app, &admin, &tjs, 10_000).await;
 
-    // Admin sets TJS->USD: 1 TJS-minor = 0.1 USD-minor (num=1, den=10).
     let (status, _) = send(
         &app,
         req(
@@ -995,11 +1072,9 @@ async fn fx_conversion_balances_both_legs() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    // FX-position accounts are shared/persistent — measure deltas.
-    let fx_tjs_before = raw_balance(&pool, Uuid::from_u128(3)).await;
-    let fx_usd_before = raw_balance(&pool, Uuid::from_u128(4)).await;
+    let fx_tjs_before = system_total(&pool, "system_fx_gain_loss", "TJS").await;
+    let fx_usd_before = system_total(&pool, "system_fx_gain_loss", "USD").await;
 
-    // Convert 10_000 TJS-minor → 1_000 USD-minor.
     let (status, body) = send(
         &app,
         req(
@@ -1017,7 +1092,6 @@ async fn fx_conversion_balances_both_legs() {
     assert_eq!(body["from_currency"], "TJS");
     assert_eq!(body["to_currency"], "USD");
 
-    // Balances: TJS drained, USD funded.
     let (_, tjs_bal) = send(
         &app,
         req(
@@ -1044,18 +1118,15 @@ async fn fx_conversion_balances_both_legs() {
     assert_eq!(usd_bal["balance_minor"], 1_000);
     assert_eq!(usd_bal["display"], "10.00 USD");
 
-    // Each currency leg balanced to zero: the platform FX positions mirror the user.
-    // TJS fx position gained the 10_000 the user spent; USD fx position went short 1_000.
     assert_eq!(
-        raw_balance(&pool, Uuid::from_u128(3)).await - fx_tjs_before,
+        system_total(&pool, "system_fx_gain_loss", "TJS").await - fx_tjs_before,
         10_000
     );
     assert_eq!(
-        raw_balance(&pool, Uuid::from_u128(4)).await - fx_usd_before,
+        system_total(&pool, "system_fx_gain_loss", "USD").await - fx_usd_before,
         -1_000
     );
 
-    // No same-currency FX.
     let (status, _) = send(
         &app,
         req(
@@ -1070,10 +1141,6 @@ async fn fx_conversion_balances_both_legs() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-/// Regression (audit 2026-07-03): a retry of an already-posted transfer must
-/// replay the stored response, even when the original transfer consumed the
-/// AML budget that a fresh screening would now fail — a lost-response retry
-/// must never be told "limit exceeded" for money that actually moved.
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn retry_of_posted_transfer_replays_despite_consumed_limits() {
@@ -1104,7 +1171,6 @@ async fn retry_of_posted_transfer_replays_despite_consumed_limits() {
     let key = Uuid::new_v4().to_string();
     let xfer = json!({"from_account": alice, "to_account": bob, "amount_minor": 1_000});
 
-    // Post the transfer; it consumes 1_000 of the 1_500 daily budget.
     let (s1, first) = send(
         &app,
         req(
@@ -1118,7 +1184,6 @@ async fn retry_of_posted_transfer_replays_despite_consumed_limits() {
     .await;
     assert_eq!(s1, StatusCode::CREATED, "first post: {first}");
 
-    // A DIFFERENT transfer of the same size would now blow the daily limit.
     let (s2, blocked) = send(
         &app,
         req(
@@ -1137,8 +1202,6 @@ async fn retry_of_posted_transfer_replays_despite_consumed_limits() {
     );
     assert_eq!(blocked["error"]["code"], "limit_exceeded");
 
-    // But the RETRY of the first (same key, same body) must replay the stored
-    // 201 — not be re-screened into a bogus 422.
     let (s3, replay) = send(
         &app,
         req("POST", "/v1/transfers", Some(&alice_tok), Some(&key), xfer),
@@ -1147,7 +1210,6 @@ async fn retry_of_posted_transfer_replays_despite_consumed_limits() {
     assert_eq!(s3, StatusCode::CREATED, "replay: {replay}");
     assert_eq!(replay["transaction_id"], first["transaction_id"]);
 
-    // And the money moved exactly once.
     let (_, bal) = send(
         &app,
         req(
@@ -1162,9 +1224,6 @@ async fn retry_of_posted_transfer_replays_despite_consumed_limits() {
     assert_eq!(bal["balance_minor"], 9_000);
 }
 
-/// Regression (audit 2026-07-03): system accounts have well-known ids; money
-/// moved into them is unrecoverable, so transfers and deposits must refuse any
-/// target that is not a user wallet.
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn system_accounts_are_not_valid_targets() {
@@ -1175,7 +1234,6 @@ async fn system_accounts_are_not_valid_targets() {
     let admin = admin_token(&app, &pool).await;
     admin_deposit(&app, &admin, &alice, 10_000).await;
 
-    // The seeded fee-revenue account.
     let fee_account = "00000000-0000-0000-0000-000000000002";
 
     let (status, body) = send(
@@ -1205,7 +1263,6 @@ async fn system_accounts_are_not_valid_targets() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "deposit: {body}");
 }
 
-/// Phase A (console/app support): wallet list + keyset-paginated statement.
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn wallet_list_and_statement_pagination() {
@@ -1218,7 +1275,6 @@ async fn wallet_list_and_statement_pagination() {
     let admin = admin_token(&app, &pool).await;
     admin_deposit(&app, &admin, &alice, 5_000).await;
 
-    // One outgoing transfer so the statement has two entries (credit + debit).
     let (s, b) = send(
         &app,
         req(
@@ -1232,7 +1288,6 @@ async fn wallet_list_and_statement_pagination() {
     .await;
     assert_eq!(s, StatusCode::CREATED, "transfer: {b}");
 
-    // Wallet list shows the wallet with its post-transfer balance.
     let (s, wallets) = send(
         &app,
         req("GET", "/v1/wallets", Some(&alice_tok), None, Value::Null),
@@ -1245,7 +1300,6 @@ async fn wallet_list_and_statement_pagination() {
     assert_eq!(list[0]["balance_minor"], 4_000);
     assert_eq!(list[0]["display"], "40.00 TJS");
 
-    // Statement, one entry per page: newest first (the transfer debit)...
     let (s, page1) = send(
         &app,
         req(
@@ -1262,7 +1316,6 @@ async fn wallet_list_and_statement_pagination() {
     assert_eq!(page1["entries"][0]["amount_minor"], 1_000);
     let cursor = page1["next_cursor"].as_str().unwrap().to_string();
 
-    // ...then the older deposit credit on page 2.
     let encoded = cursor
         .replace('+', "%2B")
         .replace(' ', "%20")
@@ -1282,7 +1335,6 @@ async fn wallet_list_and_statement_pagination() {
     assert_eq!(page2["entries"][0]["direction"], "credit");
     assert_eq!(page2["entries"][0]["amount_minor"], 5_000);
 
-    // Someone else's statement is forbidden.
     let (s, _) = send(
         &app,
         req(
@@ -1296,7 +1348,6 @@ async fn wallet_list_and_statement_pagination() {
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 
-    // A garbage cursor is a 400, not a 500.
     let (s, _) = send(
         &app,
         req(
@@ -1338,7 +1389,6 @@ fn multipart_request(uri: &str, token: &str, content_type: &str, payload: &[u8])
         .unwrap()
 }
 
-/// Phase A: KYC document upload, admin-only retrieval, and the review queue.
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn kyc_documents_and_admin_review_queue() {
@@ -1346,8 +1396,7 @@ async fn kyc_documents_and_admin_review_queue() {
     let (_uid, tok) = register(&app).await;
     let admin = admin_token(&app, &pool).await;
 
-    // Upload a (fake) PNG.
-    let payload = b"\x89PNG-not-really-but-bytes";
+    let payload = b"\x89PNG\r\n\x1a\nnot-really-a-png-but-the-magic-is-right";
     let (s, up) = send(
         &app,
         multipart_request("/v1/kyc/documents", &tok, "image/png", payload),
@@ -1357,7 +1406,6 @@ async fn kyc_documents_and_admin_review_queue() {
     let doc_ref = up["document_ref"].as_str().unwrap().to_string();
     assert!(doc_ref.ends_with(".png"));
 
-    // Unsupported content type → 400.
     let (s, _) = send(
         &app,
         multipart_request("/v1/kyc/documents", &tok, "text/html", b"nope"),
@@ -1365,7 +1413,6 @@ async fn kyc_documents_and_admin_review_queue() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
-    // The uploader cannot read documents back; an admin can, byte-exact.
     let (s, _) = send(
         &app,
         req(
@@ -1394,7 +1441,6 @@ async fn kyc_documents_and_admin_review_queue() {
     let got = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(got.as_ref(), payload);
 
-    // Path traversal shapes are rejected outright.
     let (s, _) = send(
         &app,
         req(
@@ -1408,7 +1454,6 @@ async fn kyc_documents_and_admin_review_queue() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
-    // Submit KYC citing the uploaded ref; it appears in the pending queue.
     let (s, sub) = send(
         &app,
         req(
@@ -1439,7 +1484,6 @@ async fn kyc_documents_and_admin_review_queue() {
         });
     assert!(found, "submission missing from pending queue: {queue}");
 
-    // Non-admins cannot list the queue.
     let (s, _) = send(
         &app,
         req(
@@ -1454,7 +1498,6 @@ async fn kyc_documents_and_admin_review_queue() {
     assert_eq!(s, StatusCode::FORBIDDEN);
 }
 
-/// Phase A: admin user lookup, integrity status, and the FX rate list.
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn admin_lookup_status_and_fx_rates() {
@@ -1478,7 +1521,6 @@ async fn admin_lookup_status_and_fx_rates() {
     let admin = admin_token(&app, &pool).await;
     admin_deposit(&app, &admin, &wallet, 2_500).await;
 
-    // Lookup by phone (with separators, exercising normalization).
     let spaced = format!("{} {}", &phone[..4], &phone[4..]).replace(' ', "%20");
     let (s, user) = send(
         &app,
@@ -1496,7 +1538,6 @@ async fn admin_lookup_status_and_fx_rates() {
     assert_eq!(user["wallets"][0]["balance_minor"], 2_500);
     assert!(user["blocked_reason"].is_null());
 
-    // Status: conservation must be exactly zero in every currency.
     let (s, status) = send(
         &app,
         req("GET", "/v1/admin/status", Some(&admin), None, Value::Null),
@@ -1507,7 +1548,6 @@ async fn admin_lookup_status_and_fx_rates() {
         assert_eq!(c["net_minor"], 0, "conservation broken: {status}");
     }
 
-    // FX rates: set one as admin, read it back as a normal user.
     let (s, _) = send(
         &app,
         req(
@@ -1534,8 +1574,6 @@ async fn admin_lookup_status_and_fx_rates() {
     assert!(found, "rate missing: {rates}");
 }
 
-/// Audit 2026-07-08: freezing an account must end its sessions — refresh is
-/// status-gated and a freeze revokes the whole token family.
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn frozen_account_cannot_refresh_or_login() {
@@ -1561,7 +1599,6 @@ async fn frozen_account_cannot_refresh_or_login() {
     let admin = admin_token(&app, &pool).await;
     let status_uri = format!("/v1/admin/users/{uid}/status");
 
-    // Only admins may change a status, and only to a known one.
     let (s, _) = send(
         &app,
         req(
@@ -1599,7 +1636,6 @@ async fn frozen_account_cannot_refresh_or_login() {
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
-    // Freeze: the pre-freeze refresh token is revoked, and login is refused.
     let (s, _) = send(
         &app,
         req(
@@ -1637,8 +1673,6 @@ async fn frozen_account_cannot_refresh_or_login() {
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "frozen login: {body}");
 
-    // Reactivate, log back in, then freeze via a path that does NOT revoke
-    // tokens (a direct DB write): refresh alone must still refuse.
     let (s, _) = send(
         &app,
         req(
@@ -1685,8 +1719,6 @@ async fn frozen_account_cannot_refresh_or_login() {
     assert_eq!(body["error"]["code"], "forbidden");
 }
 
-/// Audit 2026-07-08: uploads are quota'd per user, so one registered account
-/// cannot fill the document volume at the global rate limit.
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn kyc_upload_quota_enforced() {
@@ -1704,22 +1736,20 @@ async fn kyc_upload_quota_enforced() {
     for i in 0..2 {
         let (s, body) = send(
             &app,
-            multipart_request("/v1/kyc/documents", &tok, "image/png", b"png-bytes"),
+            multipart_request("/v1/kyc/documents", &tok, "image/png", PNG_BYTES),
         )
         .await;
         assert_eq!(s, StatusCode::CREATED, "upload {i}: {body}");
     }
     let (s, body) = send(
         &app,
-        multipart_request("/v1/kyc/documents", &tok, "image/png", b"png-bytes"),
+        multipart_request("/v1/kyc/documents", &tok, "image/png", PNG_BYTES),
     )
     .await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "over quota: {body}");
     assert_eq!(body["error"]["code"], "rate_limited");
 }
 
-/// Audit 2026-07-08: a self-transfer moves nothing but would consume AML
-/// budget (and pay a fee, if configured) — reject it outright.
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn self_transfer_is_rejected() {
@@ -1743,7 +1773,6 @@ async fn self_transfer_is_rejected() {
     assert_eq!(body["error"]["code"], "bad_request");
 }
 
-/// Console overhaul 2026-07-09: dashboard metrics + browsable user directory.
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn admin_metrics_and_user_list() {
@@ -1754,13 +1783,11 @@ async fn admin_metrics_and_user_list() {
     let admin = admin_token(&app, &pool).await;
     admin_deposit(&app, &admin, &wallet, 12_345).await;
 
-    // Both endpoints are admin-only.
     for uri in ["/v1/admin/metrics", "/v1/admin/users/list"] {
         let (s, _) = send(&app, req("GET", uri, Some(&tok), None, Value::Null)).await;
         assert_eq!(s, StatusCode::FORBIDDEN, "{uri} must be admin-only");
     }
 
-    // Metrics: sane shape, and today's deposit is visible in the aggregates.
     let (s, m) = send(
         &app,
         req("GET", "/v1/admin/metrics", Some(&admin), None, Value::Null),
@@ -1795,7 +1822,6 @@ async fn admin_metrics_and_user_list() {
     assert!(m["users"]["total"].as_i64().unwrap() >= 2);
     assert!(m["kyc"]["pending"].is_i64() && m["aml_blocked_30d"].is_i64());
 
-    // User list: newest-first browse pages by cursor…
     let (s, page) = send(
         &app,
         req(
@@ -1827,7 +1853,6 @@ async fn admin_metrics_and_user_list() {
         "cursor must advance"
     );
 
-    // …and prefix search finds the freshly registered user by phone.
     let phone = page_phone(&app, &admin, &uid).await;
     let (s, found) = send(
         &app,
@@ -1852,11 +1877,7 @@ async fn admin_metrics_and_user_list() {
     );
 }
 
-/// Today's UTC date in the same YYYY-MM-DD form the metrics endpoint emits.
-/// Both this and the container's Postgres bucket in UTC, so they agree even
-/// across a local-timezone midnight.
 fn chrono_like_today() -> String {
-    // std-only: seconds since epoch → civil date (Howard Hinnant's algorithm).
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1885,8 +1906,6 @@ fn urlencode(s: &str) -> String {
         .collect()
 }
 
-/// Record an approved KYC submission with a verified name, as a real review
-/// would — this is the only source of a name the resolve endpoint will reveal.
 async fn approve_named_kyc(pool: &PgPool, user_id: &str, full_name: &str) {
     sqlx::query(
         "INSERT INTO kyc_submissions
@@ -1909,21 +1928,17 @@ async fn resolve_recipient_by_phone_and_wallet() {
     let (app, pool) = app().await;
     let admin = admin_token(&app, &pool).await;
 
-    // Sender must be KYC-1 to use resolve at all.
     let (sender_id, sender_tok) = register(&app).await;
 
-    // Case 1: recipient with an approved KYC name + a TJS wallet.
     let (named_id, named_tok) = register(&app).await;
     let named_wallet = create_wallet(&app, &named_tok).await;
     approve_named_kyc(&pool, &named_id, "Firuz Rahimov").await;
     let named_phone = page_phone(&app, &admin, &named_id).await;
 
-    // Case 2: recipient registered with a TJS wallet but no verified name.
     let (nameless_id, nameless_tok) = register(&app).await;
     let _nameless_wallet = create_wallet(&app, &nameless_tok).await;
     let nameless_phone = page_phone(&app, &admin, &nameless_id).await;
 
-    // Un-verified sender is refused (403 kyc_required) — not an open oracle.
     let (s, body) = send(
         &app,
         req(
@@ -1940,7 +1955,6 @@ async fn resolve_recipient_by_phone_and_wallet() {
 
     verify_kyc(&pool, &sender_id).await;
 
-    // Verified recipient → name revealed, marked verified, wallet returned.
     let (s, body) = send(
         &app,
         req(
@@ -1958,7 +1972,6 @@ async fn resolve_recipient_by_phone_and_wallet() {
     assert_eq!(body["wallet_id"], named_wallet);
     assert_eq!(body["currency"], "TJS");
 
-    // Registered but unverified recipient → found & sendable, no name.
     let (s, body) = send(
         &app,
         req(
@@ -1974,7 +1987,6 @@ async fn resolve_recipient_by_phone_and_wallet() {
     assert!(body["name"].is_null());
     assert_eq!(body["name_verified"], false);
 
-    // Unknown number → 404 not_found (the "different message" case).
     let (s, body) = send(
         &app,
         req(
@@ -1989,7 +2001,6 @@ async fn resolve_recipient_by_phone_and_wallet() {
     assert_eq!(s, StatusCode::NOT_FOUND, "resolve unknown: {body}");
     assert_eq!(body["error"]["code"], "not_found");
 
-    // QR path: resolve the same recipient by wallet id → same result.
     let (s, body) = send(
         &app,
         req(
@@ -2005,7 +2016,6 @@ async fn resolve_recipient_by_phone_and_wallet() {
     assert_eq!(body["name"], "Firuz Rahimov");
     assert_eq!(body["wallet_id"], named_wallet);
 
-    // A system account id is never a valid recipient.
     let system = format!("{}", uuid::Uuid::from_u128(0x1000));
     let (s, _) = send(
         &app,
@@ -2020,7 +2030,6 @@ async fn resolve_recipient_by_phone_and_wallet() {
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND, "system account must not resolve");
 
-    // Neither key, or both, is a 400.
     let (s, _) = send(
         &app,
         req(
@@ -2035,11 +2044,7 @@ async fn resolve_recipient_by_phone_and_wallet() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "no key → 400");
 }
 
-/// Fetch a user's phone via the admin lookup-by-id path (through the list).
 async fn page_phone(app: &axum::Router, admin: &str, user_id: &str) -> String {
-    // The registration helper doesn't expose the phone, so find it by id in
-    // a big first page (tests share the DB; the user was just created, so
-    // newest-first finds it immediately).
     let (s, page) = send(
         app,
         req(
@@ -2061,7 +2066,6 @@ async fn page_phone(app: &axum::Router, admin: &str, user_id: &str) -> String {
         .expect("freshly registered user must be on the first page")
 }
 
-/// A user's phone, read straight from the DB (test-only shortcut).
 async fn db_phone(pool: &PgPool, user_id: &str) -> String {
     sqlx::query_scalar("SELECT phone FROM users WHERE id = $1")
         .bind(Uuid::parse_str(user_id).unwrap())
@@ -2086,7 +2090,6 @@ async fn statement_is_enriched_with_kind_and_counterparty() {
     let alice_phone = db_phone(&pool, &alice_id).await;
     let bob_phone = db_phone(&pool, &bob_id).await;
 
-    // Fund Alice, then she pays Bob.
     admin_deposit(&app, &admin, &alice_wallet, 10_000).await;
     let (s, body) = send(
         &app,
@@ -2104,7 +2107,6 @@ async fn statement_is_enriched_with_kind_and_counterparty() {
     .await;
     assert_eq!(s, StatusCode::CREATED, "transfer: {body}");
 
-    // Alice's statement, newest first: [transfer out to Bob, deposit].
     let (s, body) = send(
         &app,
         req(
@@ -2125,11 +2127,9 @@ async fn statement_is_enriched_with_kind_and_counterparty() {
     assert_eq!(entries[0]["counterparty_name"], "Bobojon Qurbonov");
     assert_eq!(entries[1]["kind"], "deposit");
     assert_eq!(entries[1]["direction"], "credit");
-    // System counterparts expose nothing.
     assert!(entries[1]["counterparty_phone"].is_null());
     assert!(entries[1]["counterparty_name"].is_null());
 
-    // Bob's side of the same transfer: received from Alice, with her identity.
     let (s, body) = send(
         &app,
         req(
@@ -2148,7 +2148,6 @@ async fn statement_is_enriched_with_kind_and_counterparty() {
     assert_eq!(entries[0]["counterparty_phone"], json!(alice_phone));
     assert_eq!(entries[0]["counterparty_name"], "Alice Statement");
 
-    // FX between Alice's own wallets is kind "fx" on both sides, no counterparty.
     let (s, body) = send(
         &app,
         req(
@@ -2193,4 +2192,215 @@ async fn statement_is_enriched_with_kind_and_counterparty() {
         assert!(e["counterparty_phone"].is_null());
         assert!(e["counterparty_name"].is_null());
     }
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL (docker compose up -d)"]
+async fn aml_daily_limit_holds_under_concurrency() {
+    let pool = connect().await;
+    PostgresLedger::new(pool.clone()).migrate().await.unwrap();
+    let aml = AmlConfig {
+        level1: Limits {
+            per_tx_minor: 1_000,
+            daily_minor: 5_000,
+            velocity_per_hour: 1_000,
+        },
+        level2: AmlConfig::default().level2,
+    };
+    let app = router_with_aml(pool.clone(), RateLimitState::default(), aml);
+    let admin = admin_token(&app, &pool).await;
+    let (alice_id, alice_tok) = register(&app).await;
+    let (_bob_id, bob_tok) = register(&app).await;
+    verify_kyc(&pool, &alice_id).await;
+    let alice = create_wallet(&app, &alice_tok).await;
+    let bob = create_wallet(&app, &bob_tok).await;
+    admin_deposit(&app, &admin, &alice, 100_000).await;
+
+    let mut handles = Vec::new();
+    for _ in 0..12 {
+        let app = app.clone();
+        let (tok, from, to) = (alice_tok.clone(), alice.clone(), bob.clone());
+        handles.push(tokio::spawn(async move {
+            send(
+                &app,
+                req(
+                    "POST",
+                    "/v1/transfers",
+                    Some(&tok),
+                    Some(&Uuid::new_v4().to_string()),
+                    json!({"from_account": from, "to_account": to, "amount_minor": 1_000}),
+                ),
+            )
+            .await
+        }));
+    }
+    let mut posted = 0;
+    let mut limited = 0;
+    for h in handles {
+        let (status, body) = h.await.unwrap();
+        match status {
+            StatusCode::CREATED => posted += 1,
+            StatusCode::UNPROCESSABLE_ENTITY => {
+                assert_eq!(body["error"]["code"], "limit_exceeded", "{body}");
+                limited += 1;
+            }
+            other => panic!("unexpected {other}: {body}"),
+        }
+    }
+    assert_eq!(posted, 5, "exactly floor(5000/1000) transfers may post");
+    assert_eq!(limited, 7);
+
+    let (_, b_bal) = send(
+        &app,
+        req(
+            "GET",
+            &format!("/v1/accounts/{bob}/balance"),
+            Some(&bob_tok),
+            None,
+            Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(b_bal["balance_minor"], 5_000);
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL (docker compose up -d)"]
+async fn frozen_user_cannot_transfer_with_live_token() {
+    let (app, pool) = app().await;
+    let admin = admin_token(&app, &pool).await;
+    let (alice_id, alice_tok) = register(&app).await;
+    let (_bob_id, bob_tok) = register(&app).await;
+    verify_kyc(&pool, &alice_id).await;
+    let alice = create_wallet(&app, &alice_tok).await;
+    let bob = create_wallet(&app, &bob_tok).await;
+    admin_deposit(&app, &admin, &alice, 10_000).await;
+
+    let (status, _) = send(
+        &app,
+        req(
+            "POST",
+            &format!("/v1/admin/users/{alice_id}/status"),
+            Some(&admin),
+            None,
+            json!({"status": "frozen"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/transfers",
+            Some(&alice_tok),
+            Some(&Uuid::new_v4().to_string()),
+            json!({"from_account": alice, "to_account": bob, "amount_minor": 100}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "forbidden");
+    assert!(body["error"]["request_id"].is_string());
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL (docker compose up -d)"]
+async fn kyc_upload_rejects_mismatched_content() {
+    let (app, _pool) = app().await;
+    let (_uid, tok) = register(&app).await;
+    let (s, body) = send(
+        &app,
+        multipart_request(
+            "/v1/kyc/documents",
+            &tok,
+            "image/png",
+            b"<html>not a png</html>",
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    let (s, body) = send(
+        &app,
+        multipart_request(
+            "/v1/kyc/documents",
+            &tok,
+            "application/pdf",
+            b"%PDF-1.4 minimal",
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL (docker compose up -d)"]
+async fn readiness_request_ids_and_cache_policy() {
+    let (app, _pool) = app().await;
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/ready", None, None, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("x-request-id").is_some());
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+
+    let mut request = req("GET", "/v1/config", None, None, Value::Null);
+    request
+        .headers_mut()
+        .insert("x-request-id", "abc-123".parse().unwrap());
+    let resp = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.headers().get("x-request-id").unwrap(), "abc-123");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["request_id"], "abc-123");
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL (docker compose up -d)"]
+async fn usd_deposit_uses_usd_settlement() {
+    let (app, pool) = app().await;
+    let admin = admin_token(&app, &pool).await;
+    let (_uid, tok) = register(&app).await;
+    let usd = create_wallet_cur(&app, &tok, "USD").await;
+    let before = system_total(&pool, "system_settlement", "USD").await;
+    let (status, body) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/deposits",
+            Some(&admin),
+            Some(&Uuid::new_v4().to_string()),
+            json!({"user_account": usd, "amount_minor": 2_500, "currency": "USD"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        system_total(&pool, "system_settlement", "USD").await - before,
+        -2_500
+    );
+    let (status, body) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/deposits",
+            Some(&admin),
+            Some(&Uuid::new_v4().to_string()),
+            json!({"user_account": usd, "amount_minor": 100, "currency": "TJS"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM admin_actions WHERE action = 'deposit' AND target = $1",
+    )
+    .bind(&usd)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audited, 1);
 }
