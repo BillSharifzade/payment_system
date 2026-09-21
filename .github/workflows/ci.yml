@@ -126,6 +126,9 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
+          # The action's container ships its own rustup; rust-toolchain.toml
+          # pins 1.98, so the matching toolchain must be installed there too.
+          rust-version: "1.98"
 
   console:
     name: Admin console — lint, test, build, audit
