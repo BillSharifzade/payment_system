@@ -31,3 +31,6 @@ deploy/backups/
 .vscode/
 *.iml
 .DS_Store
+
+# Claude Code local settings
+.claude/
