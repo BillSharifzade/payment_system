@@ -318,7 +318,7 @@ Notes:
 - **External clients (app, web):** REST/JSON over HTTPS. Versioned (`/v1/...`). Simple, debuggable, universally supported.
 - **Internal service-to-service & partner banks:** **gRPC** (typed, fast, streaming) with **mTLS**.
 - **Webhooks to partners:** signed (Ed25519) payloads, with retries and idempotency.
-- Core endpoints (v1): auth (register/login/refresh/logout), accounts (list/balance), transfers (create/get/list — all idempotent), deposits/withdrawals (via partner integration), admin (freeze account, view ledger, reconciliation reports).
+- Core endpoints (v1): auth (register/login/refresh/logout), accounts (list/balance), transfers (create/get/list — all idempotent), deposits/withdrawals (via partner integration), admin (freeze account, view ledger, reconciliation reports), biometric enrolment + merchant checks paid by fingerprint (§20).
 - **Every write endpoint:** requires `Idempotency-Key`, validates input strictly (reject unknown fields), and returns a stable, documented error taxonomy.
 
 ---
@@ -555,6 +555,7 @@ payment-backend/
 > - ✅ Console (React) — pending deposit key in `localStorage` with balance re-check, confirm steps on KYC approve / FX rate, error boundary, abortable requests, keyset-paged KYC queue, counts from metrics, atomic reverse FX rates, request ids in errors, sandboxed PDF viewer, ESLint + Vitest (13 tests), CSP without `unsafe-inline` styles.
 > - ✅ Mobile (Kotlin/Compose) — unreadable-2xx and retried 401/403 are *unsettled* not rejected; tri-state refresh (transient failures never wipe the session); statement lookup before discard; FX key reuse; Keystore corruption recovery; global signed-out signal; direct refresh on cold start; stores warmed off-main; one shared OkHttp client with call timeouts and no redirects; lifecycle-aware polling; wallet/config cache; release signing config; `:app` MockWebServer tests. See FRONTEND.md §7.4.
 > - ✅ Ops — cargo-chef Dockerfile (rust 1.98 → distroless), console image, SHA image tags with rollback, compose hardening (no-new-privileges, cap_drop, read-only rootfs, log rotation, memory limits, healthchecks via the binaries' subcommands, healthy-ordered startup, 30 s stop grace), Postgres tuning, backup sidecars + restore drill, Loki retention + rules, Prometheus/Alertmanager rules, Caddy access log / cache headers / stricter CSP / `/ready` health checks; CI with Postgres + Redis + NATS services, per-crate integration lane, console/mobile/docker jobs. **CI still needs a git remote to run.**
+> - ✅ **Biometric payments (2026-09-22, §20)** — `biometric` crate (template validation, AES-256-GCM sealing, decision policy, HTTP matcher adapter; 17 tests), migration 0022 (`fingerprint_enrollments`, `checks`, `biometric_events`), endpoints for enrolment and merchant checks, `POST /v1/checks/{id}/pay/fingerprint` posting through `post_on` with the check state transition inside the lock. 5 HTTP integration tests incl. an 8-way race on one check (exactly one posts). Matching engine + terminal app still to come.
 > - ⏭️ Next: push a remote; redeploy srv-dchr01 with the new image; money in/out rails (Phase 4); SMS OTP; public anchoring option (§6.4); TigerBeetle only when Postgres commit throughput (~3k/s per box today) is the bottleneck.
 
 **Phase 0 — Foundations:**
@@ -613,6 +614,124 @@ Status legend: ✅ decided · ⬜ still open.
 | 10 | (not addressed) | **Compliance/KYC/AML/licensing** as first-class | Legally required; cheap to design in, expensive to retrofit. |
 | 11 | (not addressed) | **Deterministic simulation testing** + continuous reconciliation | How correctness is actually proven and monitored. |
 | 12 | "blockchain as option" | **Optional public anchoring** of checkpoint roots | Keeps the genuinely useful 5% of blockchain, drops the costly 95%. |
+
+---
+
+## 20. Biometric (fingerprint) payments — added 2026-09-22
+
+### 20.1 What it is, and the reality check
+
+The product ask: a merchant enters an amount (a **check**, e.g. 200 TJS), the customer
+puts a finger on the merchant's scanner, we work out **who** that is, confirm they
+have the money, and post the payment — no phone, no card.
+
+Two facts shape the design and must not be papered over:
+
+1. **This is 1:N identification, and a phone cannot do it.** Android `BiometricPrompt`
+   / iOS Touch ID only answer "is this the device owner?" and never release the
+   fingerprint. The capture side is therefore a **dedicated scanner** on the merchant
+   terminal (SecuGen / Futronic / Suprema / Mantra class) whose vendor SDK extracts a
+   minutiae **template** (ISO/IEC 19794-2 or ANSI 378). The customer app plays no part
+   in the payment.
+2. **Matching is a specialised engine, not something we write.** There is no mature
+   Rust AFIS. Matching sits behind an interface: today the **`exact`** matcher (byte-
+   identical template lookup by hash — enough to build, test and demo the whole flow),
+   tomorrow the **`http`** adapter talking to a matching sidecar (open-source
+   SourceAFIS, or a commercial SDK such as Innovatrics / Neurotechnology) over the
+   contract in §20.5. Switching is configuration, not code.
+
+Compliance: a fingerprint template is special-category personal data. Enrolment
+requires explicit consent (recorded), templates are **encrypted at rest**
+(AES-256-GCM, key outside the database), never returned by any API, revocable by the
+user, never deleted (audit / legal hold — `revoked_at`), and every identification
+attempt is logged with a hash of the probe, never the probe. A fingerprint alone has
+no liveness check, so biometric payments carry their own cap (`BIOMETRIC_MAX_MINOR`,
+default 2 000 TJS) on top of the KYC-tiered AML limits.
+
+### 20.2 Flow
+
+```
+customer (once)      POST /v1/biometric/fingerprints  {finger, format, template, consent:true}
+                     → template validated, sealed, stored; pushed to the matcher (http mode)
+
+merchant terminal    POST /v1/checks   Idempotency-Key = check id   {account, amount_minor, description?}
+                     → check {id, status:"open", expires_at}    (TTL 300 s default, 30 s … 1 h)
+
+customer's finger    POST /v1/checks/{id}/pay/fingerprint   Idempotency-Key   {format, template}
+                     1. check belongs to caller, is open, not expired, amount ≤ biometric cap
+                     2. identify: matcher → candidates → decision policy (§20.4)
+                     3. payer ≠ merchant; payer's best wallet in the check currency; balance ≥ amount
+                     4. payer active, KYC ≥ 1, neither party blocklisted, per-tx AML limit
+                     5. post_on: debit payer / credit merchant (− fee) / credit fee shard, with the
+                        guard inside the lock: UPDATE checks … WHERE status='open' AND expires_at>now()
+                        (0 rows ⇒ rejected — single use under concurrency), biometric_events 'paid',
+                        AML rolling-window check
+                     → 201 {transaction_id, status:"posted", check_id, amount_minor, currency, payer_name}
+```
+
+Every refusal (no match, ambiguous, insufficient funds, frozen, blocked, over cap,
+matcher down) leaves the check **open** so the cashier can retry with another finger or
+after a top-up; only `paid`, `cancelled` and `expired` are terminal. Expiry is lazy: an
+open check past `expires_at` reads as `expired` and is flipped on first touch.
+
+### 20.3 Data model (migration 0022)
+
+- `fingerprint_enrollments(id, user_id, finger 1..10, format, template BYTEA (sealed),
+  template_hash BYTEA, quality, consent_at, created_at, revoked_at)` — one live row per
+  (user, finger) and per template hash (partial unique indexes); re-enrolling a finger
+  revokes the previous row. Sealing: `nonce ‖ AES-256-GCM(template, AAD = enrollment id)`
+  so a ciphertext cannot be re-homed to another row.
+- `checks(id = Idempotency-Key, merchant_user_id, merchant_account, amount_minor, currency,
+  description, status open|paid|cancelled|expired, payer_user_id, payer_account,
+  transaction_id → transactions, method, created_at, expires_at, paid_at, cancelled_at)`.
+- `biometric_events(id, check_id, terminal_user_id, matched_user_id, outcome, score,
+  probe_hash, detail, created_at)` — outcomes `paid | no_match | ambiguous | rejected |
+  matcher_error`.
+
+### 20.4 Decision policy
+
+The matcher returns `(enrollment_id, score)` hits; the API maps them to users and
+`biometric::decide` takes the best score per **person** (several fingers of one person
+never compete). Match iff best ≥ `BIOMETRIC_MATCH_THRESHOLD` (default 40, SourceAFIS's
+FMR ≈ 0.01 % operating point) and no second person is both above the threshold and
+within `BIOMETRIC_MATCH_MARGIN` (default 10) of the best — otherwise `409
+ambiguous_match` and the cashier asks for another finger. The exact matcher scores 100.
+
+### 20.5 Matcher sidecar contract (`BIOMETRIC_MATCHER=http`)
+
+| Call | Body | Reply |
+|---|---|---|
+| `PUT /v1/templates/{enrollment_id}` | `{subject, format, template(base64)}` | 2xx |
+| `DELETE /v1/templates/{enrollment_id}` | — | 2xx or 404 |
+| `POST /v1/identify` | `{format, template(base64), limit}` | `{hits:[{enrollment_id, score}]}` |
+| `GET /health` | — | 2xx |
+
+The sidecar owns the in-memory gallery; the database stays the source of truth (hits
+for revoked/unknown ids are ignored, so a stale gallery can only *miss*, never pay the
+wrong person). Enrolment pushes before commit; a 5xx / timeout is `503 retry_later`.
+
+### 20.6 Configuration
+
+`BIOMETRIC_TEMPLATE_KEY` (64 hex chars, or `_FILE`; required outside dev),
+`BIOMETRIC_MATCHER` = `exact` | `http`, `BIOMETRIC_MATCHER_URL`,
+`BIOMETRIC_MATCHER_TIMEOUT_MS` (2000), `BIOMETRIC_MATCH_THRESHOLD` (40),
+`BIOMETRIC_MATCH_MARGIN` (10), `BIOMETRIC_MAX_MINOR` (200000), `CHECK_TTL_SECS` (300),
+`CHECK_MAX_TTL_SECS` (3600). `GET /v1/config` exposes `biometric_max_minor` and
+`check_ttl_secs` to terminals.
+
+### 20.7 What is deliberately not built yet
+
+- **Terminal app + scanner SDK** — blocked on choosing hardware; the API is
+  scanner-agnostic (template in, ISO/ANSI/raw).
+- **Matcher sidecar** — SourceAFIS (Java) behind §20.5 is the default plan; run it next
+  to the API, one instance per site is enough for tens of thousands of templates.
+- **Terminal identity** — terminals authenticate as the merchant user today; a
+  `terminals` table with per-device API keys and a merchant role comes with the first
+  real merchant.
+- **Console** — enrolment / check / event views for support and disputes.
+- Key rotation for `BIOMETRIC_TEMPLATE_KEY` (re-seal in place; the AAD makes rows
+  self-describing), liveness / anti-spoof (scanner-dependent), a second factor above a
+  configurable amount.
 
 ---
 

@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use api::config::{env_flag, env_or, env_or_file};
 use api::{
-    build_router, warm_password_hasher, AmlConfig, AppState, AuthConfig, FeeConfig, RateLimitState,
+    build_router, warm_password_hasher, AmlConfig, AppState, AuthConfig, BiometricConfig,
+    FeeConfig, RateLimitState,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use storage::PostgresLedger;
@@ -63,6 +64,12 @@ async fn main() -> Result<(), BoxError> {
 
     let fees = FeeConfig::from_env()?;
     let aml = AmlConfig::from_env()?;
+    let biometric = BiometricConfig::from_env(is_prod)?;
+    tracing::info!(
+        matcher = biometric.matcher.name(),
+        max_minor = biometric.max_minor,
+        "biometric payments configured"
+    );
     let request_timeout = Duration::from_secs(env_or("REQUEST_TIMEOUT_SECS", 10u64)?);
     api::middleware::configure_request_timeout(request_timeout);
 
@@ -171,6 +178,7 @@ async fn main() -> Result<(), BoxError> {
         document_dir,
         kyc_upload_daily_max,
         fees,
+        biometric,
         trust_proxy,
     });
 

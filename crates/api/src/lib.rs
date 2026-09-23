@@ -1,4 +1,5 @@
 mod admin;
+pub mod biometric;
 mod common;
 pub mod config;
 mod error;
@@ -9,6 +10,7 @@ mod ratelimit;
 mod reads;
 mod session;
 
+pub use biometric::{BiometricConfig, MatcherBackend};
 pub use error::{ApiError, ApiResult};
 pub use ratelimit::RateLimitState;
 pub use session::{warm_password_hasher, AdminUser, AuthUser};
@@ -147,6 +149,7 @@ pub struct AppState {
     pub resolve_limit: RateLimitState,
     pub aml: AmlConfig,
     pub fees: FeeConfig,
+    pub biometric: BiometricConfig,
     pub trust_proxy: bool,
     pub document_dir: std::path::PathBuf,
     pub kyc_upload_daily_max: i64,
@@ -207,6 +210,24 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/deposits", post(payments::create_deposit))
         .route("/v1/transfers", post(payments::create_transfer))
         .route("/v1/fx", post(payments::create_fx))
+        .route(
+            "/v1/biometric/fingerprints",
+            post(biometric::enroll_fingerprint).get(biometric::list_fingerprints),
+        )
+        .route(
+            "/v1/biometric/fingerprints/{id}",
+            axum::routing::delete(biometric::revoke_fingerprint),
+        )
+        .route(
+            "/v1/checks",
+            post(biometric::create_check).get(biometric::list_checks),
+        )
+        .route("/v1/checks/{id}", get(biometric::get_check))
+        .route("/v1/checks/{id}/cancel", post(biometric::cancel_check))
+        .route(
+            "/v1/checks/{id}/pay/fingerprint",
+            post(biometric::pay_check_fingerprint),
+        )
         .with_state(state.clone());
 
     router

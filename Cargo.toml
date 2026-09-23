@@ -8,6 +8,7 @@ members = [
     "crates/crypto",
     "crates/workers",
     "crates/api",
+    "crates/biometric",
 ]
 
 # Fatter release optimization: thin LTO + a single codegen unit typically buys
@@ -45,3 +46,7 @@ ledger = { path = "crates/ledger" }
 storage = { path = "crates/storage" }
 auth = { path = "crates/auth" }
 crypto = { path = "crates/crypto" }
+biometric = { path = "crates/biometric" }
+aes-gcm = "0.10"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

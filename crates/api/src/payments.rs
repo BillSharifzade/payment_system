@@ -33,7 +33,7 @@ pub fn settlement_shard(currency: &str) -> Option<Uuid> {
     }
 }
 
-fn fee_shard(currency: &str) -> Option<Uuid> {
+pub(crate) fn fee_shard(currency: &str) -> Option<Uuid> {
     match currency {
         "TJS" => Some(shard(0x2000)),
         _ => None,
@@ -74,8 +74,8 @@ pub struct FxRequest {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PostResponse {
-    transaction_id: Uuid,
-    status: String,
+    pub(crate) transaction_id: Uuid,
+    pub(crate) status: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -87,22 +87,22 @@ pub struct FxResponse {
     to_currency: String,
 }
 
-struct AccountRow {
-    account_type: AccountType,
-    owner: Option<Uuid>,
-    currency: Currency,
+pub(crate) struct AccountRow {
+    pub(crate) account_type: AccountType,
+    pub(crate) owner: Option<Uuid>,
+    pub(crate) currency: Currency,
 }
 
-struct MoneyContext {
-    kyc_level: i16,
-    status: String,
-    sender_blocked: bool,
-    from: Option<AccountRow>,
-    to: Option<AccountRow>,
-    recipient_blocked: bool,
-    pair_rate: Option<(i64, i64)>,
-    tjs_rate: Option<(i64, i64)>,
-    stored: Option<(String, i32, serde_json::Value)>,
+pub(crate) struct MoneyContext {
+    pub(crate) kyc_level: i16,
+    pub(crate) status: String,
+    pub(crate) sender_blocked: bool,
+    pub(crate) from: Option<AccountRow>,
+    pub(crate) to: Option<AccountRow>,
+    pub(crate) recipient_blocked: bool,
+    pub(crate) pair_rate: Option<(i64, i64)>,
+    pub(crate) tjs_rate: Option<(i64, i64)>,
+    pub(crate) stored: Option<(String, i32, serde_json::Value)>,
 }
 
 fn account_row(row: &sqlx::postgres::PgRow, prefix: &str) -> ApiResult<Option<AccountRow>> {
@@ -132,7 +132,7 @@ fn account_row(row: &sqlx::postgres::PgRow, prefix: &str) -> ApiResult<Option<Ac
     }))
 }
 
-async fn money_context(
+pub(crate) async fn money_context(
     conn: &mut PgConnection,
     user_id: Uuid,
     from: Uuid,
@@ -206,7 +206,7 @@ async fn money_context(
 }
 
 impl MoneyContext {
-    fn replay<T: serde::de::DeserializeOwned>(
+    pub(crate) fn replay<T: serde::de::DeserializeOwned>(
         &self,
         fingerprint: &str,
     ) -> ApiResult<Option<(StatusCode, Json<T>)>> {
@@ -223,14 +223,14 @@ impl MoneyContext {
         Ok(Some((status, Json(resp))))
     }
 
-    fn require_active(&self) -> ApiResult<()> {
+    pub(crate) fn require_active(&self) -> ApiResult<()> {
         if self.status != "active" {
             return Err(ApiError::Forbidden(format!("account is {}", self.status)));
         }
         Ok(())
     }
 
-    fn require_kyc(&self, min_level: i16) -> ApiResult<()> {
+    pub(crate) fn require_kyc(&self, min_level: i16) -> ApiResult<()> {
         if self.kyc_level < min_level {
             return Err(ApiError::KycRequired(format!(
                 "this action requires KYC level {min_level}"
@@ -240,7 +240,7 @@ impl MoneyContext {
     }
 }
 
-fn owned(account: &Option<AccountRow>, user_id: Uuid) -> ApiResult<&AccountRow> {
+pub(crate) fn owned(account: &Option<AccountRow>, user_id: Uuid) -> ApiResult<&AccountRow> {
     let acct = account
         .as_ref()
         .ok_or_else(|| ApiError::NotFound("account not found".to_string()))?;
@@ -253,12 +253,12 @@ fn owned(account: &Option<AccountRow>, user_id: Uuid) -> ApiResult<&AccountRow> 
 }
 
 #[derive(Clone)]
-struct ScreenCtx {
-    user_id: Uuid,
-    from_account: Uuid,
-    to_account: Uuid,
-    amount_minor: i64,
-    currency: String,
+pub(crate) struct ScreenCtx {
+    pub(crate) user_id: Uuid,
+    pub(crate) from_account: Uuid,
+    pub(crate) to_account: Uuid,
+    pub(crate) amount_minor: i64,
+    pub(crate) currency: String,
 }
 
 async fn log_screening(
@@ -292,7 +292,7 @@ fn to_tjs(minor: i64, (num, den): (i64, i64)) -> i64 {
     i64::try_from((minor as i128 * num as i128) / den as i128).unwrap_or(i64::MAX)
 }
 
-async fn pre_screen(
+pub(crate) async fn pre_screen(
     conn: &mut PgConnection,
     state: &AppState,
     ctx: &MoneyContext,
@@ -342,7 +342,7 @@ async fn pre_screen(
     Ok((tjs, limits))
 }
 
-fn aml_guard(s: ScreenCtx, tjs: (i64, i64), limits: Limits) -> PostHook {
+pub(crate) fn aml_guard(s: ScreenCtx, tjs: (i64, i64), limits: Limits) -> PostHook {
     Box::new(move |conn: &mut PgConnection| {
         Box::pin(async move {
             let row = sqlx::query(
@@ -412,7 +412,11 @@ fn admin_audit_guard(
     })
 }
 
-fn record<T: Serialize>(key: Uuid, fingerprint: &str, created: &T) -> ApiResult<IdempotencyRecord> {
+pub(crate) fn record<T: Serialize>(
+    key: Uuid,
+    fingerprint: &str,
+    created: &T,
+) -> ApiResult<IdempotencyRecord> {
     Ok(IdempotencyRecord {
         key,
         fingerprint: fingerprint.to_string(),
@@ -450,7 +454,7 @@ pub(crate) async fn load_idempotent<T: serde::de::DeserializeOwned>(
     Ok(Some((status, Json(resp))))
 }
 
-async fn finish<T>(
+pub(crate) async fn finish<T>(
     conn: &mut PgConnection,
     result: storage::Result<()>,
     key: Uuid,

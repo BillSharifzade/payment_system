@@ -152,6 +152,8 @@ pub async fn list_wallets(
 #[derive(Serialize)]
 pub struct ClientConfigResponse {
     transfer_fee_bps: u32,
+    biometric_max_minor: i64,
+    check_ttl_secs: i64,
 }
 
 pub async fn client_config(
@@ -160,6 +162,8 @@ pub async fn client_config(
 ) -> ApiResult<Json<ClientConfigResponse>> {
     Ok(Json(ClientConfigResponse {
         transfer_fee_bps: state.fees.transfer_bps,
+        biometric_max_minor: state.biometric.max_minor,
+        check_ttl_secs: state.biometric.check_ttl_secs,
     }))
 }
 

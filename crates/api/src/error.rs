@@ -36,6 +36,15 @@ pub enum ApiError {
     #[error("{0}")]
     LimitExceeded(String),
 
+    #[error("{0}")]
+    InsufficientFunds(String),
+
+    #[error("no enrolled fingerprint matches")]
+    NoMatch,
+
+    #[error("fingerprint matches more than one person; use another finger or method")]
+    AmbiguousMatch,
+
     #[error("rate limit exceeded")]
     TooManyRequests,
 
@@ -65,6 +74,11 @@ impl ApiError {
             ApiError::KycRequired(_) => (StatusCode::FORBIDDEN, "kyc_required"),
             ApiError::Blocked(_) => (StatusCode::FORBIDDEN, "account_blocked"),
             ApiError::LimitExceeded(_) => (StatusCode::UNPROCESSABLE_ENTITY, "limit_exceeded"),
+            ApiError::InsufficientFunds(_) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "insufficient_funds")
+            }
+            ApiError::NoMatch => (StatusCode::NOT_FOUND, "no_match"),
+            ApiError::AmbiguousMatch => (StatusCode::CONFLICT, "ambiguous_match"),
             ApiError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
             ApiError::RetryLater => (StatusCode::SERVICE_UNAVAILABLE, "retry_later"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),

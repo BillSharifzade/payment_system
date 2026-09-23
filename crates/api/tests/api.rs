@@ -1,4 +1,7 @@
-use api::{build_router, AmlConfig, AppState, AuthConfig, FeeConfig, Limits, RateLimitState};
+use api::{
+    build_router, AmlConfig, AppState, AuthConfig, BiometricConfig, FeeConfig, Limits,
+    RateLimitState,
+};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
@@ -83,6 +86,7 @@ fn router_custom(
         resolve_limit: RateLimitState::new(10_000, std::time::Duration::from_secs(60)),
         aml,
         fees,
+        biometric: BiometricConfig::dev(),
         trust_proxy: true,
         document_dir: std::env::temp_dir().join("payment-kyc-docs-test"),
         kyc_upload_daily_max,
@@ -2403,4 +2407,733 @@ async fn usd_deposit_uses_usd_settlement() {
     .await
     .unwrap();
     assert_eq!(audited, 1);
+}
+
+fn template_bytes(tag: Uuid) -> Vec<u8> {
+    tag.as_bytes()
+        .iter()
+        .cycle()
+        .take(64)
+        .enumerate()
+        .map(|(i, b)| b.wrapping_add(i as u8))
+        .collect()
+}
+
+fn template_b64(tag: Uuid) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(template_bytes(tag))
+}
+
+async fn enroll(app: &axum::Router, token: &str, finger: i16, seed: Uuid) -> (StatusCode, Value) {
+    send(
+        app,
+        req(
+            "POST",
+            "/v1/biometric/fingerprints",
+            Some(token),
+            None,
+            json!({"finger": finger, "format": "raw", "template": template_b64(seed), "consent": true}),
+        ),
+    )
+    .await
+}
+
+async fn create_check(
+    app: &axum::Router,
+    token: &str,
+    account: &str,
+    amount_minor: i64,
+    key: &str,
+    extra: Value,
+) -> (StatusCode, Value) {
+    let mut body = json!({"account": account, "amount_minor": amount_minor});
+    if let Value::Object(m) = extra {
+        for (k, v) in m {
+            body[k] = v;
+        }
+    }
+    send(app, req("POST", "/v1/checks", Some(token), Some(key), body)).await
+}
+
+async fn pay_check(
+    app: &axum::Router,
+    token: &str,
+    check_id: &str,
+    seed: Uuid,
+    key: &str,
+) -> (StatusCode, Value) {
+    send(
+        app,
+        req(
+            "POST",
+            &format!("/v1/checks/{check_id}/pay/fingerprint"),
+            Some(token),
+            Some(key),
+            json!({"format": "raw", "template": template_b64(seed)}),
+        ),
+    )
+    .await
+}
+
+async fn balance_of(app: &axum::Router, token: &str, account: &str) -> i64 {
+    let (status, body) = send(
+        app,
+        req(
+            "GET",
+            &format!("/v1/accounts/{account}/balance"),
+            Some(token),
+            None,
+            Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "balance: {body}");
+    body["balance_minor"].as_i64().unwrap()
+}
+
+async fn get_check(app: &axum::Router, token: &str, id: &str) -> (StatusCode, Value) {
+    send(
+        app,
+        req(
+            "GET",
+            &format!("/v1/checks/{id}"),
+            Some(token),
+            None,
+            Value::Null,
+        ),
+    )
+    .await
+}
+
+struct Party {
+    id: String,
+    token: String,
+    wallet: String,
+}
+
+async fn party(app: &axum::Router, pool: &PgPool, name: Option<&str>) -> Party {
+    let (id, token) = register(app).await;
+    match name {
+        Some(n) => approve_named_kyc(pool, &id, n).await,
+        None => verify_kyc(pool, &id).await,
+    }
+    let wallet = create_wallet(app, &token).await;
+    Party { id, token, wallet }
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL (docker compose up -d)"]
+async fn fingerprint_check_payment_flow() {
+    let (app, pool) = app().await;
+    let admin = admin_token(&app, &pool).await;
+    let merchant = party(&app, &pool, Some("Shop Owner")).await;
+    let customer = party(&app, &pool, Some("Firuza Karimova")).await;
+    admin_deposit(&app, &admin, &customer.wallet, 50_000).await;
+    let seed = Uuid::new_v4();
+
+    let (status, body) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/biometric/fingerprints",
+            Some(&customer.token),
+            None,
+            json!({"finger": 2, "format": "raw", "template": template_b64(seed)}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no consent: {body}");
+
+    let (status, body) = enroll(&app, &customer.token, 2, seed).await;
+    assert_eq!(status, StatusCode::CREATED, "enroll: {body}");
+    assert_eq!(body["finger"], 2);
+    let (status, body) = enroll(&app, &customer.token, 2, seed).await;
+    assert_eq!(status, StatusCode::OK, "re-enroll same template: {body}");
+    let (status, body) = send(
+        &app,
+        req(
+            "GET",
+            "/v1/biometric/fingerprints",
+            Some(&customer.token),
+            None,
+            Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 1, "{body}");
+
+    let check_key = Uuid::new_v4().to_string();
+    let (status, check) = create_check(
+        &app,
+        &merchant.token,
+        &merchant.wallet,
+        20_000,
+        &check_key,
+        json!({"description": "  2 kg apples "}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create check: {check}");
+    assert_eq!(check["id"], check_key);
+    assert_eq!(check["status"], "open");
+    assert_eq!(check["description"], "2 kg apples");
+    assert!(check["expires_at_ms"].as_i64().unwrap() > check["created_at_ms"].as_i64().unwrap());
+
+    let (status, again) = create_check(
+        &app,
+        &merchant.token,
+        &merchant.wallet,
+        20_000,
+        &check_key,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "replayed create: {again}");
+    assert_eq!(again["id"], check_key);
+    let (status, _) = create_check(
+        &app,
+        &merchant.token,
+        &merchant.wallet,
+        30_000,
+        &check_key,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, body) = pay_check(
+        &app,
+        &merchant.token,
+        &check_key,
+        Uuid::new_v4(),
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown finger: {body}");
+    assert_eq!(body["error"]["code"], "no_match");
+
+    let pay_key = Uuid::new_v4().to_string();
+    let (status, paid) = pay_check(&app, &merchant.token, &check_key, seed, &pay_key).await;
+    assert_eq!(status, StatusCode::CREATED, "pay: {paid}");
+    assert_eq!(paid["status"], "posted");
+    assert_eq!(paid["transaction_id"], pay_key);
+    assert_eq!(paid["check_id"], check_key);
+    assert_eq!(paid["amount_minor"], 20_000);
+    assert_eq!(paid["currency"], "TJS");
+    assert_eq!(paid["payer_name"], "Firuza Karimova");
+
+    assert_eq!(
+        balance_of(&app, &customer.token, &customer.wallet).await,
+        30_000
+    );
+    assert_eq!(
+        balance_of(&app, &merchant.token, &merchant.wallet).await,
+        20_000
+    );
+
+    let (status, replay) = pay_check(&app, &merchant.token, &check_key, seed, &pay_key).await;
+    assert_eq!(status, StatusCode::CREATED, "replay: {replay}");
+    assert_eq!(replay, paid);
+    assert_eq!(
+        balance_of(&app, &customer.token, &customer.wallet).await,
+        30_000
+    );
+
+    let (status, body) = pay_check(
+        &app,
+        &merchant.token,
+        &check_key,
+        seed,
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "second payment: {body}");
+
+    let (status, body) = get_check(&app, &merchant.token, &check_key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "paid");
+    assert_eq!(body["transaction_id"], pay_key);
+    assert_eq!(body["payer_name"], "Firuza Karimova");
+    assert!(body["paid_at_ms"].is_i64());
+    let (status, body) = get_check(&app, &customer.token, &check_key).await;
+    assert_eq!(status, StatusCode::OK, "payer may read: {body}");
+    let (status, _) = get_check(&app, &admin, &check_key).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = send(
+        &app,
+        req(
+            "GET",
+            "/v1/checks?status=paid",
+            Some(&merchant.token),
+            None,
+            Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["id"] == check_key));
+
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM biometric_events WHERE check_id = $1 AND outcome = 'paid'",
+    )
+    .bind(Uuid::parse_str(&check_key).unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 1);
+    let no_match: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM biometric_events WHERE check_id = $1 AND outcome = 'no_match'",
+    )
+    .bind(Uuid::parse_str(&check_key).unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(no_match, 1);
+    let sealed: Vec<u8> = sqlx::query_scalar(
+        "SELECT template FROM fingerprint_enrollments WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(Uuid::parse_str(&customer.id).unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let plain = template_bytes(seed);
+    assert!(!sealed.windows(plain.len()).any(|w| w == plain.as_slice()));
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL (docker compose up -d)"]
+async fn fingerprint_payment_refuses_insufficient_funds_and_keeps_check_open() {
+    let (app, pool) = app().await;
+    let admin = admin_token(&app, &pool).await;
+    let merchant = party(&app, &pool, None).await;
+    let customer = party(&app, &pool, None).await;
+    admin_deposit(&app, &admin, &customer.wallet, 10_000).await;
+    let seed = Uuid::new_v4();
+    let (status, body) = enroll(&app, &customer.token, 1, seed).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let check_key = Uuid::new_v4().to_string();
+    let (status, _) = create_check(
+        &app,
+        &merchant.token,
+        &merchant.wallet,
+        20_000,
+        &check_key,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = pay_check(
+        &app,
+        &merchant.token,
+        &check_key,
+        seed,
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "insufficient_funds");
+    let (_, body) = get_check(&app, &merchant.token, &check_key).await;
+    assert_eq!(body["status"], "open");
+    assert_eq!(
+        balance_of(&app, &customer.token, &customer.wallet).await,
+        10_000
+    );
+
+    admin_deposit(&app, &admin, &customer.wallet, 10_000).await;
+    let (status, body) = pay_check(
+        &app,
+        &merchant.token,
+        &check_key,
+        seed,
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(balance_of(&app, &customer.token, &customer.wallet).await, 0);
+    assert_eq!(
+        balance_of(&app, &merchant.token, &merchant.wallet).await,
+        20_000
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL (docker compose up -d)"]
+async fn fingerprint_enrollment_rules() {
+    let (app, pool) = app().await;
+    let admin = admin_token(&app, &pool).await;
+    let seed = Uuid::new_v4();
+
+    let (_, unverified_tok) = register(&app).await;
+    let (status, body) = enroll(&app, &unverified_tok, 1, seed).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "kyc_required");
+
+    let alice = party(&app, &pool, None).await;
+    let bob = party(&app, &pool, None).await;
+    let (status, first) = enroll(&app, &alice.token, 1, seed).await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let (status, body) = enroll(&app, &bob.token, 1, seed).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "same template, other user: {body}"
+    );
+
+    let (status, body) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/biometric/fingerprints",
+            Some(&alice.token),
+            None,
+            json!({"finger": 11, "format": "raw", "template": template_b64(seed), "consent": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = send(
+        &app,
+        req(
+            "POST",
+            "/v1/biometric/fingerprints",
+            Some(&alice.token),
+            None,
+            json!({"finger": 3, "format": "iso-19794-2", "template": template_b64(seed), "consent": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "iso magic: {body}");
+
+    let (status, second) = enroll(&app, &alice.token, 1, Uuid::new_v4()).await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    assert_ne!(first["id"], second["id"]);
+    let (_, list) = send(
+        &app,
+        req(
+            "GET",
+            "/v1/biometric/fingerprints",
+            Some(&alice.token),
+            None,
+            Value::Null,
+        ),
+    )
+    .await;
+    let list = list.as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], second["id"]);
+
+    let (status, body) = enroll(&app, &bob.token, 1, seed).await;
+    assert_eq!(status, StatusCode::CREATED, "released template: {body}");
+
+    let merchant = party(&app, &pool, None).await;
+    admin_deposit(&app, &admin, &bob.wallet, 5_000).await;
+    let (status, body) = send(
+        &app,
+        req(
+            "DELETE",
+            &format!(
+                "/v1/biometric/fingerprints/{}",
+                body["id"].as_str().unwrap()
+            ),
+            Some(&bob.token),
+            None,
+            Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "revoked");
+    let (status, _) = send(
+        &app,
+        req(
+            "DELETE",
+            &format!("/v1/biometric/fingerprints/{}", Uuid::new_v4()),
+            Some(&bob.token),
+            None,
+            Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let check_key = Uuid::new_v4().to_string();
+    let (status, _) = create_check(
+        &app,
+        &merchant.token,
+        &merchant.wallet,
+        1_000,
+        &check_key,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = pay_check(
+        &app,
+        &merchant.token,
+        &check_key,
+        seed,
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "revoked finger: {body}");
+    assert_eq!(balance_of(&app, &bob.token, &bob.wallet).await, 5_000);
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL (docker compose up -d)"]
+async fn check_lifecycle_cancel_expiry_and_limits() {
+    let (app, pool) = app().await;
+    let admin = admin_token(&app, &pool).await;
+    let merchant = party(&app, &pool, None).await;
+    let customer = party(&app, &pool, None).await;
+    admin_deposit(&app, &admin, &customer.wallet, 1_000_000).await;
+    admin_deposit(&app, &admin, &merchant.wallet, 1_000).await;
+    let seed = Uuid::new_v4();
+    let (status, _) = enroll(&app, &customer.token, 5, seed).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let merchant_seed = Uuid::new_v4();
+    let (status, _) = enroll(&app, &merchant.token, 5, merchant_seed).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = create_check(
+        &app,
+        &merchant.token,
+        &merchant.wallet,
+        1_000,
+        &Uuid::new_v4().to_string(),
+        json!({"expires_in_secs": 5}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = create_check(
+        &app,
+        &merchant.token,
+        &customer.wallet,
+        1_000,
+        &Uuid::new_v4().to_string(),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "foreign wallet: {body}");
+    let (status, body) = create_check(
+        &app,
+        &merchant.token,
+        &merchant.wallet,
+        1_000,
+        &Uuid::new_v4().to_string(),
+        json!({"currency": "USD"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "currency mismatch: {body}");
+
+    let cancel_key = Uuid::new_v4().to_string();
+    let (status, _) = create_check(
+        &app,
+        &merchant.token,
+        &merchant.wallet,
+        1_000,
+        &cancel_key,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = send(
+        &app,
+        req(
+            "POST",
+            &format!("/v1/checks/{cancel_key}/cancel"),
+            Some(&customer.token),
+            None,
+            Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "stranger cancel: {body}");
+    let (status, body) = send(
+        &app,
+        req(
+            "POST",
+            &format!("/v1/checks/{cancel_key}/cancel"),
+            Some(&merchant.token),
+            None,
+            Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "cancelled");
+    let (status, body) = send(
+        &app,
+        req(
+            "POST",
+            &format!("/v1/checks/{cancel_key}/cancel"),
+            Some(&merchant.token),
+            None,
+            Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, body) = pay_check(
+        &app,
+        &merchant.token,
+        &cancel_key,
+        seed,
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "pay cancelled: {body}");
+
+    let expired_key = Uuid::new_v4().to_string();
+    let (status, _) = create_check(
+        &app,
+        &merchant.token,
+        &merchant.wallet,
+        1_000,
+        &expired_key,
+        json!({"expires_in_secs": 30}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    sqlx::query("UPDATE checks SET expires_at = now() - interval '1 second' WHERE id = $1")
+        .bind(Uuid::parse_str(&expired_key).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (_, body) = get_check(&app, &merchant.token, &expired_key).await;
+    assert_eq!(body["status"], "expired");
+    let (status, body) = pay_check(
+        &app,
+        &merchant.token,
+        &expired_key,
+        seed,
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "pay expired: {body}");
+    let (_, body) = send(
+        &app,
+        req(
+            "GET",
+            "/v1/checks?status=expired",
+            Some(&merchant.token),
+            None,
+            Value::Null,
+        ),
+    )
+    .await;
+    assert!(
+        body.as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == expired_key),
+        "{body}"
+    );
+
+    let big_key = Uuid::new_v4().to_string();
+    let (status, _) = create_check(
+        &app,
+        &merchant.token,
+        &merchant.wallet,
+        250_000,
+        &big_key,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = pay_check(
+        &app,
+        &merchant.token,
+        &big_key,
+        seed,
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "over cap: {body}");
+    assert_eq!(body["error"]["code"], "limit_exceeded");
+
+    let own_key = Uuid::new_v4().to_string();
+    let (status, _) = create_check(
+        &app,
+        &merchant.token,
+        &merchant.wallet,
+        500,
+        &own_key,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = pay_check(
+        &app,
+        &merchant.token,
+        &own_key,
+        merchant_seed,
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "self pay: {body}");
+    assert_eq!(
+        balance_of(&app, &customer.token, &customer.wallet).await,
+        1_000_000
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL (docker compose up -d)"]
+async fn concurrent_fingerprint_payments_of_one_check_post_once() {
+    let (app, pool) = app().await;
+    let admin = admin_token(&app, &pool).await;
+    let merchant = party(&app, &pool, None).await;
+    let customer = party(&app, &pool, None).await;
+    admin_deposit(&app, &admin, &customer.wallet, 100_000).await;
+    let seed = Uuid::new_v4();
+    let (status, _) = enroll(&app, &customer.token, 7, seed).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let check_key = Uuid::new_v4().to_string();
+    let (status, _) = create_check(
+        &app,
+        &merchant.token,
+        &merchant.wallet,
+        30_000,
+        &check_key,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let app = app.clone();
+        let tok = merchant.token.clone();
+        let ck = check_key.clone();
+        tasks.push(tokio::spawn(async move {
+            pay_check(&app, &tok, &ck, seed, &Uuid::new_v4().to_string()).await
+        }));
+    }
+    let mut posted = 0;
+    let mut conflicts = 0;
+    for t in tasks {
+        let (status, body) = t.await.unwrap();
+        match status {
+            StatusCode::CREATED => posted += 1,
+            StatusCode::CONFLICT => conflicts += 1,
+            other => panic!("unexpected {other}: {body}"),
+        }
+    }
+    assert_eq!(posted, 1);
+    assert_eq!(conflicts, 7);
+    assert_eq!(
+        balance_of(&app, &customer.token, &customer.wallet).await,
+        70_000
+    );
+    assert_eq!(
+        balance_of(&app, &merchant.token, &merchant.wallet).await,
+        30_000
+    );
 }

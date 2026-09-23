@@ -19,6 +19,8 @@ money = { workspace = true }
 ledger = { workspace = true }
 storage = { workspace = true }
 auth = { workspace = true }
+biometric = { workspace = true }
+base64 = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true }

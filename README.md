@@ -14,6 +14,7 @@ for the clients, and [`deploy/README.md`](./deploy/README.md) to run it in produ
 | `crates/storage` | `PostgresLedger` — durable, row-locked, concurrency-safe posting (five round trips per transfer). |
 | `crates/auth` | Argon2id passwords, JWT access tokens, hashed rotating refresh tokens. *(pure)* |
 | `crates/crypto` | SHA-256 Merkle trees + Ed25519 for tamper-evident checkpoints. *(pure)* |
+| `crates/biometric` | Fingerprint payments: template validation, AES-GCM sealing, match-decision policy, HTTP adapter to a matching engine. *(pure)* |
 | `crates/api` | axum HTTP server → binary `payment-server`. |
 | `crates/workers` | sealer, verifier, reconciliation, outbox → NATS JetStream relay → binary `payment-workers`. |
 | `migrations/` | sqlx migrations, embedded into the binaries and applied on startup. |
@@ -72,6 +73,18 @@ curl -s -XPOST $BASE/v1/transfers -H "$J" -H "Authorization: Bearer $A_TOK" \
 
 curl -s $BASE/v1/accounts/$A_WALLET/balance -H "Authorization: Bearer $A_TOK"   # → 65.00 TJS
 curl -s $BASE/ready                                                              # → {"status":"ready"}
+
+# Fingerprint payment (DESIGN.md §20). Bob enrols a finger once (template from the
+# scanner SDK, base64); Alice — the merchant — opens a 2.00 TJS check and Bob pays
+# it by putting his finger on Alice's scanner. Dev mode matches templates exactly.
+FP=$(head -c 64 /dev/urandom | base64 -w0)
+curl -s -XPOST $BASE/v1/biometric/fingerprints -H "$J" -H "Authorization: Bearer $B_TOK" \
+  -d "{\"finger\":2,\"format\":\"raw\",\"template\":\"$FP\",\"consent\":true}"
+CHECK=$(uuidgen)
+curl -s -XPOST $BASE/v1/checks -H "$J" -H "Authorization: Bearer $A_TOK" -H "Idempotency-Key: $CHECK" \
+  -d "{\"account\":\"$A_WALLET\",\"amount_minor\":200,\"description\":\"bread\"}"
+curl -s -XPOST $BASE/v1/checks/$CHECK/pay/fingerprint -H "$J" -H "Authorization: Bearer $A_TOK" \
+  -H "Idempotency-Key: $(uuidgen)" -d "{\"format\":\"raw\",\"template\":\"$FP\"}"   # → posted
 ```
 
 Amounts are always **integer minor units** (diram for TJS): `10000` = 100.00 TJS.
