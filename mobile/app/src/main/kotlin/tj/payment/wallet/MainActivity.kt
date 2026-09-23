@@ -3,7 +3,6 @@ package tj.payment.wallet
 import android.os.Build
 import android.os.Bundle
 import android.view.Display
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.fillMaxSize
@@ -11,10 +10,13 @@ import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
+import androidx.fragment.app.FragmentActivity
 import tj.payment.wallet.ui.AppRoot
 import tj.payment.wallet.ui.theme.PaymentTheme
 
-class MainActivity : ComponentActivity() {
+// FragmentActivity (a ComponentActivity) so androidx.biometric can host its
+// prompt; nothing else in the app uses fragments.
+class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()

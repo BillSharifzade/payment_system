@@ -224,6 +224,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/checks/{id}", get(biometric::get_check))
         .route("/v1/checks/{id}/cancel", post(biometric::cancel_check))
+        .route("/v1/checks/{id}/pay", post(biometric::pay_check))
         .route(
             "/v1/checks/{id}/pay/fingerprint",
             post(biometric::pay_check_fingerprint),

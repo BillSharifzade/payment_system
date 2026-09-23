@@ -1,9 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- staging flavor only: permit cleartext HTTP to the deployed LAN server
-     (srv-dchr01, 192.168.1.156). Everything else stays cleartext-denied. -->
+<!-- staging flavor only: a LAN test build. The backend is plain HTTP on a bare
+     LAN IP (srv-dchr01, or a developer box via -PAPI_BASE_URL), and a bare IP
+     cannot carry a public TLS certificate, so cleartext is permitted for this
+     flavor as a whole. prod keeps cleartext denied and pins its certificate. -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false" />
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">192.168.1.156</domain>
-    </domain-config>
+    <base-config cleartextTrafficPermitted="true" />
 </network-security-config>

@@ -23,6 +23,12 @@ data class PendingPayment(
     /** What the user saw on the confirm screen (phone or verified name) — shown
      * again if the app restarts with this payment unresolved. */
     @SerialName("recipient_label") val recipientLabel: String,
+    /**
+     * Set when this payment settles a merchant check (pay-by-QR): the transfer
+     * then goes through POST /v1/checks/{checkId}/pay instead of /v1/transfers.
+     * Same key rules — the server uses the key as the transaction id either way.
+     */
+    @SerialName("check_id") val checkId: String? = null,
 )
 
 /** Durable storage for at most one in-flight payment. */
@@ -112,6 +118,7 @@ class PaymentSubmitter(
         amountMinor: Long,
         currency: String,
         recipientLabel: String,
+        checkId: String? = null,
     ): SubmitResult? {
         if (load() != null) return null
         val payment = PendingPayment(
@@ -121,6 +128,7 @@ class PaymentSubmitter(
             amountMinor = amountMinor,
             currency = currency,
             recipientLabel = recipientLabel,
+            checkId = checkId,
         )
         // Durable BEFORE the first attempt — and if it isn't, the attempt never
         // happens: a key that exists only in memory can be lost mid-flight.

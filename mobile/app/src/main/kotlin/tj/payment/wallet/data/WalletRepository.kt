@@ -6,6 +6,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import tj.payment.core.AccountResponse
 import tj.payment.core.ApiOutcome
+import tj.payment.core.CheckDto
+import tj.payment.core.CreateCheckRequest
+import tj.payment.core.PayCheckRequest
 import tj.payment.core.ClientConfigResponse
 import tj.payment.core.DocumentResponse
 import tj.payment.core.FxRateDto
@@ -39,10 +42,17 @@ class WalletRepository(
         store = pendingStore,
         newKey = { UUID.randomUUID().toString() },
         transfer = { p ->
-            api.transfer(
-                TransferRequest(p.fromAccount, p.toAccount, p.amountMinor, p.currency),
-                idempotencyKey = p.idempotencyKey,
-            ).also { markWalletsStale() } // any outcome but a refusal may have moved money
+            val checkId = p.checkId
+            if (checkId != null) {
+                // A scanned check: the server debits p.fromAccount and credits the
+                // merchant; the key is the transaction id exactly as for a transfer.
+                api.payCheck(checkId, PayCheckRequest(account = p.fromAccount), idempotencyKey = p.idempotencyKey)
+            } else {
+                api.transfer(
+                    TransferRequest(p.fromAccount, p.toAccount, p.amountMinor, p.currency),
+                    idempotencyKey = p.idempotencyKey,
+                )
+            }.also { markWalletsStale() } // any outcome but a refusal may have moved money
         },
         findPosted = { p -> findPostedByKey(p.fromAccount, p.idempotencyKey) },
     )
@@ -164,6 +174,25 @@ class WalletRepository(
     ): ApiOutcome<FxResponse> =
         api.fx(FxRequest(fromAccount, toAccount, amountMinor), idempotencyKey = idempotencyKey)
             .also { markWalletsStale() }
+
+    // --- Checks (request money by QR / pay a scanned check) ---
+
+    /**
+     * Open a check on [account]. [idempotencyKey] is owned by the caller and IS
+     * the check id: a retried create returns the same check, never a second one.
+     */
+    suspend fun createCheck(
+        account: String,
+        amountMinor: Long,
+        currency: String,
+        description: String?,
+        idempotencyKey: String,
+    ): ApiOutcome<CheckDto> =
+        api.createCheck(CreateCheckRequest(account, amountMinor, currency, description), idempotencyKey)
+
+    suspend fun check(id: String): ApiOutcome<CheckDto> = api.check(id)
+
+    suspend fun cancelCheck(id: String): ApiOutcome<CheckDto> = api.cancelCheck(id)
 
     private companion object {
         const val WALLETS_FRESH_MS = 60_000L

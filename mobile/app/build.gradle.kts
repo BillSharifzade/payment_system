@@ -89,7 +89,11 @@ android {
             // The deployed backend on srv-dchr01 (LAN), reached from a real phone
             // on the same network. HTTP for now — a bare LAN IP can't get TLS;
             // granted by src/staging/res/xml/network_security_config.xml.
-            buildConfigField("String", "API_BASE_URL", "\"http://192.168.1.156:8099\"")
+            // Override for a phone test against a developer box:
+            //   ./gradlew :app:assembleStagingRelease -PAPI_BASE_URL=http://192.168.5.105:8099
+            val stagingBaseUrl = (project.findProperty("API_BASE_URL") as String?)
+                ?.trim()?.takeIf { it.isNotEmpty() } ?: "http://192.168.1.156:8099"
+            buildConfigField("String", "API_BASE_URL", "\"$stagingBaseUrl\"")
             buildConfigField("boolean", "SECURE_WINDOW", "false")
             signingConfig = signingConfigs.getByName("debug")
         }
@@ -187,6 +191,13 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.androidx.security.crypto)
+    // Pay-by-QR: the device's biometric prompt (fingerprint / face / device
+    // credential) authorises a check payment; ZXing draws the merchant's QR and
+    // scans it (embedded: no Play Services needed on TJ's phones).
+    implementation(libs.androidx.biometric)
+    implementation(libs.androidx.fragment.ktx)
+    implementation(libs.zxing.core)
+    implementation(libs.zxing.android.embedded)
 
     // Installs a shipped Baseline Profile into ART at first launch so the hot
     // paths (Compose runtime, navigation, JSON decode) are AOT-compiled instead

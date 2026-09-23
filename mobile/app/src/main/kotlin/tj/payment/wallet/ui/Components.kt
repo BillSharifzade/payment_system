@@ -320,6 +320,46 @@ fun GlyphSwap() {
     }
 }
 
+/** A QR tile: three finder squares + a dot, reads as "a code to show". */
+@Composable
+fun GlyphQr() {
+    val color = Rust
+    Canvas(Modifier.size(22.dp)) {
+        val s = size.minDimension
+        val stroke = s * 0.1f
+        val box = s * 0.34f
+        fun finder(x: Float, y: Float) {
+            drawRect(color, topLeft = Offset(x, y), size = androidx.compose.ui.geometry.Size(box, box), style = androidx.compose.ui.graphics.drawscope.Stroke(stroke))
+            drawRect(color, topLeft = Offset(x + box * 0.32f, y + box * 0.32f), size = androidx.compose.ui.geometry.Size(box * 0.36f, box * 0.36f))
+        }
+        finder(s * 0.08f, s * 0.08f)
+        finder(s * 0.58f, s * 0.08f)
+        finder(s * 0.08f, s * 0.58f)
+        drawRect(color, topLeft = Offset(s * 0.62f, s * 0.62f), size = androidx.compose.ui.geometry.Size(s * 0.13f, s * 0.13f))
+        drawRect(color, topLeft = Offset(s * 0.79f, s * 0.79f), size = androidx.compose.ui.geometry.Size(s * 0.13f, s * 0.13f))
+    }
+}
+
+/** A viewfinder: four corner brackets around a scan line, reads as "scan". */
+@Composable
+fun GlyphScan() {
+    val color = Rust
+    Canvas(Modifier.size(22.dp)) {
+        val s = size.minDimension
+        val stroke = s * 0.11f
+        val len = s * 0.24f
+        val a = s * 0.1f
+        val b = s * 0.9f
+        for ((x, y) in listOf(a to a, b to a, a to b, b to b)) {
+            val dx = if (x == a) len else -len
+            val dy = if (y == a) len else -len
+            drawLine(color, Offset(x, y), Offset(x + dx, y), stroke, StrokeCap.Round)
+            drawLine(color, Offset(x, y), Offset(x, y + dy), stroke, StrokeCap.Round)
+        }
+        drawLine(color, Offset(s * 0.28f, s * 0.5f), Offset(s * 0.72f, s * 0.5f), stroke, StrokeCap.Round)
+    }
+}
+
 /** Inline error line with a retry action — the standard failure state. */
 @Composable
 fun ErrorRetry(message: String, onRetry: () -> Unit) {

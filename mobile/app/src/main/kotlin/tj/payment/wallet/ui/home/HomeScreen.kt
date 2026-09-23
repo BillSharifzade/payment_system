@@ -43,6 +43,8 @@ import tj.payment.wallet.ui.ActionButton
 import tj.payment.wallet.ui.ErrorRetry
 import tj.payment.wallet.ui.GlyphArrow
 import tj.payment.wallet.ui.GlyphList
+import tj.payment.wallet.ui.GlyphQr
+import tj.payment.wallet.ui.GlyphScan
 import tj.payment.wallet.ui.GlyphSwap
 import tj.payment.wallet.ui.TransactionRow
 import tj.payment.wallet.ui.theme.NegativeRed
@@ -57,6 +59,8 @@ fun HomeScreen(
     onHistory: (walletId: String) -> Unit,
     onConvert: () -> Unit,
     onKyc: () -> Unit,
+    onPayCheck: () -> Unit,
+    onRequest: () -> Unit,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
 
@@ -160,6 +164,14 @@ fun HomeScreen(
                         horizontalArrangement = Arrangement.SpaceEvenly,
                     ) {
                         ActionButton("Send", onClick = onSend) { GlyphArrow(up = true) }
+                        ActionButton("Pay QR", onClick = onPayCheck) { GlyphScan() }
+                        ActionButton("Request", onClick = onRequest) { GlyphQr() }
+                    }
+                    Spacer(Modifier.height(18.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                    ) {
                         ActionButton("Receive", onClick = onReceive) { GlyphArrow(up = false) }
                         ActionButton("History", onClick = {
                             state.primaryWallet?.let { onHistory(it.id) }

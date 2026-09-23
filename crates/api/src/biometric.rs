@@ -7,7 +7,7 @@ use axum::Json;
 use biometric::{
     decide, Candidate, Decision, HttpMatcher, MatchPolicy, MatcherError, Template, TemplateCipher,
 };
-use ledger::{AccountId, AccountType, Entry, LedgerError, Transaction, TransactionId};
+use ledger::{AccountId, AccountType, Entry, Transaction, TransactionId};
 use money::Money;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
@@ -372,6 +372,7 @@ pub struct CheckResponse {
     account: Uuid,
     transaction_id: Option<Uuid>,
     payer_name: Option<String>,
+    merchant_name: Option<String>,
     created_at_ms: i64,
     expires_at_ms: i64,
     paid_at_ms: Option<i64>,
@@ -384,13 +385,18 @@ const CHECK_SELECT: &str =
             (EXTRACT(EPOCH FROM c.created_at) * 1000)::BIGINT AS created_ms,
             (EXTRACT(EPOCH FROM c.expires_at) * 1000)::BIGINT AS expires_ms,
             (EXTRACT(EPOCH FROM c.paid_at) * 1000)::BIGINT AS paid_ms,
-            k.full_name AS payer_name
+            k.full_name AS payer_name, m.full_name AS merchant_name
      FROM checks c
      LEFT JOIN LATERAL (
          SELECT full_name FROM kyc_submissions
          WHERE user_id = c.payer_user_id AND status = 'approved'
          ORDER BY reviewed_at DESC NULLS LAST, created_at DESC LIMIT 1
-     ) k ON TRUE";
+     ) k ON TRUE
+     LEFT JOIN LATERAL (
+         SELECT full_name FROM kyc_submissions
+         WHERE user_id = c.merchant_user_id AND status = 'approved'
+         ORDER BY reviewed_at DESC NULLS LAST, created_at DESC LIMIT 1
+     ) m ON TRUE";
 
 fn check_row(row: &PgRow) -> ApiResult<CheckResponse> {
     let lapsed: bool = db(row.try_get("lapsed"))?;
@@ -408,6 +414,7 @@ fn check_row(row: &PgRow) -> ApiResult<CheckResponse> {
         account: db(row.try_get("merchant_account"))?,
         transaction_id: db(row.try_get("transaction_id"))?,
         payer_name: db(row.try_get("payer_name"))?,
+        merchant_name: db(row.try_get("merchant_name"))?,
         created_at_ms: db(row.try_get("created_ms"))?,
         expires_at_ms: db(row.try_get("expires_ms"))?,
         paid_at_ms: db(row.try_get("paid_ms"))?,
@@ -541,7 +548,9 @@ pub async fn get_check(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<CheckResponse>> {
     let row = db(sqlx::query(&format!(
-        "{CHECK_SELECT} WHERE c.id = $1 AND (c.merchant_user_id = $2 OR c.payer_user_id = $2)"
+        "{CHECK_SELECT} WHERE c.id = $1
+           AND (c.merchant_user_id = $2 OR c.payer_user_id = $2
+                OR (c.status = 'open' AND c.expires_at > now()))"
     ))
     .bind(id)
     .bind(user_id)
@@ -627,6 +636,12 @@ pub struct ProbeRequest {
     template: String,
 }
 
+#[derive(Deserialize, Default)]
+pub struct PayCheckRequest {
+    #[serde(default)]
+    account: Option<Uuid>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PayCheckResponse {
     transaction_id: Uuid,
@@ -635,6 +650,337 @@ pub struct PayCheckResponse {
     amount_minor: i64,
     currency: String,
     payer_name: Option<String>,
+}
+
+struct CheckCtx {
+    id: Uuid,
+    merchant_user_id: Uuid,
+    merchant_account: Uuid,
+    amount_minor: i64,
+    currency: String,
+    status: String,
+    lapsed: bool,
+    stored: Option<(String, i32, serde_json::Value)>,
+}
+
+async fn load_check(
+    conn: &mut PgConnection,
+    check_id: Uuid,
+    key: Uuid,
+) -> ApiResult<Option<CheckCtx>> {
+    let row = db(sqlx::query(
+        "SELECT c.merchant_user_id, c.merchant_account, c.amount_minor, c.currency, c.status,
+                (c.expires_at <= now()) AS lapsed,
+                ik.fingerprint AS ik_fingerprint, ik.response_status AS ik_status,
+                ik.response_body AS ik_body
+         FROM checks c
+         LEFT JOIN idempotency_keys ik ON ik.key = $2
+         WHERE c.id = $1",
+    )
+    .bind(check_id)
+    .bind(key)
+    .fetch_optional(&mut *conn)
+    .await)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let ik_fingerprint: Option<String> = db(row.try_get("ik_fingerprint"))?;
+    let stored = match ik_fingerprint {
+        Some(fp) => Some((
+            fp,
+            db(row.try_get::<i32, _>("ik_status"))?,
+            db(row.try_get::<serde_json::Value, _>("ik_body"))?,
+        )),
+        None => None,
+    };
+    Ok(Some(CheckCtx {
+        id: check_id,
+        merchant_user_id: db(row.try_get("merchant_user_id"))?,
+        merchant_account: db(row.try_get("merchant_account"))?,
+        amount_minor: db(row.try_get("amount_minor"))?,
+        currency: db(row.try_get("currency"))?,
+        status: db(row.try_get("status"))?,
+        lapsed: db(row.try_get("lapsed"))?,
+        stored,
+    }))
+}
+
+impl CheckCtx {
+    fn replay(&self, fingerprint: &str) -> ApiResult<Option<(StatusCode, Json<PayCheckResponse>)>> {
+        let Some((stored_fp, status, body)) = &self.stored else {
+            return Ok(None);
+        };
+        if stored_fp != fingerprint {
+            return Err(ApiError::IdempotencyConflict);
+        }
+        let resp: PayCheckResponse = serde_json::from_value(body.clone())
+            .map_err(|e| StorageError::DataIntegrity(format!("stored idempotent response: {e}")))?;
+        let status = StatusCode::from_u16(*status as u16)
+            .map_err(|e| StorageError::DataIntegrity(format!("stored status: {e}")))?;
+        Ok(Some((status, Json(resp))))
+    }
+
+    async fn require_open(&self, conn: &mut PgConnection) -> ApiResult<()> {
+        if self.status != "open" {
+            return Err(ApiError::Conflict(format!("check is {}", self.status)));
+        }
+        if self.lapsed {
+            db(sqlx::query(
+                "UPDATE checks SET status = 'expired' WHERE id = $1 AND status = 'open'",
+            )
+            .bind(self.id)
+            .execute(&mut *conn)
+            .await)?;
+            return Err(ApiError::Conflict("check has expired".to_string()));
+        }
+        Ok(())
+    }
+}
+
+struct PaidEvent {
+    terminal: Uuid,
+    probe_hash: Vec<u8>,
+    score: f64,
+}
+
+struct Settlement<'a> {
+    key: Uuid,
+    fingerprint: &'a str,
+    check: &'a CheckCtx,
+    payer_id: Uuid,
+    wallet: Option<Uuid>,
+    method: &'static str,
+    event: Option<PaidEvent>,
+}
+
+async fn settle_check(
+    conn: &mut PgConnection,
+    state: &AppState,
+    s: Settlement<'_>,
+) -> ApiResult<(StatusCode, Json<PayCheckResponse>)> {
+    let check = s.check;
+    let (check_id, key, payer_id, merchant_account, amount_minor) = (
+        check.id,
+        s.key,
+        s.payer_id,
+        check.merchant_account,
+        check.amount_minor,
+    );
+    let wallet = db(sqlx::query(
+        "SELECT a.id, b.raw_minor, k.full_name
+         FROM accounts a
+         JOIN balances b ON b.account_id = a.id
+         LEFT JOIN LATERAL (
+             SELECT full_name FROM kyc_submissions
+             WHERE user_id = $1 AND status = 'approved'
+             ORDER BY reviewed_at DESC NULLS LAST, created_at DESC LIMIT 1
+         ) k ON TRUE
+         WHERE a.owner_user_id = $1 AND a.currency = $2 AND a.account_type = 'user_wallet'
+           AND ($3::uuid IS NULL OR a.id = $3::uuid)
+         ORDER BY b.raw_minor DESC, a.created_at ASC
+         LIMIT 1",
+    )
+    .bind(payer_id)
+    .bind(&check.currency)
+    .bind(s.wallet)
+    .fetch_optional(&mut *conn)
+    .await)?;
+    let Some(wallet) = wallet else {
+        return Err(match s.wallet {
+            Some(_) => {
+                ApiError::BadRequest(format!("account is not your {} wallet", check.currency))
+            }
+            None => ApiError::InsufficientFunds(format!("payer has no {} wallet", check.currency)),
+        });
+    };
+    let payer_account: Uuid = db(wallet.try_get("id"))?;
+    let raw_minor: i64 = db(wallet.try_get("raw_minor"))?;
+    let payer_name: Option<String> = db(wallet.try_get("full_name"))?;
+    if raw_minor < amount_minor {
+        return Err(ApiError::InsufficientFunds(
+            "payer has insufficient funds".to_string(),
+        ));
+    }
+
+    let ctx = money_context(&mut *conn, payer_id, payer_account, merchant_account, key).await?;
+    ctx.require_active()?;
+    ctx.require_kyc(KYC_LEVEL_FOR_TRANSFER)?;
+    let from = ctx
+        .from
+        .as_ref()
+        .ok_or_else(|| ApiError::NotFound("account not found".to_string()))?;
+    let to = ctx
+        .to
+        .as_ref()
+        .ok_or_else(|| ApiError::NotFound("merchant account not found".to_string()))?;
+    if to.currency != from.currency {
+        return Err(ApiError::BadRequest(
+            "merchant wallet currency no longer matches the check".to_string(),
+        ));
+    }
+    let currency = from.currency;
+
+    let screen = ScreenCtx {
+        user_id: payer_id,
+        from_account: payer_account,
+        to_account: merchant_account,
+        amount_minor,
+        currency: currency.code().to_string(),
+    };
+    let (tjs, limits) = pre_screen(&mut *conn, state, &ctx, &screen).await?;
+
+    let amount = Money::from_minor(amount_minor as i128, currency);
+    let fee_minor = if currency.code() == "TJS" {
+        state.fees.fee_minor(amount_minor)
+    } else {
+        0
+    };
+    let entries = if fee_minor > 0 {
+        let to_merchant = amount_minor
+            .checked_sub(fee_minor)
+            .filter(|v| *v > 0)
+            .ok_or_else(|| ApiError::BadRequest("amount does not cover the fee".to_string()))?;
+        let fee_account = fee_shard(currency.code())
+            .ok_or_else(|| ApiError::Internal("no fee account for currency".to_string()))?;
+        vec![
+            Entry::debit(AccountId(payer_account), amount),
+            Entry::credit(
+                AccountId(merchant_account),
+                Money::from_minor(to_merchant as i128, currency),
+            ),
+            Entry::credit(
+                AccountId(fee_account),
+                Money::from_minor(fee_minor as i128, currency),
+            ),
+        ]
+    } else {
+        vec![
+            Entry::debit(AccountId(payer_account), amount),
+            Entry::credit(AccountId(merchant_account), amount),
+        ]
+    };
+    let txn = Transaction::new(TransactionId(key), entries);
+
+    let created = PayCheckResponse {
+        transaction_id: key,
+        status: "posted".to_string(),
+        check_id,
+        amount_minor,
+        currency: currency.code().to_string(),
+        payer_name,
+    };
+    let raced = PayCheckResponse {
+        status: "already_posted".to_string(),
+        ..created.clone()
+    };
+
+    let aml = aml_guard(screen.clone(), tjs, limits);
+    let method = s.method;
+    let event = s.event;
+    let guard: PostHook = Box::new(move |conn: &mut PgConnection| {
+        Box::pin(async move {
+            let updated = sqlx::query(
+                "UPDATE checks
+                 SET status = 'paid', payer_user_id = $2, payer_account = $3,
+                     transaction_id = $4, method = $5, paid_at = now()
+                 WHERE id = $1 AND status = 'open' AND expires_at > now()",
+            )
+            .bind(check_id)
+            .bind(payer_id)
+            .bind(payer_account)
+            .bind(key)
+            .bind(method)
+            .execute(&mut *conn)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(HookError::Rejected {
+                    rule: "check_not_open".to_string(),
+                    message: "check is no longer open".to_string(),
+                });
+            }
+            if let Some(ev) = event {
+                sqlx::query(
+                    "INSERT INTO biometric_events
+                       (id, check_id, terminal_user_id, matched_user_id, outcome, score, probe_hash, detail)
+                     VALUES ($1, $2, $3, $4, 'paid', $5, $6, NULL)",
+                )
+                .bind(Uuid::now_v7())
+                .bind(check_id)
+                .bind(ev.terminal)
+                .bind(payer_id)
+                .bind(ev.score)
+                .bind(&ev.probe_hash)
+                .execute(&mut *conn)
+                .await?;
+            }
+            aml(conn).await
+        })
+    });
+    let opts = PostOptions {
+        idempotency: Some(record(key, s.fingerprint, &created)?),
+        guard: Some(guard),
+    };
+    let result = state.ledger.post_on(&mut *conn, &txn, opts).await;
+    if let Err(StorageError::Rejected { rule, .. }) = &result {
+        if rule == "check_not_open" {
+            return Err(ApiError::Conflict("check is no longer open".to_string()));
+        }
+    }
+    let out = finish(
+        &mut *conn,
+        result,
+        key,
+        s.fingerprint,
+        created,
+        raced,
+        Some(&screen),
+    )
+    .await?;
+    metrics::counter!("checks_paid_total", "method" => method).increment(1);
+    tracing::info!(%check_id, %payer_id, method, amount_minor, "check paid");
+    Ok(out)
+}
+
+pub async fn pay_check(
+    AuthUser(payer_id): AuthUser,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(check_id): Path<Uuid>,
+    body: Option<Json<PayCheckRequest>>,
+) -> ApiResult<(StatusCode, Json<PayCheckResponse>)> {
+    let key = idempotency_key(&headers)?;
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let fingerprint = format!(
+        "check_pay_app:{check_id}:{payer_id}:{}",
+        req.account.map(|a| a.to_string()).unwrap_or_default()
+    );
+    let mut conn = db(state.ledger.pool().acquire().await)?;
+    let check = load_check(&mut conn, check_id, key)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("check not found".to_string()))?;
+    if let Some(found) = check.replay(&fingerprint)? {
+        return Ok(found);
+    }
+    check.require_open(&mut conn).await?;
+    if check.merchant_user_id == payer_id {
+        return Err(ApiError::BadRequest(
+            "a check cannot be paid by its own merchant".to_string(),
+        ));
+    }
+    settle_check(
+        &mut conn,
+        &state,
+        Settlement {
+            key,
+            fingerprint: &fingerprint,
+            check: &check,
+            payer_id,
+            wallet: req.account,
+            method: "app",
+            event: None,
+        },
+    )
+    .await
 }
 
 struct Attempt {
@@ -757,57 +1103,15 @@ pub async fn pay_check_fingerprint(
     let fingerprint = format!("check_pay:{check_id}:{merchant_id}");
 
     let mut conn = db(state.ledger.pool().acquire().await)?;
-    let check = db(sqlx::query(
-        "SELECT c.merchant_user_id, c.merchant_account, c.amount_minor, c.currency, c.status,
-                (c.expires_at <= now()) AS lapsed,
-                ik.fingerprint AS ik_fingerprint, ik.response_status AS ik_status,
-                ik.response_body AS ik_body
-         FROM checks c
-         LEFT JOIN idempotency_keys ik ON ik.key = $2
-         WHERE c.id = $1",
-    )
-    .bind(check_id)
-    .bind(key)
-    .fetch_optional(&mut *conn)
-    .await)?;
-    let Some(check) = check else {
-        return Err(ApiError::NotFound("check not found".to_string()));
-    };
-    let merchant: Uuid = db(check.try_get("merchant_user_id"))?;
-    if merchant != merchant_id {
-        return Err(ApiError::NotFound("check not found".to_string()));
+    let check = load_check(&mut conn, check_id, key)
+        .await?
+        .filter(|c| c.merchant_user_id == merchant_id)
+        .ok_or_else(|| ApiError::NotFound("check not found".to_string()))?;
+    if let Some(found) = check.replay(&fingerprint)? {
+        return Ok(found);
     }
-    let stored_fp: Option<String> = db(check.try_get("ik_fingerprint"))?;
-    if let Some(stored_fp) = stored_fp {
-        if stored_fp != fingerprint {
-            return Err(ApiError::IdempotencyConflict);
-        }
-        let status: i32 = db(check.try_get("ik_status"))?;
-        let body: serde_json::Value = db(check.try_get("ik_body"))?;
-        let resp: PayCheckResponse = serde_json::from_value(body)
-            .map_err(|e| StorageError::DataIntegrity(format!("stored idempotent response: {e}")))?;
-        let status = StatusCode::from_u16(status as u16)
-            .map_err(|e| StorageError::DataIntegrity(format!("stored status: {e}")))?;
-        return Ok((status, Json(resp)));
-    }
-    let status: String = db(check.try_get("status"))?;
-    let lapsed: bool = db(check.try_get("lapsed"))?;
-    if status != "open" {
-        return Err(ApiError::Conflict(format!("check is {status}")));
-    }
-    if lapsed {
-        db(
-            sqlx::query("UPDATE checks SET status = 'expired' WHERE id = $1 AND status = 'open'")
-                .bind(check_id)
-                .execute(&mut *conn)
-                .await,
-        )?;
-        return Err(ApiError::Conflict("check has expired".to_string()));
-    }
-    let merchant_account: Uuid = db(check.try_get("merchant_account"))?;
-    let amount_minor: i64 = db(check.try_get("amount_minor"))?;
-    let currency_code: String = db(check.try_get("currency"))?;
-    if amount_minor > state.biometric.max_minor {
+    check.require_open(&mut conn).await?;
+    if check.amount_minor > state.biometric.max_minor {
         let err = ApiError::LimitExceeded(format!(
             "amount exceeds the fingerprint payment limit of {} minor units",
             state.biometric.max_minor
@@ -865,57 +1169,30 @@ pub async fn pay_check_fingerprint(
         .await);
     }
 
-    let wallet = db(sqlx::query(
-        "SELECT a.id, b.raw_minor, k.full_name
-         FROM accounts a
-         JOIN balances b ON b.account_id = a.id
-         LEFT JOIN LATERAL (
-             SELECT full_name FROM kyc_submissions
-             WHERE user_id = $1 AND status = 'approved'
-             ORDER BY reviewed_at DESC NULLS LAST, created_at DESC LIMIT 1
-         ) k ON TRUE
-         WHERE a.owner_user_id = $1 AND a.currency = $2 AND a.account_type = 'user_wallet'
-         ORDER BY b.raw_minor DESC, a.created_at ASC
-         LIMIT 1",
+    let settled = settle_check(
+        &mut conn,
+        &state,
+        Settlement {
+            key,
+            fingerprint: &fingerprint,
+            check: &check,
+            payer_id,
+            wallet: None,
+            method: "fingerprint",
+            event: Some(PaidEvent {
+                terminal: merchant_id,
+                probe_hash: attempt.probe_hash.clone(),
+                score,
+            }),
+        },
     )
-    .bind(payer_id)
-    .bind(&currency_code)
-    .fetch_optional(&mut *conn)
-    .await)?;
-    let Some(wallet) = wallet else {
-        let err = ApiError::InsufficientFunds(format!("payer has no {currency_code} wallet"));
-        return Err(refuse(
-            &mut conn,
-            &attempt,
-            Some(payer_id),
-            "rejected",
-            Some(score),
-            err,
-        )
-        .await);
-    };
-    let payer_account: Uuid = db(wallet.try_get("id"))?;
-    let raw_minor: i64 = db(wallet.try_get("raw_minor"))?;
-    let payer_name: Option<String> = db(wallet.try_get("full_name"))?;
-    if raw_minor < amount_minor {
-        let err = ApiError::InsufficientFunds("payer has insufficient funds".to_string());
-        return Err(refuse(
-            &mut conn,
-            &attempt,
-            Some(payer_id),
-            "rejected",
-            Some(score),
-            err,
-        )
-        .await);
-    }
-
-    let ctx = money_context(&mut conn, payer_id, payer_account, merchant_account, key).await?;
-    if let Err(e) = ctx
-        .require_active()
-        .and_then(|_| ctx.require_kyc(KYC_LEVEL_FOR_TRANSFER))
-    {
-        return Err(refuse(
+    .await;
+    match settled {
+        Ok(out) => {
+            metrics::counter!("biometric_identify_total", "outcome" => "paid").increment(1);
+            Ok(out)
+        }
+        Err(e) => Err(refuse(
             &mut conn,
             &attempt,
             Some(payer_id),
@@ -923,173 +1200,6 @@ pub async fn pay_check_fingerprint(
             Some(score),
             e,
         )
-        .await);
+        .await),
     }
-    let from = ctx
-        .from
-        .as_ref()
-        .ok_or_else(|| ApiError::NotFound("account not found".to_string()))?;
-    let to = ctx
-        .to
-        .as_ref()
-        .ok_or_else(|| ApiError::NotFound("merchant account not found".to_string()))?;
-    if to.currency != from.currency {
-        return Err(ApiError::BadRequest(
-            "merchant wallet currency no longer matches the check".to_string(),
-        ));
-    }
-    let currency = from.currency;
-
-    let screen = ScreenCtx {
-        user_id: payer_id,
-        from_account: payer_account,
-        to_account: merchant_account,
-        amount_minor,
-        currency: currency.code().to_string(),
-    };
-    let (tjs, limits) = match pre_screen(&mut conn, &state, &ctx, &screen).await {
-        Ok(v) => v,
-        Err(e) => {
-            return Err(refuse(
-                &mut conn,
-                &attempt,
-                Some(payer_id),
-                "rejected",
-                Some(score),
-                e,
-            )
-            .await);
-        }
-    };
-
-    let amount = Money::from_minor(amount_minor as i128, currency);
-    let fee_minor = if currency.code() == "TJS" {
-        state.fees.fee_minor(amount_minor)
-    } else {
-        0
-    };
-    let entries = if fee_minor > 0 {
-        let to_merchant = amount_minor
-            .checked_sub(fee_minor)
-            .filter(|v| *v > 0)
-            .ok_or_else(|| ApiError::BadRequest("amount does not cover the fee".to_string()))?;
-        let fee_account = fee_shard(currency.code())
-            .ok_or_else(|| ApiError::Internal("no fee account for currency".to_string()))?;
-        vec![
-            Entry::debit(AccountId(payer_account), amount),
-            Entry::credit(
-                AccountId(merchant_account),
-                Money::from_minor(to_merchant as i128, currency),
-            ),
-            Entry::credit(
-                AccountId(fee_account),
-                Money::from_minor(fee_minor as i128, currency),
-            ),
-        ]
-    } else {
-        vec![
-            Entry::debit(AccountId(payer_account), amount),
-            Entry::credit(AccountId(merchant_account), amount),
-        ]
-    };
-    let txn = Transaction::new(TransactionId(key), entries);
-
-    let created = PayCheckResponse {
-        transaction_id: key,
-        status: "posted".to_string(),
-        check_id,
-        amount_minor,
-        currency: currency.code().to_string(),
-        payer_name: payer_name.clone(),
-    };
-    let raced = PayCheckResponse {
-        status: "already_posted".to_string(),
-        ..created.clone()
-    };
-
-    let aml = aml_guard(screen.clone(), tjs, limits);
-    let probe_hash = attempt.probe_hash.clone();
-    let guard: PostHook = Box::new(move |conn: &mut PgConnection| {
-        Box::pin(async move {
-            let updated = sqlx::query(
-                "UPDATE checks
-                 SET status = 'paid', payer_user_id = $2, payer_account = $3,
-                     transaction_id = $4, method = 'fingerprint', paid_at = now()
-                 WHERE id = $1 AND status = 'open' AND expires_at > now()",
-            )
-            .bind(check_id)
-            .bind(payer_id)
-            .bind(payer_account)
-            .bind(key)
-            .execute(&mut *conn)
-            .await?;
-            if updated.rows_affected() != 1 {
-                return Err(HookError::Rejected {
-                    rule: "check_not_open".to_string(),
-                    message: "check is no longer open".to_string(),
-                });
-            }
-            sqlx::query(
-                "INSERT INTO biometric_events
-                   (id, check_id, terminal_user_id, matched_user_id, outcome, score, probe_hash, detail)
-                 VALUES ($1, $2, $3, $4, 'paid', $5, $6, NULL)",
-            )
-            .bind(Uuid::now_v7())
-            .bind(check_id)
-            .bind(merchant_id)
-            .bind(payer_id)
-            .bind(score)
-            .bind(&probe_hash)
-            .execute(&mut *conn)
-            .await?;
-            aml(conn).await
-        })
-    });
-    let opts = PostOptions {
-        idempotency: Some(record(key, &fingerprint, &created)?),
-        guard: Some(guard),
-    };
-    let result = state.ledger.post_on(&mut conn, &txn, opts).await;
-    match &result {
-        Err(StorageError::Rejected { rule, .. }) if rule == "check_not_open" => {
-            return Err(ApiError::Conflict("check is no longer open".to_string()));
-        }
-        Err(StorageError::Ledger(LedgerError::InsufficientFunds { .. })) => {
-            let err = ApiError::InsufficientFunds("payer has insufficient funds".to_string());
-            return Err(refuse(
-                &mut conn,
-                &attempt,
-                Some(payer_id),
-                "rejected",
-                Some(score),
-                err,
-            )
-            .await);
-        }
-        Err(StorageError::Rejected { rule, message }) => {
-            let _ = log_event(
-                &mut conn,
-                &attempt,
-                Some(payer_id),
-                "rejected",
-                Some(score),
-                Some(&format!("{rule}: {message}")),
-            )
-            .await;
-        }
-        _ => {}
-    }
-    let out = finish(
-        &mut conn,
-        result,
-        key,
-        &fingerprint,
-        created,
-        raced,
-        Some(&screen),
-    )
-    .await?;
-    metrics::counter!("biometric_identify_total", "outcome" => "paid").increment(1);
-    tracing::info!(%check_id, %merchant_id, %payer_id, amount_minor, "check paid by fingerprint");
-    Ok(out)
 }

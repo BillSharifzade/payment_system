@@ -14,6 +14,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import okhttp3.Authenticator
 import okhttp3.Interceptor
@@ -28,6 +29,9 @@ import okhttp3.ResponseBody.Companion.toResponseBody
 import okhttp3.Route
 import tj.payment.core.AccountResponse
 import tj.payment.core.ApiOutcome
+import tj.payment.core.CheckDto
+import tj.payment.core.CreateCheckRequest
+import tj.payment.core.PayCheckRequest
 import tj.payment.core.ClientConfigResponse
 import tj.payment.core.CreateWalletRequest
 import tj.payment.core.CredentialsRequest
@@ -222,6 +226,30 @@ class ApiClient(
     /** Convert between the caller's own wallets. Same idempotency contract as [transfer]. */
     suspend fun fx(request: FxRequest, idempotencyKey: String): ApiOutcome<FxResponse> =
         call(post("/v1/fx", FxRequest.serializer(), request, idempotencyKey = idempotencyKey), FxResponse.serializer())
+
+    // --- Checks: request money by QR, pay a scanned check ---
+
+    /** Open a check to collect [request.amountMinor]. The key IS the check id, so a retry returns the same check. */
+    suspend fun createCheck(request: CreateCheckRequest, idempotencyKey: String): ApiOutcome<CheckDto> =
+        call(post("/v1/checks", CreateCheckRequest.serializer(), request, idempotencyKey = idempotencyKey), CheckDto.serializer())
+
+    /** A check by id: the merchant's own, one this user paid, or any check still open (the QR preview). */
+    suspend fun check(id: String): ApiOutcome<CheckDto> =
+        call(get("/v1/checks/${id.urlEncode()}"), CheckDto.serializer())
+
+    suspend fun cancelCheck(id: String): ApiOutcome<CheckDto> =
+        call(post("/v1/checks/${id.urlEncode()}/cancel", Unit.serializer(), Unit), CheckDto.serializer())
+
+    /**
+     * Settle a check from the caller's wallet. Only ever called by the
+     * PaymentSubmitter, with a persisted key — same contract as [transfer]; the
+     * response carries `transaction_id` + `status` like a transfer does.
+     */
+    suspend fun payCheck(checkId: String, request: PayCheckRequest, idempotencyKey: String): ApiOutcome<PostResponse> =
+        call(
+            post("/v1/checks/${checkId.urlEncode()}/pay", PayCheckRequest.serializer(), request, idempotencyKey = idempotencyKey),
+            PostResponse.serializer(),
+        )
 
     // --- Request building ---
 

@@ -3137,3 +3137,147 @@ async fn concurrent_fingerprint_payments_of_one_check_post_once() {
         30_000
     );
 }
+
+async fn pay_check_app(
+    app: &axum::Router,
+    token: &str,
+    check_id: &str,
+    key: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    send(
+        app,
+        req(
+            "POST",
+            &format!("/v1/checks/{check_id}/pay"),
+            Some(token),
+            Some(key),
+            body,
+        ),
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL (docker compose up -d)"]
+async fn check_paid_from_customer_app() {
+    let (app, pool) = app().await;
+    let admin = admin_token(&app, &pool).await;
+    let merchant = party(&app, &pool, Some("Corner Shop")).await;
+    let customer = party(&app, &pool, Some("Daler Nazarov")).await;
+    let stranger = party(&app, &pool, None).await;
+    admin_deposit(&app, &admin, &customer.wallet, 50_000).await;
+
+    let check_key = Uuid::new_v4().to_string();
+    let (status, body) = create_check(
+        &app,
+        &merchant.token,
+        &merchant.wallet,
+        20_000,
+        &check_key,
+        json!({"description": "bread"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["merchant_name"], "Corner Shop");
+
+    let (status, preview) = get_check(&app, &stranger.token, &check_key).await;
+    assert_eq!(status, StatusCode::OK, "open check preview: {preview}");
+    assert_eq!(preview["status"], "open");
+    assert_eq!(preview["merchant_name"], "Corner Shop");
+    assert_eq!(preview["amount_minor"], 20_000);
+
+    let (status, body) = pay_check_app(
+        &app,
+        &customer.token,
+        &check_key,
+        &Uuid::new_v4().to_string(),
+        json!({"account": merchant.wallet}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "foreign wallet: {body}");
+
+    let pay_key = Uuid::new_v4().to_string();
+    let (status, paid) =
+        pay_check_app(&app, &customer.token, &check_key, &pay_key, json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "pay: {paid}");
+    assert_eq!(paid["status"], "posted");
+    assert_eq!(paid["transaction_id"], pay_key);
+    assert_eq!(paid["payer_name"], "Daler Nazarov");
+    assert_eq!(
+        balance_of(&app, &customer.token, &customer.wallet).await,
+        30_000
+    );
+    assert_eq!(
+        balance_of(&app, &merchant.token, &merchant.wallet).await,
+        20_000
+    );
+
+    let (status, replay) =
+        pay_check_app(&app, &customer.token, &check_key, &pay_key, json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "replay: {replay}");
+    assert_eq!(replay, paid);
+    assert_eq!(
+        balance_of(&app, &customer.token, &customer.wallet).await,
+        30_000
+    );
+
+    let (status, body) = pay_check_app(
+        &app,
+        &stranger.token,
+        &check_key,
+        &Uuid::new_v4().to_string(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "already paid: {body}");
+    let (status, _) = get_check(&app, &stranger.token, &check_key).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "paid checks are private");
+    let (status, body) = get_check(&app, &customer.token, &check_key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "paid");
+    assert_eq!(body["transaction_id"], pay_key);
+    let method: String = sqlx::query_scalar("SELECT method FROM checks WHERE id = $1")
+        .bind(Uuid::parse_str(&check_key).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(method, "app");
+
+    let own_key = Uuid::new_v4().to_string();
+    let (status, _) = create_check(
+        &app,
+        &merchant.token,
+        &merchant.wallet,
+        500,
+        &own_key,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = pay_check_app(
+        &app,
+        &merchant.token,
+        &own_key,
+        &Uuid::new_v4().to_string(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "self pay: {body}");
+    let (status, body) = pay_check_app(
+        &app,
+        &stranger.token,
+        &own_key,
+        &Uuid::new_v4().to_string(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "broke stranger: {body}"
+    );
+    assert_eq!(body["error"]["code"], "insufficient_funds");
+    let (_, body) = get_check(&app, &merchant.token, &own_key).await;
+    assert_eq!(body["status"], "open");
+}

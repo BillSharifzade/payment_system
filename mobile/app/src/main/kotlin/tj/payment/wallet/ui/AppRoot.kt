@@ -30,7 +30,11 @@ import tj.payment.wallet.ui.home.HomeScreen
 import tj.payment.wallet.ui.home.HomeViewModel
 import tj.payment.wallet.ui.kyc.KycScreen
 import tj.payment.wallet.ui.kyc.KycViewModel
+import tj.payment.wallet.ui.paycheck.PayCheckScreen
+import tj.payment.wallet.ui.paycheck.PayCheckViewModel
 import tj.payment.wallet.ui.receive.ReceiveScreen
+import tj.payment.wallet.ui.request.RequestScreen
+import tj.payment.wallet.ui.request.RequestViewModel
 import tj.payment.wallet.ui.send.SendScreen
 import tj.payment.wallet.ui.send.SendViewModel
 
@@ -43,6 +47,8 @@ private object Routes {
     const val HISTORY = "history/{accountId}"
     const val KYC = "kyc"
     const val FX = "fx"
+    const val PAY_CHECK = "paycheck"
+    const val REQUEST = "request"
 
     fun history(accountId: String) = "history/$accountId"
 }
@@ -130,6 +136,8 @@ fun AppRoot(container: AppContainer) {
                 onHistory = { walletId -> nav.navigate(Routes.history(walletId)) },
                 onConvert = { nav.navigate(Routes.FX) },
                 onKyc = { nav.navigate(Routes.KYC) },
+                onPayCheck = { nav.navigate(Routes.PAY_CHECK) },
+                onRequest = { nav.navigate(Routes.REQUEST) },
             )
         }
         composable(Routes.SEND) {
@@ -164,6 +172,18 @@ fun AppRoot(container: AppContainer) {
         composable(Routes.FX) {
             val vm = viewModel { FxViewModel(container.walletRepository) }
             FxScreen(vm, onBack = { nav.popBackStack() })
+        }
+        composable(Routes.PAY_CHECK) {
+            val vm = viewModel { PayCheckViewModel(container.walletRepository) }
+            PayCheckScreen(
+                viewModel = vm,
+                onClose = { nav.popBackStack() },
+                onVerifyIdentity = { nav.navigate(Routes.KYC) { popUpTo(Routes.HOME) } },
+            )
+        }
+        composable(Routes.REQUEST) {
+            val vm = viewModel { RequestViewModel(container.walletRepository) }
+            RequestScreen(vm, onBack = { nav.popBackStack() })
         }
     }
 }

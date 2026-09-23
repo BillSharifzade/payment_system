@@ -190,4 +190,49 @@ data class FxResponse(
 @Serializable
 data class ClientConfigResponse(
     @SerialName("transfer_fee_bps") val transferFeeBps: Int = 0,
+    /** Cap on a single fingerprint-terminal payment (minor units); informational for the app path. */
+    @SerialName("biometric_max_minor") val biometricMaxMinor: Long = 0,
+    /** Default lifetime of a merchant check, seconds. */
+    @SerialName("check_ttl_secs") val checkTtlSecs: Long = 300,
+)
+
+// --- Checks (DESIGN.md §20): an amount a merchant wants to collect ---
+
+@Serializable
+data class CreateCheckRequest(
+    val account: String,
+    @SerialName("amount_minor") val amountMinor: Long,
+    val currency: String,
+    val description: String? = null,
+)
+
+/**
+ * A check as GET /v1/checks/{id} returns it. [status] is "open" | "paid" |
+ * "cancelled" | "expired" (expiry is applied server-side, never computed here).
+ */
+@Serializable
+data class CheckDto(
+    val id: String,
+    val status: String,
+    @SerialName("amount_minor") val amountMinor: Long,
+    val currency: String,
+    val description: String? = null,
+    /** The merchant's wallet (credited on payment). */
+    val account: String,
+    @SerialName("transaction_id") val transactionId: String? = null,
+    @SerialName("payer_name") val payerName: String? = null,
+    @SerialName("merchant_name") val merchantName: String? = null,
+    @SerialName("created_at_ms") val createdAtMs: Long,
+    @SerialName("expires_at_ms") val expiresAtMs: Long,
+    @SerialName("paid_at_ms") val paidAtMs: Long? = null,
+) {
+    fun money(): Money = Money.ofMinor(amountMinor, Currency.of(currency))
+
+    val isOpen: Boolean get() = status == "open"
+}
+
+/** Body of POST /v1/checks/{id}/pay; [account] = the payer's wallet (null = server picks). */
+@Serializable
+data class PayCheckRequest(
+    val account: String? = null,
 )

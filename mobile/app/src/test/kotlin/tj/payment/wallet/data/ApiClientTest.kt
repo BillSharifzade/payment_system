@@ -30,6 +30,7 @@ import org.junit.Before
 import org.junit.Test
 import tj.payment.core.ApiOutcome
 import tj.payment.core.ErrorCode
+import tj.payment.core.PayCheckRequest
 import tj.payment.core.PaymentSubmitter
 import tj.payment.core.PendingPayment
 import tj.payment.core.PendingPaymentStore
@@ -136,6 +137,27 @@ class ApiClientTest {
     private fun signedIn(access: String = "old", refresh: String = "r1") {
         session.access = access
         session.refresh = refresh
+    }
+
+    // --- (0) pay-by-QR request shape ---
+
+    @Test
+    fun `payCheck posts to the check's pay route with the key, bearer and wallet`() = runBlocking {
+        signedIn()
+        val seen = AtomicReference<RecordedRequest?>(null)
+        serve(refresh = { tokens("new") }) { req ->
+            seen.set(req)
+            json("""{"transaction_id":"k1","status":"posted","check_id":"c1","amount_minor":200,"currency":"TJS"}""")
+        }
+        val out = api.payCheck("c1", PayCheckRequest(account = "w1"), idempotencyKey = "k1")
+        assertTrue(out is ApiOutcome.Ok)
+        assertEquals("k1", (out as ApiOutcome.Ok).value.transactionId)
+        val request = seen.get()
+        assertNotNull(request)
+        assertEquals("/v1/checks/c1/pay", request!!.path)
+        assertEquals("k1", request.getHeader("Idempotency-Key"))
+        assertEquals("Bearer old", request.getHeader("Authorization"))
+        assertTrue(request.body.readUtf8().contains(""""account":"w1""""))
     }
 
     // --- (a) single-flight refresh ---
