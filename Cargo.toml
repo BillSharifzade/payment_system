@@ -9,6 +9,7 @@ members = [
     "crates/workers",
     "crates/api",
     "crates/biometric",
+    "crates/loadtest",
 ]
 
 # Fatter release optimization: thin LTO + a single codegen unit typically buys
