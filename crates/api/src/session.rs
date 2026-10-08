@@ -187,7 +187,9 @@ pub async fn register(
         )
         .await?;
     let (tokens, _) = issue_tokens_on(&mut tx, &state, user_id, false).await?;
-    tx.commit().await.map_err(StorageError::from)?;
+    storage::commit_durable(tx)
+        .await
+        .map_err(StorageError::from)?;
     Ok((StatusCode::CREATED, Json(tokens)))
 }
 
@@ -304,7 +306,9 @@ pub async fn refresh(
                         .execute(&mut *tx)
                         .await
                         .map_err(StorageError::from)?;
-                    tx.commit().await.map_err(StorageError::from)?;
+                    storage::commit_durable(tx)
+                        .await
+                        .map_err(StorageError::from)?;
                     tracing::info!(%user_id, "refresh token re-presented inside the grace window; rotated its successor");
                     metrics::counter!("auth_refresh_total", "outcome" => "grace").increment(1);
                     return Ok(Json(tokens));
@@ -319,7 +323,9 @@ pub async fn refresh(
         .execute(&mut *tx)
         .await
         .map_err(StorageError::from)?;
-        tx.commit().await.map_err(StorageError::from)?;
+        storage::commit_durable(tx)
+            .await
+            .map_err(StorageError::from)?;
         tracing::warn!(%user_id, "revoked refresh token replayed — all sessions revoked");
         metrics::counter!("auth_refresh_total", "outcome" => "replay").increment(1);
         return Err(ApiError::Unauthorized("invalid refresh token".to_string()));
@@ -348,7 +354,9 @@ pub async fn refresh(
         .execute(&mut *tx)
         .await
         .map_err(StorageError::from)?;
-    tx.commit().await.map_err(StorageError::from)?;
+    storage::commit_durable(tx)
+        .await
+        .map_err(StorageError::from)?;
     metrics::counter!("auth_refresh_total", "outcome" => "rotated").increment(1);
     Ok(Json(tokens))
 }

@@ -14,39 +14,52 @@ use uuid::Uuid;
 use crate::common::{default_currency, idempotency_key};
 use crate::devices::{self, DeviceKey, DeviceProof, MoneyMove, PaymentAuth};
 use crate::session::AuthUser;
-use crate::{ApiError, ApiResult, AppState, Limits};
+use crate::{ApiError, ApiResult, AppState, FeeConfig, Limits};
 
 pub const KYC_LEVEL_FOR_TRANSFER: i16 = 1;
 
-const SHARD_COUNT: u64 = 16;
+// A shard is held from its additive update to the commit, so with fewer shards than posts in
+// flight the posts queue on them (16 measured a 4 ms mean wait at 32 connections, migration
+// 0029). Ids are Uuid::from_u128(base + i), i < SHARD_COUNT.
+const SHARD_COUNT: u64 = 64;
 static SHARD_RR: AtomicU64 = AtomicU64::new(0);
 
-fn shard(base: u128) -> Uuid {
+const SETTLEMENT: [(&str, u128); 2] = [("TJS", 0x1000), ("USD", 0x1100)];
+const FEE_REVENUE: [(&str, u128); 1] = [("TJS", 0x2000)];
+const FX_POSITION: [(&str, u128); 2] = [("TJS", 0x3000), ("USD", 0x3100)];
+
+fn shard(family: &[(&str, u128)], currency: &str) -> Option<Uuid> {
+    let (_, base) = family.iter().find(|(c, _)| *c == currency)?;
     let i = SHARD_RR.fetch_add(1, Ordering::Relaxed) % SHARD_COUNT;
-    Uuid::from_u128(base + i as u128)
+    Some(Uuid::from_u128(base + i as u128))
 }
 
 pub fn settlement_shard(currency: &str) -> Option<Uuid> {
-    match currency {
-        "TJS" => Some(shard(0x1000)),
-        "USD" => Some(shard(0x1100)),
-        _ => None,
-    }
+    shard(&SETTLEMENT, currency)
 }
 
 pub(crate) fn fee_shard(currency: &str) -> Option<Uuid> {
-    match currency {
-        "TJS" => Some(shard(0x2000)),
-        _ => None,
-    }
+    shard(&FEE_REVENUE, currency)
 }
 
 fn fx_shard(currency: &str) -> Option<Uuid> {
-    match currency {
-        "TJS" => Some(shard(0x3000)),
-        "USD" => Some(shard(0x3100)),
-        _ => None,
-    }
+    shard(&FX_POSITION, currency)
+}
+
+/// Every system account a post can pick: (id, account_type, currency).
+pub fn system_shards() -> Vec<(Uuid, &'static str, &'static str)> {
+    [
+        ("system_settlement", &SETTLEMENT[..]),
+        ("system_fee_revenue", &FEE_REVENUE[..]),
+        ("system_fx_gain_loss", &FX_POSITION[..]),
+    ]
+    .into_iter()
+    .flat_map(|(kind, family)| {
+        family.iter().flat_map(move |(currency, base)| {
+            (0..SHARD_COUNT as u128).map(move |i| (Uuid::from_u128(base + i), kind, *currency))
+        })
+    })
+    .collect()
 }
 
 #[derive(Deserialize)]
@@ -314,12 +327,12 @@ pub(crate) fn owned(account: &Option<AccountRow>, user_id: Uuid) -> ApiResult<&A
 }
 
 #[derive(Clone)]
-pub(crate) struct ScreenCtx {
-    pub(crate) user_id: Uuid,
-    pub(crate) from_account: Uuid,
-    pub(crate) to_account: Uuid,
-    pub(crate) amount_minor: i64,
-    pub(crate) currency: String,
+pub struct ScreenCtx {
+    pub user_id: Uuid,
+    pub from_account: Uuid,
+    pub to_account: Uuid,
+    pub amount_minor: i64,
+    pub currency: String,
 }
 
 async fn log_screening(
@@ -404,73 +417,167 @@ pub(crate) async fn pre_screen(
 }
 
 // AML windows are per USER across all their wallets, so the guard serialises one user's posts
-// on the user's row. It runs inside post_on after the wallets are locked; the window is then
-// summed in a NEW statement (a fresh READ COMMITTED snapshot taken after the lock was granted),
-// so a concurrent post from any wallet of the same user is either fully visible or still
-// queued behind the lock — the limit is exact. No deadlock: every posting transaction locks
-// its wallets first (one statement, id order), then exactly one users row, then system shards
-// last (sorted, never followed by another lock); nothing that holds a users row lock (status
-// and KYC changes, wallet creation) ever waits for a wallet balance. NO KEY UPDATE so FK checks
-// against users (KEY SHARE, e.g. inserting checks, events, refresh tokens) never queue on it.
-pub(crate) async fn lock_user(conn: &mut PgConnection, user_id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE")
-        .bind(user_id)
-        .execute(&mut *conn)
-        .await?;
-    Ok(())
+// on the user's row. It runs first in post_on; the window is then summed in a NEW statement (a
+// fresh READ COMMITTED snapshot taken after the lock was granted), so a concurrent post from
+// any wallet of the same user is either fully visible or still queued behind the lock — the
+// limit is exact. No deadlock: every posting transaction takes its locks in one global order —
+// at most one users row, then at most one check or deposit-request row, then its wallets (one
+// statement, id order), then system shards (sorted, never followed by another lock) — and
+// nothing that holds a users row (status and KYC changes, wallet creation, device
+// registration) or a check (cancel, expiry, attempt slots) ever waits for a wallet balance.
+// NO KEY UPDATE so FK checks against users (KEY SHARE, e.g. inserting checks, events, refresh
+// tokens) never queue on it. Also says whether the user has a stored AML window, as of before
+// the lock was granted: a window stored meanwhile reads as absent, which costs one full sum
+// (exact all the same) and nothing else — windows are never deleted.
+pub(crate) async fn lock_user(conn: &mut PgConnection, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    let stored: Option<bool> = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM aml_windows WHERE user_id = $1)
+         FROM users WHERE id = $1 FOR NO KEY UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(stored == Some(true))
 }
 
-// Every debit of the user's wallets in the window, each currency converted to TJS at the
-// current rate (floored per currency, as the per-transaction check does). A debit currency
-// with no TJS rate cannot be priced, so the guard fails closed.
-pub(crate) async fn aml_check(
-    conn: &mut PgConnection,
-    s: &ScreenCtx,
-    tjs: (i64, i64),
-    limits: Limits,
-) -> Result<(), HookError> {
-    let row = sqlx::query(
-        "WITH d AS (
-             SELECT a.currency, SUM(e.amount_minor)::numeric AS total,
-                    COUNT(*) FILTER (WHERE e.created_at >= now() - interval '1 hour') AS hourly
-             FROM accounts a
-             JOIN entries e ON e.account_id = a.id
-             WHERE a.owner_user_id = $1 AND a.account_type = 'user_wallet'
-               AND e.direction = 'debit' AND e.created_at >= now() - interval '24 hours'
-             GROUP BY a.currency
-         ), w AS (
-             SELECT COALESCE(SUM(CASE WHEN d.currency = 'TJS' THEN d.total
-                                      ELSE floor(d.total * r.rate_num / r.rate_den) END), 0) AS daily,
-                    COALESCE(SUM(d.hourly), 0) AS hourly,
-                    COUNT(*) FILTER (WHERE d.currency <> 'TJS' AND r.rate_num IS NULL) AS unpriced
-             FROM d
-             LEFT JOIN fx_rates r ON r.base_currency = d.currency AND r.quote_currency = 'TJS'
+/// Daily debits from which a user's AML window is stored (aml_windows, migration 0030). Below
+/// it the guard sums the entries each time, which costs less than keeping a window current.
+const AML_WINDOW_FROM_DEBITS: i64 = 64;
+
+// The decision both statements end in: every debit of the user's wallets in the window, each
+// currency converted to TJS at the current rate (floored per currency, as the per-transaction
+// check does). A debit currency with no TJS rate cannot be priced, so the guard fails closed.
+// Expects n(currency, day_sum, hour_count).
+const AML_DECIDE: &str = "t AS (
+             SELECT COALESCE(SUM(CASE WHEN n.currency = 'TJS' THEN n.day_sum::numeric
+                                      ELSE floor(n.day_sum::numeric * r.rate_num / r.rate_den)
+                                 END), 0) AS daily,
+                    COALESCE(SUM(n.hour_count), 0) AS hourly,
+                    COUNT(*) FILTER (WHERE n.currency <> 'TJS' AND n.day_sum > 0
+                                       AND r.rate_num IS NULL) AS unpriced
+             FROM n
+             LEFT JOIN fx_rates r ON r.base_currency = n.currency AND r.quote_currency = 'TJS'
          ), ok AS (
-             SELECT w.unpriced = 0 AS priced_ok,
-                    w.daily + floor(($2::bigint)::numeric * ($3::bigint)::numeric / ($4::bigint)::numeric)
+             SELECT t.unpriced = 0 AS priced_ok,
+                    t.daily + floor(($2::bigint)::numeric * ($3::bigint)::numeric / ($4::bigint)::numeric)
                       <= ($5::bigint)::numeric AS daily_ok,
-                    w.hourly < $6::bigint AS velocity_ok
-             FROM w
+                    t.hourly < $6::bigint AS velocity_ok
+             FROM t
          ), ins AS (
              INSERT INTO screening_events
                (id, user_id, from_account, to_account, amount_minor, currency, decision, rule, detail)
              SELECT $7::uuid, $1::uuid, $8::uuid, $9::uuid, $2::bigint, $10::text, 'allowed', NULL, NULL
              FROM ok WHERE ok.priced_ok AND ok.daily_ok AND ok.velocity_ok
          )
-         SELECT priced_ok, daily_ok, velocity_ok FROM ok",
-    )
-    .bind(s.user_id)
-    .bind(s.amount_minor)
-    .bind(tjs.0)
-    .bind(tjs.1)
-    .bind(limits.daily_minor)
-    .bind(limits.velocity_per_hour)
-    .bind(Uuid::now_v7())
-    .bind(s.from_account)
-    .bind(s.to_account)
-    .bind(&s.currency)
-    .fetch_one(&mut *conn)
-    .await?;
+         SELECT priced_ok, daily_ok, velocity_ok FROM ok";
+
+// A user without a stored window: sum the window from the entries, and store it once it holds
+// AML_WINDOW_FROM_DEBITS debits.
+const AML_FROM_ENTRIES: &str = "WITH n AS (
+             SELECT a.currency, SUM(e.amount_minor) AS day_sum, COUNT(*) AS debits,
+                    COUNT(*) FILTER (WHERE e.created_at >= now() - interval '1 hour') AS hour_count
+             FROM accounts a
+             JOIN entries e ON e.account_id = a.id
+             WHERE a.owner_user_id = $1 AND a.account_type = 'user_wallet'
+               AND e.direction = 'debit' AND e.created_at >= now() - interval '24 hours'
+             GROUP BY a.currency
+         ), stored AS (
+             INSERT INTO aml_windows (user_id, currency, day_from, day_sum, hour_from, hour_count)
+             SELECT $1, n.currency, now() - interval '24 hours', n.day_sum,
+                    now() - interval '1 hour', n.hour_count
+             FROM n WHERE (SELECT SUM(debits) FROM n) >= $11
+             ON CONFLICT (user_id, currency) DO UPDATE
+             SET day_from = EXCLUDED.day_from, day_sum = EXCLUDED.day_sum,
+                 hour_from = EXCLUDED.hour_from, hour_count = EXCLUDED.hour_count
+         ), ";
+
+// A stored window: each edge moves to now() - 24h / now() - 1h, adding or subtracting the
+// debits it passes — the same sums as AML_FROM_ENTRIES, at O(1) per post. A currency without a
+// row yet (a newer wallet) starts its edges at 'infinity', i.e. is summed from the entries.
+// This post's own debit is added by the entries trigger when storage writes it. The edge moves
+// are aggregating LATERAL probes (the aggregate stops the planner flattening them into the
+// join) so both bounds are index conditions whatever the statistics say: as a plain join, a
+// generic plan built on skewed statistics filtered a heavy payer's entire history instead.
+const AML_FROM_WINDOW: &str = "WITH cut AS (
+             SELECT now() - interval '24 hours' AS day_to, now() - interval '1 hour' AS hour_to
+         ), w AS (
+             SELECT a.id, a.currency FROM accounts a
+             WHERE a.owner_user_id = $1 AND a.account_type = 'user_wallet'
+         ), s AS (
+             SELECT c.currency,
+                    COALESCE(x.day_from, 'infinity') AS day_from, COALESCE(x.day_sum, 0) AS day_sum,
+                    COALESCE(x.hour_from, 'infinity') AS hour_from,
+                    COALESCE(x.hour_count, 0) AS hour_count
+             FROM (SELECT DISTINCT currency FROM w) c
+             LEFT JOIN aml_windows x ON x.user_id = $1 AND x.currency = c.currency
+         ), day_moved AS (
+             SELECT s.currency, SUM(m.amount) AS amount
+             FROM s CROSS JOIN cut JOIN w ON w.currency = s.currency
+             CROSS JOIN LATERAL (
+                 SELECT SUM(e.amount_minor) AS amount FROM entries e
+                 WHERE e.account_id = w.id AND e.direction = 'debit'
+                   AND e.created_at >= LEAST(s.day_from, cut.day_to)
+                   AND e.created_at < GREATEST(s.day_from, cut.day_to)
+             ) m
+             GROUP BY s.currency
+         ), hour_moved AS (
+             SELECT s.currency, SUM(m.n) AS n
+             FROM s CROSS JOIN cut JOIN w ON w.currency = s.currency
+             CROSS JOIN LATERAL (
+                 SELECT count(*) AS n FROM entries e
+                 WHERE e.account_id = w.id AND e.direction = 'debit'
+                   AND e.created_at >= LEAST(s.hour_from, cut.hour_to)
+                   AND e.created_at < GREATEST(s.hour_from, cut.hour_to)
+             ) m
+             GROUP BY s.currency
+         ), n AS (
+             SELECT s.currency,
+                    s.day_sum + CASE WHEN cut.day_to < s.day_from THEN 1 ELSE -1 END
+                                * COALESCE(dm.amount, 0) AS day_sum,
+                    s.hour_count + CASE WHEN cut.hour_to < s.hour_from THEN 1 ELSE -1 END
+                                * COALESCE(hm.n, 0) AS hour_count
+             FROM s CROSS JOIN cut
+             LEFT JOIN day_moved dm ON dm.currency = s.currency
+             LEFT JOIN hour_moved hm ON hm.currency = s.currency
+         ), saved AS (
+             INSERT INTO aml_windows (user_id, currency, day_from, day_sum, hour_from, hour_count)
+             SELECT $1, n.currency, cut.day_to, n.day_sum, cut.hour_to, n.hour_count
+             FROM n CROSS JOIN cut
+             ON CONFLICT (user_id, currency) DO UPDATE
+             SET day_from = EXCLUDED.day_from, day_sum = EXCLUDED.day_sum,
+                 hour_from = EXCLUDED.hour_from, hour_count = EXCLUDED.hour_count
+         ), ";
+
+// `stored` comes from lock_user. Either statement runs after the user's row lock was granted,
+// in a fresh snapshot, so concurrent posts of the same user are fully counted or still queued.
+pub(crate) async fn aml_check(
+    conn: &mut PgConnection,
+    s: &ScreenCtx,
+    tjs: (i64, i64),
+    limits: Limits,
+    stored: bool,
+) -> Result<(), HookError> {
+    let from = if stored {
+        AML_FROM_WINDOW
+    } else {
+        AML_FROM_ENTRIES
+    };
+    let sql = format!("{from}{AML_DECIDE}");
+    let mut query = sqlx::query(&sql)
+        .bind(s.user_id)
+        .bind(s.amount_minor)
+        .bind(tjs.0)
+        .bind(tjs.1)
+        .bind(limits.daily_minor)
+        .bind(limits.velocity_per_hour)
+        .bind(Uuid::now_v7())
+        .bind(s.from_account)
+        .bind(s.to_account)
+        .bind(&s.currency);
+    if !stored {
+        query = query.bind(AML_WINDOW_FROM_DEBITS);
+    }
+    let row = query.fetch_one(&mut *conn).await?;
     let reject = |rule: &str, message: &str| HookError::Rejected {
         rule: rule.to_string(),
         message: message.to_string(),
@@ -493,13 +600,54 @@ pub(crate) async fn aml_check(
     Ok(())
 }
 
-pub(crate) fn aml_guard(s: ScreenCtx, tjs: (i64, i64), limits: Limits) -> PostHook {
+pub fn aml_guard(s: ScreenCtx, tjs: (i64, i64), limits: Limits) -> PostHook {
     Box::new(move |conn: &mut PgConnection| {
         Box::pin(async move {
-            lock_user(conn, s.user_id).await?;
-            aml_check(conn, &s, tjs, limits).await
+            let stored = lock_user(conn, s.user_id).await?;
+            aml_check(conn, &s, tjs, limits, stored).await
         })
     })
+}
+
+/// The entries of a same-currency payment from `from` to `to` (a transfer or a check): the
+/// recipient gets `amount` less the transfer fee (TJS only), which goes to a fee shard.
+pub fn payment_entries(
+    fees: FeeConfig,
+    from: Uuid,
+    to: Uuid,
+    amount: Money,
+) -> ApiResult<Vec<Entry>> {
+    let currency = amount.currency();
+    let amount_minor = i64::try_from(amount.minor_units())
+        .map_err(|_| ApiError::BadRequest("amount is too large".to_string()))?;
+    let fee_minor = if currency.code() == "TJS" {
+        fees.fee_minor(amount_minor)
+    } else {
+        0
+    };
+    if fee_minor == 0 {
+        return Ok(vec![
+            Entry::debit(AccountId(from), amount),
+            Entry::credit(AccountId(to), amount),
+        ]);
+    }
+    let to_recipient = amount_minor
+        .checked_sub(fee_minor)
+        .filter(|v| *v > 0)
+        .ok_or_else(|| ApiError::BadRequest("amount does not cover the fee".to_string()))?;
+    let fee_account = fee_shard(currency.code())
+        .ok_or_else(|| ApiError::Internal("no fee account for currency".to_string()))?;
+    Ok(vec![
+        Entry::debit(AccountId(from), amount),
+        Entry::credit(
+            AccountId(to),
+            Money::from_minor(to_recipient as i128, currency),
+        ),
+        Entry::credit(
+            AccountId(fee_account),
+            Money::from_minor(fee_minor as i128, currency),
+        ),
+    ])
 }
 
 pub(crate) fn record<T: Serialize>(
@@ -651,38 +799,7 @@ pub async fn create_transfer(
     let (tjs, limits) = pre_screen(&mut conn, &state, &ctx, &screen).await?;
 
     let amount = Money::from_minor(req.amount_minor as i128, currency);
-
-    let fee_minor = if currency.code() == "TJS" {
-        state.fees.fee_minor(req.amount_minor)
-    } else {
-        0
-    };
-    let entries = if fee_minor > 0 {
-        let to_recipient_minor = req
-            .amount_minor
-            .checked_sub(fee_minor)
-            .filter(|v| *v > 0)
-            .ok_or_else(|| ApiError::BadRequest("amount does not cover the fee".to_string()))?;
-        let fee_account = fee_shard(currency.code())
-            .ok_or_else(|| ApiError::Internal("no fee account for currency".to_string()))?;
-        vec![
-            Entry::debit(AccountId(req.from_account), amount),
-            Entry::credit(
-                AccountId(req.to_account),
-                Money::from_minor(to_recipient_minor as i128, currency),
-            ),
-            Entry::credit(
-                AccountId(fee_account),
-                Money::from_minor(fee_minor as i128, currency),
-            ),
-        ]
-    } else {
-        vec![
-            Entry::debit(AccountId(req.from_account), amount),
-            Entry::credit(AccountId(req.to_account), amount),
-        ]
-    };
-
+    let entries = payment_entries(state.fees, req.from_account, req.to_account, amount)?;
     let txn = Transaction::new(TransactionId(key), entries);
     let created = PostResponse {
         transaction_id: key,

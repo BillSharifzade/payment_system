@@ -10,6 +10,7 @@ members = [
     "crates/api",
     "crates/biometric",
     "crates/ledger-tigerbeetle",
+    "crates/loadtest",
 ]
 # cargo-fuzz targets: nightly-only, own lockfile; run by .github/workflows/fuzz.yml.
 exclude = ["fuzz"]

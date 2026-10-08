@@ -17,6 +17,7 @@ mod transactions;
 pub use biometric::{BiometricConfig, MatcherBackend};
 pub use config::{DeviceBinding, DeviceConfig};
 pub use error::{ApiError, ApiResult};
+pub use payments::{aml_guard, payment_entries, settlement_shard, system_shards, ScreenCtx};
 pub use ratelimit::RateLimitState;
 pub use session::{warm_password_hasher, AdminUser, AuthUser};
 

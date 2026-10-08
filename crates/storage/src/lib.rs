@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 
 use ledger::{Account, AccountId, AccountType, LedgerError, NormalSide, Transaction};
 use money::{Currency, Money};
-use sqlx::{Connection, PgConnection, PgPool, Row};
+use sqlx::{Connection, PgConnection, PgPool, Postgres, Row};
 use uuid::Uuid;
 
 #[allow(async_fn_in_trait)]
@@ -27,6 +27,10 @@ pub trait LedgerStore {
 pub struct PostgresLedger {
     pool: PgPool,
     currencies: Arc<RwLock<HashMap<String, Currency>>>,
+    // System accounts (settlement, fee, FX shards) a post has verified. An account's type and
+    // currency never change (migration 0029 makes the database refuse it), so after the first
+    // post that touches one its metadata costs no query.
+    system_accounts: Arc<RwLock<HashMap<Uuid, Currency>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +60,9 @@ pub type PostHook = Box<
 #[derive(Default)]
 pub struct PostOptions {
     pub idempotency: Option<IdempotencyRecord>,
+    /// Runs in the posting transaction right after the id is claimed and before any wallet is
+    /// locked; a rejection rolls the whole post back. It may lock rows that never wait for a
+    /// balance (a users row, a check, a deposit request) — never a balance itself.
     pub guard: Option<PostHook>,
 }
 
@@ -70,6 +77,20 @@ fn parse_account_type(type_str: &str) -> Result<AccountType> {
         .ok_or_else(|| StorageError::DataIntegrity(format!("account_type={type_str}")))
 }
 
+/// COMMIT of a transaction whose outcome is acknowledged to a client. statement_timeout is
+/// lifted first, so a COMMIT waiting for a synchronous standby ends by replication, by failover
+/// (the connection drops: 503) or by the request deadline (504), never by a timeout cancel —
+/// Postgres answers a cancelled wait with success ("committed locally, but might not have been
+/// replicated") for data the standby may lack. An idempotent retry settles the other outcomes.
+pub async fn commit_durable(
+    mut tx: sqlx::Transaction<'_, Postgres>,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query("SET LOCAL statement_timeout = 0")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
 fn parse_currency(code: &str, exponent: i16) -> Result<Currency> {
     Currency::new(code, exponent as u8).map_err(|e| StorageError::DataIntegrity(e.to_string()))
 }
@@ -79,6 +100,7 @@ impl PostgresLedger {
         Self {
             pool,
             currencies: Arc::new(RwLock::new(HashMap::new())),
+            system_accounts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -111,7 +133,7 @@ impl PostgresLedger {
     pub async fn open_account_owned(&self, account: &Account, owner: Option<Uuid>) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         self.open_account_owned_on(&mut tx, account, owner).await?;
-        tx.commit().await?;
+        commit_durable(tx).await?;
         Ok(())
     }
 
@@ -228,7 +250,10 @@ impl PostgresLedger {
         let owner: Option<Uuid> = row.try_get("owner_user_id")?;
         let account_type = parse_account_type(&type_str)?;
         let currency = parse_currency(&code, exponent)?;
-        Ok((owner, Self::orient(account_type, raw_minor, currency)))
+        Ok((
+            owner,
+            Self::orient(account_type, raw_minor as i128, currency),
+        ))
     }
 
     fn to_i64(amount: i128) -> Result<i64> {
@@ -251,10 +276,10 @@ impl PostgresLedger {
         }))
     }
 
-    fn orient(account_type: AccountType, raw_minor: i64, currency: Currency) -> Money {
+    fn orient(account_type: AccountType, raw_minor: i128, currency: Currency) -> Money {
         let oriented = match account_type.normal_side() {
-            NormalSide::Credit => raw_minor as i128,
-            NormalSide::Debit => -(raw_minor as i128),
+            NormalSide::Credit => raw_minor,
+            NormalSide::Debit => -raw_minor,
         };
         Money::from_minor(oriented, currency)
     }
@@ -267,7 +292,19 @@ impl PostgresLedger {
     ) -> Result<()> {
         txn.validate()?;
 
-        let mut db = conn.begin().await?;
+        // Every statement of a post (and of its guard and triggers) is a keyed lookup or write
+        // whose generic plan is the right one. In the default `auto` mode Postgres re-planned
+        // the array-parameter statements on every execution — their generic estimate assumes
+        // ten elements, so a custom plan always looked cheaper — which cost about a quarter of
+        // the database CPU of a post (crates/loadtest/README.md). One round trip with BEGIN;
+        // SET LOCAL ends with the transaction, so nothing leaks onto the pooled connection.
+        let nested = conn.is_in_transaction();
+        let mut db = if nested {
+            conn.begin().await?
+        } else {
+            conn.begin_with("BEGIN; SET LOCAL plan_cache_mode = force_generic_plan")
+                .await?
+        };
 
         let claim =
             sqlx::query("INSERT INTO transactions (id) VALUES ($1) ON CONFLICT (id) DO NOTHING")
@@ -276,6 +313,17 @@ impl PostgresLedger {
                 .await?;
         if claim.rows_affected() == 0 {
             return Err(LedgerError::DuplicateTransaction(txn.id).into());
+        }
+
+        // The guard runs before any wallet is locked: it serialises on rows of its own (a users
+        // row, a check, a deposit request), so a hot wallet — a merchant everyone pays — stays
+        // locked only for the write and the commit, not for every payer's guard. Lock order
+        // of a post: transactions row, guard rows, wallets (id order), system shards (sorted).
+        if let Some(guard) = opts.guard {
+            guard(&mut db).await.map_err(|e| match e {
+                HookError::Rejected { rule, message } => StorageError::Rejected { rule, message },
+                HookError::Database(e) => StorageError::Database(e),
+            })?;
         }
 
         let mut account_ids: Vec<Uuid> =
@@ -312,12 +360,22 @@ impl PostgresLedger {
             );
         }
 
-        let system_ids: Vec<Uuid> = account_ids
-            .iter()
-            .copied()
-            .filter(|id| !wallets.contains_key(id))
-            .collect();
-        let mut system: HashMap<Uuid, Currency> = HashMap::with_capacity(system_ids.len());
+        let mut system: HashMap<Uuid, Currency> = HashMap::new();
+        let mut system_ids: Vec<Uuid> = Vec::new();
+        {
+            let known = self
+                .system_accounts
+                .read()
+                .expect("system account cache poisoned");
+            for id in account_ids.iter().filter(|id| !wallets.contains_key(id)) {
+                match known.get(id) {
+                    Some(currency) => {
+                        system.insert(*id, *currency);
+                    }
+                    None => system_ids.push(*id),
+                }
+            }
+        }
         if !system_ids.is_empty() {
             let rows = sqlx::query(
                 "SELECT a.id, a.account_type, a.currency, c.exponent
@@ -345,24 +403,18 @@ impl PostgresLedger {
             }
         }
 
-        if let Some(guard) = opts.guard {
-            guard(&mut db).await.map_err(|e| match e {
-                HookError::Rejected { rule, message } => StorageError::Rejected { rule, message },
-                HookError::Database(e) => StorageError::Database(e),
-            })?;
-        }
-
-        let mut proposed: HashMap<Uuid, i64> =
-            wallets.iter().map(|(id, w)| (*id, w.raw_minor)).collect();
-        let mut deltas: HashMap<Uuid, i64> = system.keys().map(|id| (*id, 0)).collect();
-
+        // Net every account in i128 first, so whether a post overflows cannot depend on the
+        // order of its entries (a debit before the matching credit), then check and convert.
+        let overflow = || -> StorageError {
+            LedgerError::Money(money::MoneyError::Overflow { operation: "post" }).into()
+        };
+        let mut net: HashMap<Uuid, i128> = HashMap::with_capacity(account_ids.len());
         for entry in &txn.entries {
             let id = entry.account_id.as_uuid();
-            let signed = Self::to_i64(entry.signed_amount()?.minor_units())?;
-            let (account_currency, slot) = if let Some(w) = wallets.get(&id) {
-                (w.currency, proposed.get_mut(&id))
+            let account_currency = if let Some(w) = wallets.get(&id) {
+                w.currency
             } else if let Some(currency) = system.get(&id) {
-                (*currency, deltas.get_mut(&id))
+                *currency
             } else {
                 return Err(LedgerError::UnknownAccount(entry.account_id).into());
             };
@@ -374,26 +426,64 @@ impl PostgresLedger {
                 }
                 .into());
             }
-            let slot = slot.ok_or_else(|| StorageError::DataIntegrity("balance slot".into()))?;
-            *slot = slot.checked_add(signed).ok_or(LedgerError::Money(
-                money::MoneyError::Overflow { operation: "post" },
-            ))?;
+            let signed = entry.signed_amount()?.minor_units();
+            Self::to_i64(signed)?; // every entry must fit the entries column
+            let slot = net.entry(id).or_insert(0);
+            *slot = slot.checked_add(signed).ok_or_else(overflow)?;
         }
 
-        for (id, wallet) in &wallets {
-            if !wallet.account_type.allows_negative_balance() {
-                let oriented = Self::orient(wallet.account_type, proposed[id], wallet.currency);
-                if oriented.is_negative() {
-                    return Err(LedgerError::InsufficientFunds {
-                        account: AccountId(*id),
-                        balance_minor: wallet.raw_minor as i128,
-                        delta_minor: (proposed[id] - wallet.raw_minor) as i128,
-                    }
-                    .into());
+        // In id order, so the account an InsufficientFunds names does not depend on hash order.
+        let mut proposed: HashMap<Uuid, i64> = HashMap::with_capacity(wallets.len());
+        for id in &account_ids {
+            let Some(wallet) = wallets.get(id) else {
+                continue;
+            };
+            let delta = net.get(id).copied().unwrap_or(0);
+            let next = (wallet.raw_minor as i128)
+                .checked_add(delta)
+                .ok_or_else(overflow)?;
+            if !wallet.account_type.allows_negative_balance()
+                && Self::orient(wallet.account_type, next, wallet.currency).is_negative()
+            {
+                return Err(LedgerError::InsufficientFunds {
+                    account: AccountId(*id),
+                    balance_minor: wallet.raw_minor as i128,
+                    delta_minor: next - wallet.raw_minor as i128,
                 }
+                .into());
+            }
+            proposed.insert(*id, i64::try_from(next).map_err(|_| overflow())?);
+        }
+        let mut deltas: HashMap<Uuid, i64> = HashMap::with_capacity(system.len());
+        for id in system.keys() {
+            let delta = net.get(id).copied().unwrap_or(0);
+            deltas.insert(*id, i64::try_from(delta).map_err(|_| overflow())?);
+        }
+
+        // System-account deltas go last, in id order, as additive updates of rows nobody locked
+        // earlier, so each hot shard is held only from its update to the commit. The highest
+        // rides in the write statement itself — one round trip less while the wallets are
+        // locked; a transfer with a fee has exactly one — and any lower ones go just before it.
+        let mut system_order: Vec<(Uuid, i64)> =
+            deltas.into_iter().filter(|(_, d)| *d != 0).collect();
+        system_order.sort_unstable();
+        let last = system_order.pop();
+        for (id, delta) in system_order {
+            let updated = sqlx::query(
+                "UPDATE balances
+                 SET raw_minor = raw_minor + $2, version = version + 1, updated_at = now()
+                 WHERE account_id = $1",
+            )
+            .bind(id)
+            .bind(delta)
+            .execute(&mut *db)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(StorageError::DataIntegrity(format!(
+                    "system account {id} has no balance row"
+                )));
             }
         }
-
         {
             let n = txn.entries.len();
             let mut ids = Vec::with_capacity(n);
@@ -420,7 +510,9 @@ impl PostgresLedger {
                 ),
                 None => (None, None, None, None),
             };
-            sqlx::query(
+            // The last statement before COMMIT, so it also lifts statement_timeout for the COMMIT
+            // (see commit_durable) — not inside a caller's transaction, which it would outlive.
+            let (system_updated, _): (i64, Option<String>) = sqlx::query_as(
                 "WITH e AS (
                      INSERT INTO entries
                        (id, transaction_id, account_id, direction, amount_minor, currency)
@@ -432,14 +524,22 @@ impl PostgresLedger {
                      SET raw_minor = u.raw_minor, version = b.version + 1, updated_at = now()
                      FROM UNNEST($7::uuid[], $8::bigint[]) AS u(account_id, raw_minor)
                      WHERE b.account_id = u.account_id
+                 ), s AS (
+                     UPDATE balances
+                     SET raw_minor = raw_minor + $16, version = version + 1, updated_at = now()
+                     WHERE account_id = $15
+                     RETURNING 1
                  ), o AS (
                      INSERT INTO outbox (id, aggregate_id, event_type, payload)
                      VALUES ($9::uuid, $1, 'transaction.posted', $10::jsonb)
+                 ), i AS (
+                     INSERT INTO idempotency_keys (key, fingerprint, response_status, response_body)
+                     SELECT $11::uuid, $12::text, $13::int, $14::jsonb
+                     WHERE $11::uuid IS NOT NULL
+                     ON CONFLICT (key) DO NOTHING
                  )
-                 INSERT INTO idempotency_keys (key, fingerprint, response_status, response_body)
-                 SELECT $11::uuid, $12::text, $13::int, $14::jsonb
-                 WHERE $11::uuid IS NOT NULL
-                 ON CONFLICT (key) DO NOTHING",
+                 SELECT (SELECT count(*) FROM s),
+                        CASE WHEN $17 THEN set_config('statement_timeout', '0', true) END",
             )
             .bind(txn.id.as_uuid())
             .bind(&ids)
@@ -455,34 +555,30 @@ impl PostgresLedger {
             .bind(ifp)
             .bind(ist)
             .bind(ibody)
-            .execute(&mut *db)
+            .bind(last.map(|(id, _)| id))
+            .bind(last.map(|(_, d)| d))
+            .bind(!nested)
+            .fetch_one(&mut *db)
             .await?;
-        }
-
-        let mut system_order: Vec<Uuid> = deltas.keys().copied().collect();
-        system_order.sort_unstable();
-        for id in system_order {
-            let delta = deltas[&id];
-            if delta == 0 {
-                continue;
-            }
-            let updated = sqlx::query(
-                "UPDATE balances
-                 SET raw_minor = raw_minor + $2, version = version + 1, updated_at = now()
-                 WHERE account_id = $1",
-            )
-            .bind(id)
-            .bind(delta)
-            .execute(&mut *db)
-            .await?;
-            if updated.rows_affected() != 1 {
+            if let Some((id, _)) = last.filter(|_| system_updated != 1) {
                 return Err(StorageError::DataIntegrity(format!(
                     "system account {id} has no balance row"
                 )));
             }
         }
 
+        // The write statement already lifted statement_timeout for the COMMIT (commit_durable's
+        // rule, without its extra round trip); a savepoint leaves that to the caller's COMMIT.
         db.commit().await?;
+        // Only what a committed transaction read: never an account an enclosing transaction
+        // may still roll back.
+        if !nested && !system_ids.is_empty() {
+            let mut known = self
+                .system_accounts
+                .write()
+                .expect("system account cache poisoned");
+            known.extend(system_ids.iter().map(|id| (*id, system[id])));
+        }
         Ok(())
     }
 }

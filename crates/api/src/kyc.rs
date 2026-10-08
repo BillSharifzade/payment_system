@@ -202,7 +202,9 @@ pub async fn approve_kyc(
     )
     .await?;
 
-    tx.commit().await.map_err(StorageError::from)?;
+    storage::commit_durable(tx)
+        .await
+        .map_err(StorageError::from)?;
     Ok(Json(KycSubmissionResponse {
         id: submission_id,
         status: "approved".to_string(),
@@ -253,7 +255,9 @@ pub async fn reject_kyc(
         serde_json::json!({ "user_id": user_id, "reason": req.reason }),
     )
     .await?;
-    tx.commit().await.map_err(StorageError::from)?;
+    storage::commit_durable(tx)
+        .await
+        .map_err(StorageError::from)?;
     Ok(Json(KycSubmissionResponse {
         id: submission_id,
         status: "rejected".to_string(),

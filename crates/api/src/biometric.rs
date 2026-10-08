@@ -8,7 +8,7 @@ use biometric::{
     decide, Candidate, Decision, HttpMatcher, MatchPolicy, MatcherError, Template, TemplateCipher,
     DEFAULT_IDENTIFY_SCALE,
 };
-use ledger::{AccountId, AccountType, Entry, Transaction, TransactionId};
+use ledger::{AccountType, Transaction, TransactionId};
 use money::Money;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
@@ -20,7 +20,7 @@ use crate::common::{default_currency, idempotency_key, normalize_phone};
 use crate::config::{env_bool, env_or, env_or_file};
 use crate::devices::{self, DeviceKey, DeviceProof, MoneyMove, PaymentAuth};
 use crate::payments::{
-    aml_check, fee_shard, finish, lock_user, money_context, pre_screen, record, KeyState,
+    aml_check, finish, lock_user, money_context, payment_entries, pre_screen, record, KeyState,
     ScreenCtx, KEY_STATE_COLUMNS, KYC_LEVEL_FOR_TRANSFER,
 };
 use crate::session::AuthUser;
@@ -329,7 +329,7 @@ pub async fn enroll_fingerprint(
         .bind(req.quality)
         .fetch_one(&mut *tx)
         .await?;
-        tx.commit().await?;
+        storage::commit_durable(tx).await?;
         Ok::<_, sqlx::Error>((revoked, row))
     }
     .await;
@@ -898,35 +898,7 @@ async fn settle_check(
     let (tjs, limits) = pre_screen(&mut *conn, state, &ctx, &screen).await?;
 
     let amount = Money::from_minor(amount_minor as i128, currency);
-    let fee_minor = if currency.code() == "TJS" {
-        state.fees.fee_minor(amount_minor)
-    } else {
-        0
-    };
-    let entries = if fee_minor > 0 {
-        let to_merchant = amount_minor
-            .checked_sub(fee_minor)
-            .filter(|v| *v > 0)
-            .ok_or_else(|| ApiError::BadRequest("amount does not cover the fee".to_string()))?;
-        let fee_account = fee_shard(currency.code())
-            .ok_or_else(|| ApiError::Internal("no fee account for currency".to_string()))?;
-        vec![
-            Entry::debit(AccountId(payer_account), amount),
-            Entry::credit(
-                AccountId(merchant_account),
-                Money::from_minor(to_merchant as i128, currency),
-            ),
-            Entry::credit(
-                AccountId(fee_account),
-                Money::from_minor(fee_minor as i128, currency),
-            ),
-        ]
-    } else {
-        vec![
-            Entry::debit(AccountId(payer_account), amount),
-            Entry::credit(AccountId(merchant_account), amount),
-        ]
-    };
+    let entries = payment_entries(state.fees, payer_account, merchant_account, amount)?;
     let txn = Transaction::new(TransactionId(key), entries);
 
     let created = PayCheckResponse {
@@ -948,7 +920,7 @@ async fn settle_check(
     let aml_screen = screen.clone();
     let guard: PostHook = Box::new(move |conn: &mut PgConnection| {
         Box::pin(async move {
-            lock_user(conn, payer_id).await?;
+            let stored = lock_user(conn, payer_id).await?;
             let updated = sqlx::query(
                 "UPDATE checks
                  SET status = 'paid', payer_user_id = $2, payer_account = $3,
@@ -987,7 +959,7 @@ async fn settle_check(
                 .execute(&mut *conn)
                 .await?;
             }
-            aml_check(conn, &aml_screen, tjs, limits).await
+            aml_check(conn, &aml_screen, tjs, limits, stored).await
         })
     });
     let opts = PostOptions {

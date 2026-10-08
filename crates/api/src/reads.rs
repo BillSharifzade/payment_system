@@ -74,7 +74,9 @@ pub async fn create_wallet(
             (StatusCode::CREATED, id.as_uuid())
         }
     };
-    tx.commit().await.map_err(StorageError::from)?;
+    storage::commit_durable(tx)
+        .await
+        .map_err(StorageError::from)?;
     Ok((
         status,
         Json(AccountResponse {
@@ -118,23 +120,6 @@ pub async fn get_balance(
         currency: balance.currency().code().to_string(),
         display: balance.to_string(),
     }))
-}
-
-pub(crate) async fn ensure_owner(
-    state: &AppState,
-    account: AccountId,
-    user_id: Uuid,
-) -> ApiResult<()> {
-    match state.ledger.account_owner(account).await {
-        Ok(Some(owner)) if owner == user_id => Ok(()),
-        Ok(_) => Err(ApiError::Forbidden(
-            "you do not own this account".to_string(),
-        )),
-        Err(StorageError::Ledger(LedgerError::UnknownAccount(_))) => {
-            Err(ApiError::NotFound("account not found".to_string()))
-        }
-        Err(e) => Err(e.into()),
-    }
 }
 
 #[derive(Serialize)]
@@ -335,7 +320,6 @@ pub async fn list_account_transactions(
     Path(id): Path<Uuid>,
     Query(params): Query<StatementParams>,
 ) -> ApiResult<Json<StatementResponse>> {
-    ensure_owner(&state, AccountId(id), user_id).await?;
     let limit = params.limit.unwrap_or(50).clamp(1, 100);
     let cursor = match &params.cursor {
         None => None,
@@ -343,7 +327,7 @@ pub async fn list_account_transactions(
     };
 
     let base = "SELECT e.id, e.transaction_id, e.direction, e.amount_minor, e.currency,
-                       e.created_at::text AS ts,
+                       e.created_at, e.created_at::text AS ts,
                        (EXTRACT(EPOCH FROM e.created_at) * 1000)::BIGINT AS ms,
                        cp.account_type AS cp_type,
                        cp.owner_user_id AS cp_owner,
@@ -367,35 +351,57 @@ pub async fn list_account_transactions(
                     LIMIT 1
                 ) cp ON TRUE
                 WHERE e.account_id = $1";
+    // The ownership check rides in the same round trip: no row = no such account, one row
+    // with no entry = the owner's empty page or someone else's account.
+    let page = |after: &str| {
+        format!(
+            "SELECT a.owner_user_id AS owner, p.*
+             FROM accounts a
+             LEFT JOIN LATERAL ({base} AND a.owner_user_id = $3 {after}
+                                ORDER BY e.created_at DESC, e.id DESC LIMIT $2) p ON TRUE
+             WHERE a.id = $1
+             ORDER BY p.created_at DESC, p.id DESC"
+        )
+    };
     let rows = match &cursor {
         None => {
-            sqlx::query(&format!(
-                "{base} ORDER BY e.created_at DESC, e.id DESC LIMIT $2"
-            ))
-            .bind(id)
-            .bind(limit)
-            .fetch_all(state.ledger.pool())
-            .await
+            sqlx::query(&page(""))
+                .bind(id)
+                .bind(limit)
+                .bind(user_id)
+                .fetch_all(state.ledger.pool())
+                .await
         }
         Some((ts, eid)) => {
-            sqlx::query(&format!(
-                "{base} AND (e.created_at, e.id) < ($3::timestamptz, $4)
-                 ORDER BY e.created_at DESC, e.id DESC LIMIT $2"
-            ))
-            .bind(id)
-            .bind(limit)
-            .bind(ts)
-            .bind(eid)
-            .fetch_all(state.ledger.pool())
-            .await
+            sqlx::query(&page("AND (e.created_at, e.id) < ($4::timestamptz, $5)"))
+                .bind(id)
+                .bind(limit)
+                .bind(user_id)
+                .bind(ts)
+                .bind(eid)
+                .fetch_all(state.ledger.pool())
+                .await
         }
     }
     .map_err(cursor_db_error)?;
 
+    let owner: Option<Uuid> = rows
+        .first()
+        .ok_or_else(|| ApiError::NotFound("account not found".to_string()))?
+        .try_get("owner")
+        .map_err(StorageError::from)?;
+    if owner != Some(user_id) {
+        return Err(ApiError::Forbidden(
+            "you do not own this account".to_string(),
+        ));
+    }
     let mut entries = Vec::with_capacity(rows.len());
     let mut last: Option<(String, Uuid)> = None;
     for row in rows {
-        let entry_id: Uuid = row.try_get("id").map_err(StorageError::from)?;
+        let entry_id: Option<Uuid> = row.try_get("id").map_err(StorageError::from)?;
+        let Some(entry_id) = entry_id else {
+            continue;
+        };
         let ts: String = row.try_get("ts").map_err(StorageError::from)?;
         let direction: String = row.try_get("direction").map_err(StorageError::from)?;
         let cp_type: Option<String> = row.try_get("cp_type").map_err(StorageError::from)?;
