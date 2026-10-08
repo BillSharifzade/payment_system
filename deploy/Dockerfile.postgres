@@ -1,10 +1,10 @@
 # Postgres + pgBackRest, used ONLY by the opt-in WAL-archiving overlay
 # (docker-compose.wal-archive.yml). archive_command runs inside the database
-# container, so the backup tool has to live in the same image. Same base tag
-# as the plain `postgres` service; bump both together.
+# container, so the backup tool has to live in the same image. Same base image
+# (tag AND digest) as the plain `postgres` service; bump both together.
 #
 #   docker build -f deploy/Dockerfile.postgres -t payment-postgres:<tag> deploy
-FROM postgres:16.15
+FROM postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pgbackrest \
     && rm -rf /var/lib/apt/lists/* \

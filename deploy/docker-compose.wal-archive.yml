@@ -3,16 +3,19 @@
 # "the last nightly dump". Layered on top of the prod (or lan) file:
 #
 #   1. cp pgbackrest/pgbackrest.conf.example secrets/pgbackrest.conf
-#      edit the CHANGE_ME lines (bucket, keys, cipher pass); chmod 644 secrets/pgbackrest.conf
-#   2. COMPOSE_FILE=docker-compose.prod.yml:docker-compose.wal-archive.yml  (in deploy/.env)
+#      edit the CHANGE_ME lines (bucket, keys, cipher pass); deploy.sh sets its
+#      permissions (0640, group SECRETS_GID) like every other secret.
+#   2. COMPOSE_FILE=docker-compose.prod.yml:docker-compose.wal-archive.yml  (in deploy/.env;
+#      add :docker-compose.monitoring.yml to get the WalArchiveFailing/Stale alerts)
 #   3. ./deploy.sh                   builds payment-postgres (postgres + pgbackrest)
 #                                    and restarts postgres with archive_mode=on
-#   4. docker compose exec -u postgres postgres pgbackrest --stanza=payment stanza-create
-#      docker compose exec -u postgres postgres pgbackrest --stanza=payment check
+#   4. docker compose exec postgres pgbackrest --stanza=payment stanza-create
+#      docker compose exec postgres pgbackrest --stanza=payment check
 #   5. schedule base backups from the host crontab (see deploy/README.md):
-#      0 3 * * 0   cd ~/payment_system/deploy && docker compose exec -T -u postgres postgres pgbackrest --stanza=payment --type=full backup
-#      0 3 * * 1-6 cd ~/payment_system/deploy && docker compose exec -T -u postgres postgres pgbackrest --stanza=payment --type=diff backup
+#      0 3 * * 0   cd ~/payment_system/deploy && docker compose exec -T postgres pgbackrest --stanza=payment --type=full backup
+#      0 3 * * 1-6 cd ~/payment_system/deploy && docker compose exec -T postgres pgbackrest --stanza=payment --type=diff backup
 #
+# (The postgres container already runs as the postgres user, so no `-u postgres`.)
 # The nightly logical dumps keep running: they are the simple, tool-free
 # fallback and what restore-drill.sh exercises.
 services:
@@ -40,6 +43,10 @@ services:
       - -c
       - log_lock_waits=on
       - -c
+      - log_connections=off
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
       - shared_preload_libraries=pg_stat_statements
       - -c
       - synchronous_commit=on
@@ -56,12 +63,20 @@ services:
       - archive_timeout=300
     secrets:
       - postgres_password
+      - pg_owner_password
+      - pg_app_password
+      - pg_backup_password
+      - pg_monitor_password
       - source: pgbackrest_conf
         target: /etc/pgbackrest/pgbackrest.conf
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./postgres:/docker-entrypoint-initdb.d:ro
       - pgbackrest_spool:/var/spool/pgbackrest
       - pgbackrest_log:/var/log/pgbackrest
+    # archive-push talks to the off-box bucket: the database container needs
+    # egress in this overlay (the backend network itself has none).
+    networks: [backend, egress]
 
 secrets:
   pgbackrest_conf:

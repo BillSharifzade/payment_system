@@ -18,7 +18,9 @@
 #   docker build -f deploy/Dockerfile -t payment-system:<tag> .
 
 # ---- chef ---------------------------------------------------------------
-FROM rust:1.98-bookworm AS chef
+# Base images are pinned by digest (the tag is for humans). Refresh both with
+# scripts/image-digest.sh <image:tag> when bumping.
+FROM rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS chef
 WORKDIR /build
 # The repo pins its toolchain in rust-toolchain.toml (channel "1.98"). Copy it
 # in and let rustup install exactly that channel up front, in its own cached
@@ -52,7 +54,7 @@ RUN cargo build --release --locked --bin payment-server --bin payment-workers \
     && cp target/release/payment-server target/release/payment-workers /out/
 
 # ---- runtime ------------------------------------------------------------
-FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
 COPY --from=builder /out/payment-server  /usr/local/bin/payment-server
 COPY --from=builder /out/payment-workers /usr/local/bin/payment-workers
 # Pre-create the KYC document directory owned by nonroot (uid/gid 65532). Docker

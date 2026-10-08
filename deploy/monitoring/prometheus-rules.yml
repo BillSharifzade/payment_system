@@ -1,6 +1,24 @@
 # Prometheus alert rules for the payment stack. Metric names are the ones the
-# binaries export on METRICS_ADDR (see deploy/README.md "Metrics").
+# binaries export on METRICS_ADDR (crates/api/src/middleware.rs, session.rs,
+# crates/workers/src/main.rs), node-exporter, postgres-exporter and the backup
+# sidecars' textfile metrics (deploy/backup/backup-lib.sh).
+# Unit tests: deploy/monitoring/tests/prometheus-rules.test.yml
+#   (promtool test rules deploy/monitoring/tests/prometheus-rules.test.yml)
 groups:
+  # ---- dead man's switch -----------------------------------------------------
+  - name: meta
+    rules:
+      - alert: Watchdog
+        # Always firing. Alertmanager routes it ONLY to ALERT_HEARTBEAT_URL,
+        # every minute; the external service pages when the pings stop (the
+        # box, Docker, Prometheus or Alertmanager is down, or the box lost its
+        # network). Never silence it.
+        expr: vector(1)
+        labels:
+          severity: none
+        annotations:
+          summary: "Watchdog: the alerting pipeline is alive"
+
   - name: payment-api
     rules:
       - alert: HttpErrorRateHigh
@@ -16,6 +34,38 @@ groups:
         annotations:
           summary: "API 5xx rate above 1% for 5 minutes"
           description: "{{ $value | humanizePercentage }} of requests are failing. Check payment-server logs and /ready."
+
+      - alert: HttpLatencyHigh
+        # Mean over all routes (works whether the exporter renders the
+        # duration as a summary or a histogram).
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_sum{job="payment-server"}[5m]))
+            /
+            sum(rate(http_request_duration_seconds_count{job="payment-server"}[5m]))
+          ) > 0.5
+          and sum(rate(http_request_duration_seconds_count{job="payment-server"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mean API latency above 500 ms for 10 minutes"
+          description: "Mean request duration {{ $value | humanizeDuration }}. Look at slow queries (log_min_duration_statement), lock waits, DbPoolExhausted."
+
+      - alert: HttpLatencyP99High
+        # metrics-exporter-prometheus renders histograms as summaries by
+        # default (quantile label). Routes that are slow by design are
+        # excluded: password hashing, document upload, the fingerprint matcher.
+        expr: |
+          max by (route) (
+            http_request_duration_seconds{job="payment-server", quantile="0.99",
+              route!~"/v1/auth/(login|register)|/v1/kyc/documents|/v1/checks/\\{id\\}/pay/fingerprint|/v1/biometric/fingerprints"}
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 latency of {{ $labels.route }} above 2 s for 10 minutes"
 
       - alert: DbPoolExhausted
         expr: db_pool_idle{job="payment-server"} == 0
@@ -33,6 +83,36 @@ groups:
         annotations:
           summary: "Requests hit REQUEST_TIMEOUT_SECS in the last 10 minutes"
 
+  - name: payment-security
+    rules:
+      - alert: RefreshTokenReuseSpike
+        # A revoked refresh token presented again revokes the user's whole
+        # session family (session.rs, outcome="replay"). A handful a day is
+        # flaky clients; a burst is stolen tokens being tried.
+        expr: sum(increase(auth_refresh_total{job="payment-server", outcome="replay"}[15m])) > 10
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} refresh-token replays in 15 minutes"
+          description: "Revoked refresh tokens are being re-presented (possible token theft). grep 'revoked refresh token replayed' in the payment-server logs for the user ids."
+
+      - alert: LargeDeposit
+        # Threshold in minor units: 10,000,000 = 100,000 TJS (DEPOSIT_MAX_MINOR
+        # defaults to 10x that). Tune it to what is unusual for your float.
+        expr: max(payment_deposits_max_minor_15m) > 10000000
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unusually large deposit: {{ $value | printf \"%.0f\" }} minor units in one posting"
+          description: "A single deposit above the alert threshold was posted in the last 15 minutes. Check admin_actions for who requested and who approved it."
+
+      - alert: DepositVolumeHigh
+        expr: max(payment_deposits_sum_minor_15m) > 50000000
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} minor units deposited in 15 minutes"
+
   - name: payment-workers
     rules:
       - alert: OutboxRelayLagging
@@ -44,14 +124,80 @@ groups:
           summary: "Oldest unsent outbox event is older than 60 s"
           description: "The outbox -> NATS relay is behind ({{ $value | humanizeDuration }}). Is NATS healthy? `docker compose logs payment-workers`."
 
+      # Several worker replicas may run; one holds the leader lock (advisory
+      # lock) and does the sealing/verification/reconciliation. Its gauges are
+      # the truth — a replica that lost leadership keeps exporting stale values,
+      # hence the `and on (instance) worker_leader == 1` joins below.
+      - alert: WorkerNoLeader
+        expr: sum(worker_leader) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No payment-workers replica holds the leader lock"
+          description: "Nothing is sealing, verifying or reconciling. `docker compose logs payment-workers` (lost the lock? database unreachable?)."
+
+      - alert: WorkerSplitBrain
+        # The advisory lock makes this impossible on a session-mode connection;
+        # seeing it means DATABASE_URL goes through a transaction-mode pooler.
+        expr: sum(worker_leader) > 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} payment-workers replicas believe they are the leader"
+          description: "Workers' DATABASE_URL must be a direct/session-mode connection (never transaction-mode pgbouncer): concurrent sealers would fork the checkpoint chain."
+
+      # Replaces the old log-based NoCheckpointsSealed (which fired on every
+      # idle ledger): what matters is how old the oldest UNSEALED transaction
+      # is. An idle ledger has none (age 0) and stays quiet.
+      - alert: UnsealedBacklogAging
+        expr: max(ledger_oldest_unsealed_age_seconds and on (instance) (worker_leader == 1)) > 120
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A transaction has waited more than 2 minutes for its checkpoint seal"
+          description: "Oldest unsealed transaction: {{ $value | humanizeDuration }}; {{ with query \"max(ledger_unsealed_transactions and on (instance) (worker_leader == 1))\" }}{{ . | first | value }}{{ end }} unsealed. The sealer runs every WORKER_INTERVAL_SECS; check `docker compose logs payment-workers`."
+
       - alert: LedgerSealingLagging
-        expr: ledger_oldest_unsealed_age_seconds > 300
+        expr: max(ledger_oldest_unsealed_age_seconds and on (instance) (worker_leader == 1)) > 300
         for: 1m
         labels:
           severity: critical
         annotations:
           summary: "Transactions unsealed for more than 5 minutes"
           description: "The checkpoint sealer is not keeping up or is down (oldest unsealed: {{ $value | humanizeDuration }}). Tamper-evidence coverage is lagging."
+
+      - alert: WorkerMetricsMissing
+        # The leader publishes the backlog gauge every tick; its absence means
+        # no worker is running or leading (MetricsTargetDown covers a dead target).
+        expr: absent(ledger_oldest_unsealed_age_seconds)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "payment-workers export no sealing metrics"
+
+      - alert: ChainFullVerificationStale
+        # A full re-verification from genesis runs every VERIFY_FULL_EVERY_SECS
+        # (default 6 h); two missed runs is a stuck or failing verifier.
+        expr: time() - max(ledger_chain_full_verified_timestamp_seconds) > 13 * 3600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No full checkpoint-chain verification for {{ $value | humanizeDuration }}"
+
+      - alert: ReconciliationFullStale
+        # Full re-derivation of every balance every RECONCILE_FULL_EVERY_SECS
+        # (default 24 h).
+        expr: time() - max(reconciliation_full_timestamp_seconds) > 49 * 3600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No full reconciliation for {{ $value | humanizeDuration }}"
 
       - alert: WorkerErrors
         expr: increase(worker_errors_total[10m]) > 0
@@ -62,7 +208,7 @@ groups:
           description: "{{ $value }} error(s) in 10 minutes for duty {{ $labels.duty }}."
 
       - alert: ReconciliationUnhealthy
-        expr: reconciliation_healthy == 0
+        expr: (reconciliation_healthy and on (instance) (worker_leader == 1)) == 0
         labels:
           severity: critical
         annotations:
@@ -70,17 +216,141 @@ groups:
           description: "Balances do not sum to zero or do not match their entries. Page a human; see RECONCILIATION FAILED in the worker logs."
 
       - alert: LedgerChainBroken
-        expr: ledger_chain_verified == 0
+        expr: (ledger_chain_verified and on (instance) (worker_leader == 1)) == 0
         labels:
           severity: critical
         annotations:
           summary: "Checkpoint chain verification FAILED"
           description: "A signed checkpoint no longer verifies — possible tampering. Preserve the database and logs before doing anything else."
 
+  - name: payment-backups
+    rules:
+      - alert: BackupStale
+        # Daily schedule + slack. The sidecar's healthcheck turns unhealthy at
+        # the same age; this pages.
+        expr: time() - payment_backup_last_success_timestamp_seconds > 26 * 3600
+        labels:
+          severity: critical
+        annotations:
+          summary: "No successful {{ $labels.kind }} backup for {{ $value | humanizeDuration }}"
+          description: "`docker compose logs {{ if eq $labels.kind \"db\" }}postgres-backup{{ else }}kyc-backup{{ end }}`. Until fixed, the newest restore point keeps ageing."
+
+      - alert: BackupMetricsMissing
+        expr: absent(payment_backup_last_success_timestamp_seconds{kind="db"}) or absent(payment_backup_last_success_timestamp_seconds{kind="kyc"})
+        for: 2h
+        labels:
+          severity: critical
+        annotations:
+          summary: "No backup has ever reported success (or node-exporter cannot read the backup metrics)"
+
+      - alert: BackupFailed
+        expr: payment_backup_last_status == 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The last {{ $labels.kind }} backup attempt FAILED"
+          description: "The sidecar retries hourly; BackupStale fires if no attempt succeeds within 26 h."
+
+      - alert: BackupOffsiteBehind
+        # With an off-box target configured, every successful backup is copied
+        # right after it is written. Fires when the newest local backup has no
+        # off-box copy (failed copy, or never copied since the target was set).
+        expr: |
+          (payment_backup_offsite_enabled == 1)
+          unless on (kind)
+          (payment_backup_offsite_last_success_timestamp_seconds
+             >= on (kind) (payment_backup_last_success_timestamp_seconds - 600))
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "The newest {{ $labels.kind }} backup has not reached the off-box target"
+          description: "A backup on the same disk as the database is not a backup. `docker compose logs {{ if eq $labels.kind \"db\" }}postgres-backup{{ else }}kyc-backup{{ end }}` (rclone errors), check secrets/backup_rclone_conf."
+
+      - alert: NodeTextfileScrapeError
+        expr: node_textfile_scrape_error == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "node-exporter cannot parse the backup metrics files"
+
+  - name: payment-host
+    rules:
+      - alert: DiskSpaceLow
+        expr: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|nsfs|ramfs|fuse.*", mountpoint!~"/boot.*"}
+          / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|nsfs|ramfs|fuse.*", mountpoint!~"/boot.*"}
+          < 0.15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.mountpoint }}: only {{ $value | humanizePercentage }} free"
+          description: "Postgres, the backups and the logs share this box. Prune old images (docker image prune), check the backups volume and the Loki/Prometheus retention."
+
+      - alert: DiskSpaceCritical
+        expr: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|nsfs|ramfs|fuse.*", mountpoint!~"/boot.*"}
+          / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|nsfs|ramfs|fuse.*", mountpoint!~"/boot.*"}
+          < 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.mountpoint }}: only {{ $value | humanizePercentage }} free — Postgres stops accepting writes when it fills"
+
+      - alert: DiskWillFillIn24h
+        expr: |
+          predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|nsfs|ramfs|fuse.*", mountpoint!~"/boot.*"}[6h], 24 * 3600) < 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.mountpoint }} will be full within 24 h at the current rate"
+
+      - alert: HostMemoryLow
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.08
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Only {{ $value | humanizePercentage }} of memory available"
+
+  - name: payment-postgres
+    rules:
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "postgres-exporter cannot reach the database"
+
+      - alert: WalArchiveFailing
+        # Only meaningful with docker-compose.wal-archive.yml (archive_mode=on);
+        # without it the counters stay 0.
+        expr: increase(pg_stat_archiver_failed_count[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "WAL archiving to the off-box repository is failing"
+          description: "pgBackRest archive-push errors. Point-in-time recovery is degrading and pg_wal grows until the disk fills. `docker compose exec -u postgres postgres pgbackrest --stanza=payment check`."
+
+      - alert: WalArchiveStale
+        # archive_timeout=300 forces a segment at least every 5 minutes, so no
+        # successful archive for 15 minutes means it is stuck.
+        expr: pg_stat_archiver_last_archive_age > 900 and pg_stat_archiver_archived_count > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No WAL segment archived for {{ $value | humanizeDuration }}"
+
   - name: payment-targets
     rules:
       - alert: MetricsTargetDown
-        expr: up{job=~"payment-server|payment-workers"} == 0
+        expr: up{job=~"payment-server|payment-workers|node|postgres"} == 0
         for: 2m
         labels:
           severity: critical
