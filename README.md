@@ -11,7 +11,10 @@ for the clients, and [`deploy/README.md`](./deploy/README.md) to run it in produ
 |---|---|
 | `crates/money` | Currency-safe integer money. No floats, ever. *(pure)* |
 | `crates/ledger` | Double-entry core: accounts, transactions, balancing and conservation invariants. *(pure)* |
-| `crates/storage` | `PostgresLedger` — durable, row-locked, concurrency-safe posting (five round trips per transfer). |
+| `crates/storage` | `PostgresLedger` — durable, row-locked, concurrency-safe posting (BEGIN, claim, guard, wallet locks, one write statement, COMMIT). |
+| `crates/ledger-tigerbeetle` | Hybrid TigerBeetle backend (reserve in TigerBeetle, guards + journal in Postgres, post), crash-recovery protocol, benchmark. |
+| `crates/loadtest` | `payment-loadtest`: load generator (HTTP or in process) with post-run ledger verification; A/B runner `matrix.sh`. |
+| `fuzz/` | 14 property-checking cargo-fuzz targets (nightly; `fuzz/run.sh`). |
 | `crates/auth` | Argon2id passwords, JWT access tokens, hashed rotating refresh tokens. *(pure)* |
 | `crates/crypto` | SHA-256 Merkle trees + Ed25519 for tamper-evident checkpoints. *(pure)* |
 | `crates/biometric` | Fingerprint payments: template validation, AES-GCM sealing, match-decision policy, HTTP adapter to a matching engine. *(pure)* |
@@ -116,6 +119,10 @@ export REDIS_URL=redis://localhost:6379 NATS_URL=nats://localhost:4222
 cargo test -p storage -- --ignored
 cargo test -p api -- --ignored
 cargo test -p workers -- --ignored --test-threads=1
+
+# Load test with post-run ledger verification (crates/loadtest/README.md).
+cargo build --release -p api -p loadtest && target/release/payment-loadtest \
+  --database-url "$DATABASE_URL" --server-bin target/release/payment-server --workload mixed --duration 30s
 
 # Lint gate used in CI.
 cargo fmt --all -- --check

@@ -138,6 +138,8 @@ Locking only the specific account rows means unrelated accounts proceed fully in
 
 > **Alternative considered (TigerBeetle-style):** a dedicated single-threaded, in-memory accounting state machine that processes transfers from a queue at ~1M/s with no locks because there's only one writer. Phenomenal throughput and correctness, but it's a separate system to operate. **Plan: start with Postgres row-locking (simpler, one system). Abstract the ledger behind a `LedgerEngine` trait so we can swap in TigerBeetle later if throughput demands it — without rewriting business logic.** See §15.
 
+*As built (perf pass, 2026-10).* A post takes its locks in one global order: the `transactions` row (idempotency claim), the guard's rows (the payer's `users` row `FOR NO KEY UPDATE`, a check or deposit-request row), the wallets (`FOR UPDATE`, id order), then the system-account shards (64 per system account) as additive updates in id order. The guard runs before any wallet is locked, so a wallet everyone pays is held only for the write and the commit. Locking credit-only wallets after the debited ones was rejected: two users paying each other deadlock (`crates/api/tests/lock_order.rs` catches it in seconds). `post_on` plans generically and folds the last system delta and the `statement_timeout` lift into its single write statement: BEGIN, claim, guard, wallet locks, write, COMMIT. Measured with `payment-loadtest` (4 vCPU, shared box, medians of interleaved runs): +24 % uniform, **+47 % hot merchant** (p99 517 → 293 ms), **+92 % single-payer contention**; `synchronous_commit` stays `on` — batching commits was measured to gain at most 3.6–5.8 % and not built.
+
 ### 5.3 Idempotency (retries must never double-charge)
 - Every state-changing endpoint requires a client-supplied **`Idempotency-Key`** (UUID).
 - We store `(idempotency_key → request_hash, response, status)` in a dedicated table.
@@ -518,7 +520,7 @@ You said "extremely fast." The fastest correct path is worth naming explicitly:
 But we still build behind a `LedgerEngine` trait, and we still start on Postgres, for one blunt reason: **the launch bottleneck is never the ledger's TPS — it's auth, KYC, network round-trips, and ops maturity.** TigerBeetle only does accounting; it does *not* store users, KYC, metadata, idempotency records, or the outbox — all of that lives in Postgres regardless. Running TigerBeetle's consensus cluster *and* Postgres *and* Redis *and* NATS on day one, before a single real user, is a lot of moving parts to operate.
 
 So:
-1. **Phase 1: `PostgresLedger`** — double-entry, row-locked, in the Postgres we already need. One fewer datastore to operate while we prove correctness and ship the product. Comfortably handles thousands of TPS — far beyond early Tajik volume.
+1. **Phase 1: `PostgresLedger`** — double-entry, row-locked, in the Postgres we already need. One fewer datastore to operate while we prove correctness and ship the product. Comfortably handles thousands of TPS — far beyond early Tajik volume. Measured and reproducible with `payment-loadtest` (`crates/loadtest/README.md`).
 2. **Phase 2: `TigerBeetleLedger`** — swap the hot accounting path to a TigerBeetle cluster once real load (or load tests) justify the extra operational surface. Postgres stays for everything non-accounting.
    *As built (`crates/ledger-tigerbeetle`, migration 0033):* `HybridLedger::post_on` has the same signature and guards as `PostgresLedger::post_on`. TigerBeetle reserves funds with a **linked chain of pending transfers** and enforces no-overdraft itself (`debits_must_not_exceed_credits`); one Postgres transaction then claims the id, records the intent (`tb_intents`), runs the posting guards under their row locks (per-user AML stays exact — proven: 14 of 40 concurrent payments post against the limit, 36 without the lock) and writes the journal mirror, idempotency record and outbox. **That COMMIT is the commit point**; the reservation is then posted under ids derived from the transaction id, so a transaction posts at most once. Recovery settles abandoned reservations through a `void` tombstone that serialises with an in-flight commit on the intent's key; pending timeouts are only a backstop. Every crash point is covered by a fault-injection matrix, plus differentials against `InMemoryLedger` and code-for-code fidelity tests against live TigerBeetle 0.17.9 and 0.16.78. System accounts need no sharding in TigerBeetle (one core applies whole batches without locks). **Measured (noisy shared box):** the guarded hybrid is bounded by its Postgres step — about 1.5× `PostgresLedger` at best and **≈5× under a single hot recipient** (no balance-row locks: 1 009 vs 212 ops/s, Postgres p99 835 ms) — but adds two TigerBeetle round trips of latency, so plain transfers at low concurrency are slower. TigerBeetle's own throughput (the `direct` path) needs the guards out of the per-transfer path: per-user limit accounts with 24 h pending debits, check/deposit transitions as transfers with derived ids, audit/outbox from TigerBeetle's change stream — designed, not built. Client: `tigerbeetle-unofficial` (the official Rust client is not on crates.io yet) behind a trait, so switching is one adapter.
 
@@ -799,9 +801,13 @@ terminal app itself.
 - **AML per person, not per wallet.** The rolling 24 h amount and hourly velocity sum
   every wallet the user owns (converted to TJS at the current rate; a wallet with
   recent debits and no rate fails closed). Exactness under concurrency: inside the
-  posting transaction, after wallet locks, the guard takes the user's row
-  `FOR NO KEY UPDATE`. Lock order is wallets (sorted) → one user row → system shards,
-  so it cannot deadlock. One wallet per currency per user (`POST /v1/wallets` returns
+  posting transaction, before any wallet is locked, the guard takes the user's row
+  `FOR NO KEY UPDATE`. Lock order is transactions row → user row → wallets (sorted) →
+  system shards (sorted), so it cannot deadlock. From 64 debits in a day a user's
+  per-currency window is stored in `aml_windows` (migration 0030): a running (sum, count)
+  with movable edges, kept current by a statement trigger on `entries`, so the decision
+  equals the full sum at O(1) cost (`crates/api/tests/aml_windows.rs` proves it, under
+  concurrency too); lighter users keep the full sum. One wallet per currency per user (`POST /v1/wallets` returns
   the existing one).
 - **Recipients** whose user status is not `active` cannot be paid
   (`403 recipient_unavailable`). Registration creates user, wallet and session in one

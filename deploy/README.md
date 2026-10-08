@@ -178,6 +178,13 @@ Migrations are forward-only: roll back the app only to a build whose schema
 version the database already has. The pre-deploy dump in
 `/backups/db/pre-deploy/` is the restore point taken just before the rollout.
 
+**Mixed versions during a rolling deploy across migrations 0029/0030:** older
+servers lock a payer's wallets before the user row, newer ones the user row
+first. While both run, a payer's concurrent posts can deadlock; Postgres aborts
+one, the client gets `503 retry_later`, and its idempotent retry succeeds. The
+AML window trigger counts every debit whichever version wrote it. Prefer a short
+stop-start for that one upgrade if your clients do not retry.
+
 ## Settings
 
 - `deploy/.env` — compose-level: `COMPOSE_FILE` (base file + overlays),
@@ -657,4 +664,5 @@ This layout maps 1:1 onto the DESIGN.md §12 target:
 4. **Scale writes** only if needed: `crates/ledger-tigerbeetle` (the hybrid
    TigerBeetle backend, DESIGN.md §15) relieves hot accounts — it needs no
    balance-row locks — but stays bounded by its per-transfer Postgres step; see
-   its measurements before switching.
+   its measurements before switching. How many transfers one box does depends on the box:
+   measure it with `payment-loadtest` (`crates/loadtest/README.md`) before sizing.
