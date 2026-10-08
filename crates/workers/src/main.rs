@@ -301,7 +301,11 @@ async fn main() -> Result<(), BoxError> {
         Some(url) => {
             let prefix = std::env::var("NATS_SUBJECT_PREFIX").unwrap_or_else(|_| "payments".into());
             let publisher = NatsPublisher::connect(&url, &prefix).await?;
-            tracing::info!(%url, stream = publisher.stream(), "publishing events to NATS JetStream");
+            tracing::info!(
+                url = %NatsPublisher::redacted(&url),
+                stream = publisher.stream(),
+                "publishing events to NATS JetStream"
+            );
             run(cfg, publisher).await
         }
         None if is_prod() => Err("NATS_URL must be set when APP_ENV != dev".into()),

@@ -746,7 +746,13 @@ async fn nats_publisher_delivers_events() {
     let prefix = format!("test-{}", Uuid::new_v4().simple());
     let subject = format!("{prefix}.transaction.posted");
 
-    let client = async_nats::connect(&nats_url).await.unwrap();
+    // Like the relay, pass any `user:pass@` from the URL explicitly (async-nats ignores it).
+    let addr: async_nats::ServerAddr = nats_url.parse().unwrap();
+    let mut opts = async_nats::ConnectOptions::new();
+    if let (Some(user), Some(pass)) = (addr.username(), addr.password()) {
+        opts = opts.user_and_password(user.to_string(), pass.to_string());
+    }
+    let client = opts.connect(addr).await.unwrap();
     let mut sub = client.subscribe(subject).await.unwrap();
     client.flush().await.unwrap();
 
