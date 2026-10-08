@@ -136,6 +136,27 @@ class PendingPaymentTest {
     }
 
     @Test
+    fun `a settled payment is never re-adopted from a leftover legacy copy`() {
+        val kv = MemoryKv()
+        val legacyJson =
+            """{"idempotency_key":"old","from_account":"a","to_account":"b","amount_minor":5,"currency":"TJS","recipient_label":"x"}"""
+        val store = KeyValuePendingPaymentStore(kv)
+        // An adoption interrupted after writing alice's slot, before removing the legacy copy.
+        kv.map[KeyValuePendingPaymentStore.LEGACY_KEY] = legacyJson
+        store.save(payment("old", "alice"))
+
+        store.clear("alice", "old")
+        assertNull(store.load("alice"))
+        assertNull(kv.map[KeyValuePendingPaymentStore.LEGACY_KEY])
+
+        // A legacy record with a DIFFERENT key is not touched by clearing another payment.
+        kv.map[KeyValuePendingPaymentStore.LEGACY_KEY] = legacyJson
+        store.save(payment("new", "bob"))
+        store.clear("bob", "new")
+        assertEquals(legacyJson, kv.map[KeyValuePendingPaymentStore.LEGACY_KEY])
+    }
+
+    @Test
     fun `an unreadable record is dropped once with a one-time notice`() {
         val kv = MemoryKv()
         kv.map[KeyValuePendingPaymentStore.keyFor("alice")] = "{not json"

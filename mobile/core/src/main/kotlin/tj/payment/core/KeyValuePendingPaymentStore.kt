@@ -68,10 +68,17 @@ class KeyValuePendingPaymentStore(private val kv: SecureKeyValue) : PendingPayme
 
     override fun clear(userId: String, idempotencyKey: String) {
         val key = keyFor(userId)
-        val raw = kv.get(key) ?: return
-        val record = decodeOrDrop(key, raw) ?: return
-        // Never clear a NEWER record that replaced the one being settled.
-        if (record.idempotencyKey == idempotencyKey) kv.remove(key)
+        kv.get(key)?.let { raw ->
+            val record = decodeOrDrop(key, raw)
+            // Never clear a NEWER record that replaced the one being settled.
+            if (record != null && record.idempotencyKey == idempotencyKey) kv.remove(key)
+        }
+        // A legacy copy of the same payment (an adoption interrupted between
+        // its two writes) must not be adopted again once the payment settled.
+        kv.get(LEGACY_KEY)?.let { raw ->
+            val legacy = decodeOrDrop(LEGACY_KEY, raw)
+            if (legacy != null && legacy.idempotencyKey == idempotencyKey) kv.remove(LEGACY_KEY)
+        }
     }
 
     /**
