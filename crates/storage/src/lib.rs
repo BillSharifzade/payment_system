@@ -115,6 +115,18 @@ impl PostgresLedger {
 
     pub async fn open_account_owned(&self, account: &Account, owner: Option<Uuid>) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        self.open_account_owned_on(&mut tx, account, owner).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // The caller owns the transaction, so an account can be created atomically with its owner.
+    pub async fn open_account_owned_on(
+        &self,
+        conn: &mut PgConnection,
+        account: &Account,
+        owner: Option<Uuid>,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT INTO accounts (id, account_type, currency, owner_user_id)
              VALUES ($1, $2, $3, $4)
@@ -124,7 +136,7 @@ impl PostgresLedger {
         .bind(account.account_type.as_db_str())
         .bind(account.currency.code())
         .bind(owner)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         let min_raw: Option<i64> = if account.allows_negative_balance() {
@@ -139,10 +151,8 @@ impl PostgresLedger {
         )
         .bind(account.id.as_uuid())
         .bind(min_raw)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-
-        tx.commit().await?;
         Ok(())
     }
 

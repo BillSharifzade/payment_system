@@ -343,6 +343,7 @@ pub struct AdminUserResponse {
     is_admin: bool,
     created_at_ms: i64,
     blocked_reason: Option<String>,
+    full_name: Option<String>,
     wallets: Vec<WalletResponse>,
 }
 
@@ -357,8 +358,14 @@ pub async fn admin_user_lookup(
     let row = sqlx::query(
         "SELECT u.id, u.phone, u.status, u.kyc_level, u.is_admin,
                 (EXTRACT(EPOCH FROM u.created_at) * 1000)::BIGINT AS ms,
-                b.reason AS blocked_reason
-         FROM users u LEFT JOIN blocked_users b ON b.user_id = u.id
+                b.reason AS blocked_reason, k.full_name
+         FROM users u
+         LEFT JOIN blocked_users b ON b.user_id = u.id
+         LEFT JOIN LATERAL (
+             SELECT full_name FROM kyc_submissions
+             WHERE user_id = u.id AND status = 'approved'
+             ORDER BY reviewed_at DESC NULLS LAST, created_at DESC LIMIT 1
+         ) k ON TRUE
          WHERE u.phone = $1",
     )
     .bind(&phone)
@@ -376,6 +383,7 @@ pub async fn admin_user_lookup(
         is_admin: row.try_get("is_admin").map_err(StorageError::from)?,
         created_at_ms: row.try_get("ms").map_err(StorageError::from)?,
         blocked_reason: row.try_get("blocked_reason").map_err(StorageError::from)?,
+        full_name: row.try_get("full_name").map_err(StorageError::from)?,
         wallets: wallets_of(&state, user_id).await?,
     }))
 }
@@ -503,6 +511,18 @@ pub struct AdminStatusResponse {
     latest_checkpoint: Option<CheckpointStatus>,
     unsealed_transactions: i64,
     conservation: Vec<ConservationStatus>,
+    deposit_dual_control: bool,
+    deposit_max_minor: i64,
+    pending_deposits: i64,
+}
+
+async fn pending_deposits(state: &AppState) -> ApiResult<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM deposit_requests WHERE status = 'pending_approval'",
+    )
+    .fetch_one(state.ledger.pool())
+    .await
+    .map_err(StorageError::from)?)
 }
 
 pub async fn admin_status(
@@ -553,6 +573,9 @@ pub async fn admin_status(
         latest_checkpoint,
         unsealed_transactions,
         conservation,
+        deposit_dual_control: state.deposits.dual_control,
+        deposit_max_minor: state.deposits.max_minor,
+        pending_deposits: pending_deposits(&state).await?,
     }))
 }
 
@@ -612,6 +635,7 @@ pub struct MetricsResponse {
     customer_funds: Vec<CurrencyTotal>,
     users: UsersMetrics,
     aml_blocked_30d: i64,
+    pending_deposits: i64,
 }
 
 pub async fn admin_metrics(
@@ -642,8 +666,9 @@ pub async fn admin_metrics(
     let txn_rows = sqlx::query(
         "SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS date,
                 COUNT(*)::BIGINT AS count
-         FROM transactions
+         FROM transactions t
          WHERE created_at >= now() - interval '30 days'
+           AND NOT EXISTS (SELECT 1 FROM voided_transactions v WHERE v.id = t.id)
          GROUP BY 1 ORDER BY 1",
     )
     .fetch_all(pool)
@@ -787,5 +812,6 @@ pub async fn admin_metrics(
             new_30d,
         },
         aml_blocked_30d,
+        pending_deposits: pending_deposits(&state).await?,
     }))
 }

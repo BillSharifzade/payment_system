@@ -32,18 +32,53 @@ pub async fn create_wallet(
     Json(req): Json<CreateWalletRequest>,
 ) -> ApiResult<(StatusCode, Json<AccountResponse>)> {
     let currency = state.ledger.lookup_currency(&req.currency).await?;
-    let id = AccountId::new();
-    state
+    // One wallet per currency per user. Creations serialise on the user's row; the lookup is a
+    // separate statement so its snapshot is taken after the lock and sees a racing creation.
+    let mut tx = state
         .ledger
-        .open_account_owned(
-            &Account::new(id, AccountType::UserWallet, currency),
-            Some(user_id),
-        )
-        .await?;
+        .pool()
+        .begin()
+        .await
+        .map_err(StorageError::from)?;
+    let user: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(StorageError::from)?;
+    if user.is_none() {
+        return Err(ApiError::Unauthorized("unknown user".to_string()));
+    }
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM accounts
+         WHERE owner_user_id = $1 AND currency = $2 AND account_type = 'user_wallet'
+         ORDER BY created_at, id LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(currency.code())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(StorageError::from)?;
+    let (status, id) = match existing {
+        Some(id) => (StatusCode::OK, id),
+        None => {
+            let id = AccountId::new();
+            state
+                .ledger
+                .open_account_owned_on(
+                    &mut tx,
+                    &Account::new(id, AccountType::UserWallet, currency),
+                    Some(user_id),
+                )
+                .await?;
+            (StatusCode::CREATED, id.as_uuid())
+        }
+    };
+    tx.commit().await.map_err(StorageError::from)?;
     Ok((
-        StatusCode::CREATED,
+        status,
         Json(AccountResponse {
-            id: id.as_uuid(),
+            id,
             account_type: AccountType::UserWallet.as_db_str().to_string(),
             currency: currency.code().to_string(),
         }),
@@ -154,6 +189,7 @@ pub struct ClientConfigResponse {
     transfer_fee_bps: u32,
     biometric_max_minor: i64,
     check_ttl_secs: i64,
+    biometric_identify: bool,
 }
 
 pub async fn client_config(
@@ -164,6 +200,7 @@ pub async fn client_config(
         transfer_fee_bps: state.fees.transfer_bps,
         biometric_max_minor: state.biometric.max_minor,
         check_ttl_secs: state.biometric.check_ttl_secs,
+        biometric_identify: state.biometric.identify,
     }))
 }
 

@@ -45,6 +45,24 @@ pub enum ApiError {
     #[error("fingerprint matches more than one person; use another finger or method")]
     AmbiguousMatch,
 
+    #[error("this idempotency key was voided; it can never post")]
+    Voided,
+
+    #[error("{0}")]
+    DualControlRequired(String),
+
+    #[error("{0}")]
+    RecipientUnavailable(String),
+
+    #[error("a valid X-Terminal-Key of an active terminal of this merchant is required")]
+    TerminalUnauthorized,
+
+    #[error("this fingerprint capture was already presented; scan the finger again")]
+    ProbeReplayed,
+
+    #[error("too many failed fingerprint attempts; the check was cancelled")]
+    CheckLocked,
+
     #[error("rate limit exceeded")]
     TooManyRequests,
 
@@ -79,6 +97,12 @@ impl ApiError {
             }
             ApiError::NoMatch => (StatusCode::NOT_FOUND, "no_match"),
             ApiError::AmbiguousMatch => (StatusCode::CONFLICT, "ambiguous_match"),
+            ApiError::Voided => (StatusCode::CONFLICT, "voided"),
+            ApiError::DualControlRequired(_) => (StatusCode::FORBIDDEN, "dual_control_required"),
+            ApiError::RecipientUnavailable(_) => (StatusCode::FORBIDDEN, "recipient_unavailable"),
+            ApiError::TerminalUnauthorized => (StatusCode::UNAUTHORIZED, "terminal_unauthorized"),
+            ApiError::ProbeReplayed => (StatusCode::CONFLICT, "probe_replayed"),
+            ApiError::CheckLocked => (StatusCode::CONFLICT, "check_locked"),
             ApiError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
             ApiError::RetryLater => (StatusCode::SERVICE_UNAVAILABLE, "retry_later"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),

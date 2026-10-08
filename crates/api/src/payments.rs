@@ -6,13 +6,13 @@ use axum::Json;
 use ledger::{AccountId, AccountType, Entry, LedgerError, Transaction, TransactionId};
 use money::{Currency, Money};
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
-use storage::{IdempotencyRecord, PostHook, PostOptions, StorageError};
+use storage::{HookError, IdempotencyRecord, PostHook, PostOptions, StorageError};
 use uuid::Uuid;
 
-use crate::admin::audit_on;
 use crate::common::{default_currency, idempotency_key};
-use crate::session::{AdminUser, AuthUser};
+use crate::session::AuthUser;
 use crate::{ApiError, ApiResult, AppState, Limits};
 
 pub const KYC_LEVEL_FOR_TRANSFER: i16 = 1;
@@ -46,14 +46,6 @@ fn fx_shard(currency: &str) -> Option<Uuid> {
         "USD" => Some(shard(0x3100)),
         _ => None,
     }
-}
-
-#[derive(Deserialize)]
-pub struct DepositRequest {
-    user_account: Uuid,
-    amount_minor: i64,
-    #[serde(default = "default_currency")]
-    currency: String,
 }
 
 #[derive(Deserialize)]
@@ -100,9 +92,79 @@ pub(crate) struct MoneyContext {
     pub(crate) from: Option<AccountRow>,
     pub(crate) to: Option<AccountRow>,
     pub(crate) recipient_blocked: bool,
+    pub(crate) recipient_status: Option<String>,
     pub(crate) pair_rate: Option<(i64, i64)>,
     pub(crate) tjs_rate: Option<(i64, i64)>,
-    pub(crate) stored: Option<(String, i32, serde_json::Value)>,
+    pub(crate) key: KeyState,
+}
+
+// What the database already knows about an Idempotency-Key: the stored response of a post
+// made with it, and whether it was voided (claimed with no entries; it can never post).
+pub(crate) struct KeyState {
+    stored: Option<(String, i32, serde_json::Value)>,
+    voided: bool,
+}
+
+pub(crate) const KEY_STATE_COLUMNS: &str = "ik.fingerprint AS ik_fingerprint,
+     ik.response_status AS ik_status, ik.response_body AS ik_body,
+     (vt.id IS NOT NULL) AS key_voided";
+
+impl KeyState {
+    pub(crate) fn from_row(row: &PgRow) -> ApiResult<Self> {
+        let fingerprint: Option<String> =
+            row.try_get("ik_fingerprint").map_err(StorageError::from)?;
+        let stored = match fingerprint {
+            Some(fp) => Some((
+                fp,
+                row.try_get::<i32, _>("ik_status")
+                    .map_err(StorageError::from)?,
+                row.try_get::<serde_json::Value, _>("ik_body")
+                    .map_err(StorageError::from)?,
+            )),
+            None => None,
+        };
+        Ok(Self {
+            stored,
+            voided: row.try_get("key_voided").map_err(StorageError::from)?,
+        })
+    }
+
+    pub(crate) async fn load(conn: &mut PgConnection, key: Uuid) -> ApiResult<Self> {
+        let row = sqlx::query(&format!(
+            "SELECT {KEY_STATE_COLUMNS} FROM (SELECT $1::uuid AS key) k
+             LEFT JOIN idempotency_keys ik ON ik.key = k.key
+             LEFT JOIN voided_transactions vt ON vt.id = k.key"
+        ))
+        .bind(key)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(StorageError::from)?;
+        Self::from_row(&row)
+    }
+
+    pub(crate) fn voided(&self) -> bool {
+        self.voided
+    }
+
+    pub(crate) fn replay<T: serde::de::DeserializeOwned>(
+        &self,
+        fingerprint: &str,
+    ) -> ApiResult<Option<(StatusCode, Json<T>)>> {
+        if self.voided {
+            return Err(ApiError::Voided);
+        }
+        let Some((stored_fp, status, body)) = &self.stored else {
+            return Ok(None);
+        };
+        if stored_fp != fingerprint {
+            return Err(ApiError::IdempotencyConflict);
+        }
+        let resp: T = serde_json::from_value(body.clone())
+            .map_err(|e| StorageError::DataIntegrity(format!("stored idempotent response: {e}")))?;
+        let status = StatusCode::from_u16(*status as u16)
+            .map_err(|e| StorageError::DataIntegrity(format!("stored status: {e}")))?;
+        Ok(Some((status, Json(resp))))
+    }
 }
 
 fn account_row(row: &sqlx::postgres::PgRow, prefix: &str) -> ApiResult<Option<AccountRow>> {
@@ -139,18 +201,17 @@ pub(crate) async fn money_context(
     to: Uuid,
     key: Uuid,
 ) -> ApiResult<MoneyContext> {
-    let row = sqlx::query(
+    let row = sqlx::query(&format!(
         "SELECT u.kyc_level, u.status,
                 (bu.user_id IS NOT NULL) AS sender_blocked,
                 f.account_type AS from_type, f.owner_user_id AS from_owner,
                 f.currency AS from_currency, fc.exponent AS from_exponent,
                 t.account_type AS to_type, t.owner_user_id AS to_owner,
                 t.currency AS to_currency, tc.exponent AS to_exponent,
-                (bt.user_id IS NOT NULL) AS recipient_blocked,
+                (bt.user_id IS NOT NULL) AS recipient_blocked, tu.status AS recipient_status,
                 rp.rate_num AS pair_num, rp.rate_den AS pair_den,
                 rt.rate_num AS tjs_num, rt.rate_den AS tjs_den,
-                ik.fingerprint AS ik_fingerprint, ik.response_status AS ik_status,
-                ik.response_body AS ik_body
+                {KEY_STATE_COLUMNS}
          FROM users u
          LEFT JOIN blocked_users bu ON bu.user_id = u.id
          LEFT JOIN accounts f ON f.id = $2
@@ -158,11 +219,13 @@ pub(crate) async fn money_context(
          LEFT JOIN accounts t ON t.id = $3
          LEFT JOIN currencies tc ON tc.code = t.currency
          LEFT JOIN blocked_users bt ON bt.user_id = t.owner_user_id
+         LEFT JOIN users tu ON tu.id = t.owner_user_id
          LEFT JOIN fx_rates rp ON rp.base_currency = f.currency AND rp.quote_currency = t.currency
          LEFT JOIN fx_rates rt ON rt.base_currency = f.currency AND rt.quote_currency = 'TJS'
          LEFT JOIN idempotency_keys ik ON ik.key = $4
-         WHERE u.id = $1",
-    )
+         LEFT JOIN voided_transactions vt ON vt.id = $4
+         WHERE u.id = $1"
+    ))
     .bind(user_id)
     .bind(from)
     .bind(to)
@@ -177,18 +240,6 @@ pub(crate) async fn money_context(
         let d: Option<i64> = row.try_get(den).map_err(StorageError::from)?;
         Ok(n.zip(d))
     };
-    let ik_fingerprint: Option<String> =
-        row.try_get("ik_fingerprint").map_err(StorageError::from)?;
-    let stored = match ik_fingerprint {
-        Some(fp) => Some((
-            fp,
-            row.try_get::<i32, _>("ik_status")
-                .map_err(StorageError::from)?,
-            row.try_get::<serde_json::Value, _>("ik_body")
-                .map_err(StorageError::from)?,
-        )),
-        None => None,
-    };
 
     Ok(MoneyContext {
         kyc_level: row.try_get("kyc_level").map_err(StorageError::from)?,
@@ -199,9 +250,12 @@ pub(crate) async fn money_context(
         recipient_blocked: row
             .try_get("recipient_blocked")
             .map_err(StorageError::from)?,
+        recipient_status: row
+            .try_get("recipient_status")
+            .map_err(StorageError::from)?,
         pair_rate: get_rate("pair_num", "pair_den")?,
         tjs_rate: get_rate("tjs_num", "tjs_den")?,
-        stored,
+        key: KeyState::from_row(&row)?,
     })
 }
 
@@ -210,17 +264,7 @@ impl MoneyContext {
         &self,
         fingerprint: &str,
     ) -> ApiResult<Option<(StatusCode, Json<T>)>> {
-        let Some((stored_fp, status, body)) = &self.stored else {
-            return Ok(None);
-        };
-        if stored_fp != fingerprint {
-            return Err(ApiError::IdempotencyConflict);
-        }
-        let resp: T = serde_json::from_value(body.clone())
-            .map_err(|e| StorageError::DataIntegrity(format!("stored idempotent response: {e}")))?;
-        let status = StatusCode::from_u16(*status as u16)
-            .map_err(|e| StorageError::DataIntegrity(format!("stored status: {e}")))?;
-        Ok(Some((status, Json(resp))))
+        self.key.replay(fingerprint)
     }
 
     pub(crate) fn require_active(&self) -> ApiResult<()> {
@@ -228,6 +272,15 @@ impl MoneyContext {
             return Err(ApiError::Forbidden(format!("account is {}", self.status)));
         }
         Ok(())
+    }
+
+    pub(crate) fn require_recipient_active(&self) -> ApiResult<()> {
+        match self.recipient_status.as_deref() {
+            None | Some("active") => Ok(()),
+            Some(_) => Err(ApiError::RecipientUnavailable(
+                "the recipient cannot receive payments".to_string(),
+            )),
+        }
     }
 
     pub(crate) fn require_kyc(&self, min_level: i16) -> ApiResult<()> {
@@ -342,72 +395,101 @@ pub(crate) async fn pre_screen(
     Ok((tjs, limits))
 }
 
+// AML windows are per USER across all their wallets, so the guard serialises one user's posts
+// on the user's row. It runs inside post_on after the wallets are locked; the window is then
+// summed in a NEW statement (a fresh READ COMMITTED snapshot taken after the lock was granted),
+// so a concurrent post from any wallet of the same user is either fully visible or still
+// queued behind the lock — the limit is exact. No deadlock: every posting transaction locks
+// its wallets first (one statement, id order), then exactly one users row, then system shards
+// last (sorted, never followed by another lock); nothing that holds a users row lock (status
+// and KYC changes, wallet creation) ever waits for a wallet balance. NO KEY UPDATE so FK checks
+// against users (KEY SHARE, e.g. inserting checks, events, refresh tokens) never queue on it.
+pub(crate) async fn lock_user(conn: &mut PgConnection, user_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(user_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+// Every debit of the user's wallets in the window, each currency converted to TJS at the
+// current rate (floored per currency, as the per-transaction check does). A debit currency
+// with no TJS rate cannot be priced, so the guard fails closed.
+pub(crate) async fn aml_check(
+    conn: &mut PgConnection,
+    s: &ScreenCtx,
+    tjs: (i64, i64),
+    limits: Limits,
+) -> Result<(), HookError> {
+    let row = sqlx::query(
+        "WITH d AS (
+             SELECT a.currency, SUM(e.amount_minor)::numeric AS total,
+                    COUNT(*) FILTER (WHERE e.created_at >= now() - interval '1 hour') AS hourly
+             FROM accounts a
+             JOIN entries e ON e.account_id = a.id
+             WHERE a.owner_user_id = $1 AND a.account_type = 'user_wallet'
+               AND e.direction = 'debit' AND e.created_at >= now() - interval '24 hours'
+             GROUP BY a.currency
+         ), w AS (
+             SELECT COALESCE(SUM(CASE WHEN d.currency = 'TJS' THEN d.total
+                                      ELSE floor(d.total * r.rate_num / r.rate_den) END), 0) AS daily,
+                    COALESCE(SUM(d.hourly), 0) AS hourly,
+                    COUNT(*) FILTER (WHERE d.currency <> 'TJS' AND r.rate_num IS NULL) AS unpriced
+             FROM d
+             LEFT JOIN fx_rates r ON r.base_currency = d.currency AND r.quote_currency = 'TJS'
+         ), ok AS (
+             SELECT w.unpriced = 0 AS priced_ok,
+                    w.daily + floor(($2::bigint)::numeric * ($3::bigint)::numeric / ($4::bigint)::numeric)
+                      <= ($5::bigint)::numeric AS daily_ok,
+                    w.hourly < $6::bigint AS velocity_ok
+             FROM w
+         ), ins AS (
+             INSERT INTO screening_events
+               (id, user_id, from_account, to_account, amount_minor, currency, decision, rule, detail)
+             SELECT $7::uuid, $1::uuid, $8::uuid, $9::uuid, $2::bigint, $10::text, 'allowed', NULL, NULL
+             FROM ok WHERE ok.priced_ok AND ok.daily_ok AND ok.velocity_ok
+         )
+         SELECT priced_ok, daily_ok, velocity_ok FROM ok",
+    )
+    .bind(s.user_id)
+    .bind(s.amount_minor)
+    .bind(tjs.0)
+    .bind(tjs.1)
+    .bind(limits.daily_minor)
+    .bind(limits.velocity_per_hour)
+    .bind(Uuid::now_v7())
+    .bind(s.from_account)
+    .bind(s.to_account)
+    .bind(&s.currency)
+    .fetch_one(&mut *conn)
+    .await?;
+    let reject = |rule: &str, message: &str| HookError::Rejected {
+        rule: rule.to_string(),
+        message: message.to_string(),
+    };
+    if !row.try_get::<bool, _>("priced_ok")? {
+        return Err(reject(
+            "no_fx_rate",
+            "a wallet's recent debits cannot be converted to TJS for AML screening",
+        ));
+    }
+    if !row.try_get::<bool, _>("daily_ok")? {
+        return Err(reject(
+            "daily_limit",
+            "amount exceeds the rolling 24h limit",
+        ));
+    }
+    if !row.try_get::<bool, _>("velocity_ok")? {
+        return Err(reject("velocity", "too many transfers in the last hour"));
+    }
+    Ok(())
+}
+
 pub(crate) fn aml_guard(s: ScreenCtx, tjs: (i64, i64), limits: Limits) -> PostHook {
     Box::new(move |conn: &mut PgConnection| {
         Box::pin(async move {
-            let row = sqlx::query(
-                "WITH w AS (
-                     SELECT COALESCE(SUM(amount_minor), 0)::BIGINT AS daily,
-                            COUNT(*) FILTER (WHERE created_at >= now() - interval '1 hour')::BIGINT AS hourly
-                     FROM entries
-                     WHERE account_id = $1 AND direction = 'debit'
-                       AND created_at >= now() - interval '24 hours'
-                 ), ok AS (
-                     SELECT w.daily, w.hourly,
-                            (floor(w.daily::numeric * ($2::bigint)::numeric / ($3::bigint)::numeric)
-                             + floor(($4::bigint)::numeric * ($2::bigint)::numeric / ($3::bigint)::numeric))
-                              <= ($5::bigint)::numeric AS daily_ok,
-                            w.hourly < $6::bigint AS velocity_ok
-                     FROM w
-                 ), ins AS (
-                     INSERT INTO screening_events
-                       (id, user_id, from_account, to_account, amount_minor, currency, decision, rule, detail)
-                     SELECT $7::uuid, $8::uuid, $1::uuid, $9::uuid, $4::bigint, $10::text, 'allowed', NULL, NULL
-                     FROM ok WHERE ok.daily_ok AND ok.velocity_ok
-                 )
-                 SELECT daily_ok, velocity_ok FROM ok",
-            )
-            .bind(s.from_account)
-            .bind(tjs.0)
-            .bind(tjs.1)
-            .bind(s.amount_minor)
-            .bind(limits.daily_minor)
-            .bind(limits.velocity_per_hour)
-            .bind(Uuid::now_v7())
-            .bind(s.user_id)
-            .bind(s.to_account)
-            .bind(&s.currency)
-            .fetch_one(&mut *conn)
-            .await?;
-            let daily_ok: bool = row.try_get("daily_ok")?;
-            let velocity_ok: bool = row.try_get("velocity_ok")?;
-            if !daily_ok {
-                return Err(storage::HookError::Rejected {
-                    rule: "daily_limit".to_string(),
-                    message: "amount exceeds the rolling 24h limit".to_string(),
-                });
-            }
-            if !velocity_ok {
-                return Err(storage::HookError::Rejected {
-                    rule: "velocity".to_string(),
-                    message: "too many transfers in the last hour".to_string(),
-                });
-            }
-            Ok(())
-        })
-    })
-}
-
-fn admin_audit_guard(
-    admin_id: Uuid,
-    action: &'static str,
-    target: String,
-    details: serde_json::Value,
-) -> PostHook {
-    Box::new(move |conn: &mut PgConnection| {
-        Box::pin(async move {
-            audit_on(conn, admin_id, action, Some(&target), details).await?;
-            Ok(())
+            lock_user(conn, s.user_id).await?;
+            aml_check(conn, &s, tjs, limits).await
         })
     })
 }
@@ -424,34 +506,6 @@ pub(crate) fn record<T: Serialize>(
         response_body: serde_json::to_value(created)
             .map_err(|e| ApiError::Internal(format!("response serialises: {e}")))?,
     })
-}
-
-pub(crate) async fn load_idempotent<T: serde::de::DeserializeOwned>(
-    conn: &mut PgConnection,
-    key: Uuid,
-    fingerprint: &str,
-) -> ApiResult<Option<(StatusCode, Json<T>)>> {
-    let row = sqlx::query(
-        "SELECT fingerprint, response_status, response_body FROM idempotency_keys WHERE key = $1",
-    )
-    .bind(key)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(StorageError::from)?;
-
-    let Some(row) = row else { return Ok(None) };
-
-    let stored_fingerprint: String = row.try_get("fingerprint").map_err(StorageError::from)?;
-    if stored_fingerprint != fingerprint {
-        return Err(ApiError::IdempotencyConflict);
-    }
-    let status: i32 = row.try_get("response_status").map_err(StorageError::from)?;
-    let body: serde_json::Value = row.try_get("response_body").map_err(StorageError::from)?;
-    let resp: T = serde_json::from_value(body)
-        .map_err(|e| StorageError::DataIntegrity(format!("stored idempotent response: {e}")))?;
-    let status = StatusCode::from_u16(status as u16)
-        .map_err(|e| StorageError::DataIntegrity(format!("stored status: {e}")))?;
-    Ok(Some((status, Json(resp))))
 }
 
 pub(crate) async fn finish<T>(
@@ -473,7 +527,7 @@ where
         }
         Err(StorageError::Ledger(LedgerError::DuplicateTransaction(_))) => {
             metrics::counter!("ledger_posts_total", "outcome" => "duplicate").increment(1);
-            if let Some(found) = load_idempotent::<T>(conn, key, fingerprint).await? {
+            if let Some(found) = KeyState::load(conn, key).await?.replay::<T>(fingerprint)? {
                 return Ok(found);
             }
             Ok((StatusCode::OK, Json(raced)))
@@ -490,88 +544,6 @@ where
             Err(e.into())
         }
     }
-}
-
-pub async fn create_deposit(
-    AdminUser(admin_id): AdminUser,
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<DepositRequest>,
-) -> ApiResult<(StatusCode, Json<PostResponse>)> {
-    if req.amount_minor <= 0 {
-        return Err(ApiError::BadRequest(
-            "amount_minor must be positive".to_string(),
-        ));
-    }
-    let key = idempotency_key(&headers)?;
-    let settlement = settlement_shard(&req.currency).ok_or_else(|| {
-        ApiError::BadRequest(format!("deposits are not supported in {}", req.currency))
-    })?;
-    let fingerprint = format!(
-        "deposit:{admin_id}:{}:{}:{}",
-        req.user_account, req.amount_minor, req.currency
-    );
-
-    let mut conn = state
-        .ledger
-        .pool()
-        .acquire()
-        .await
-        .map_err(StorageError::from)?;
-    let ctx = money_context(&mut conn, admin_id, settlement, req.user_account, key).await?;
-    if let Some(found) = ctx.replay::<PostResponse>(&fingerprint)? {
-        return Ok(found);
-    }
-
-    let target = ctx
-        .to
-        .as_ref()
-        .ok_or_else(|| ApiError::NotFound("account not found".to_string()))?;
-    if target.account_type != AccountType::UserWallet {
-        return Err(ApiError::BadRequest(
-            "deposits must credit a user wallet".to_string(),
-        ));
-    }
-    if target.currency.code() != req.currency {
-        return Err(ApiError::BadRequest(format!(
-            "wallet holds {}, not {}",
-            target.currency.code(),
-            req.currency
-        )));
-    }
-    let currency = target.currency;
-    let amount = Money::from_minor(req.amount_minor as i128, currency);
-
-    let txn = Transaction::new(
-        TransactionId(key),
-        vec![
-            Entry::debit(AccountId(settlement), amount),
-            Entry::credit(AccountId(req.user_account), amount),
-        ],
-    );
-    let created = PostResponse {
-        transaction_id: key,
-        status: "posted".to_string(),
-    };
-    let raced = PostResponse {
-        transaction_id: key,
-        status: "already_posted".to_string(),
-    };
-    let opts = PostOptions {
-        idempotency: Some(record(key, &fingerprint, &created)?),
-        guard: Some(admin_audit_guard(
-            admin_id,
-            "deposit",
-            req.user_account.to_string(),
-            serde_json::json!({
-                "amount_minor": req.amount_minor,
-                "currency": currency.code(),
-                "transaction_id": key,
-            }),
-        )),
-    };
-    let result = state.ledger.post_on(&mut conn, &txn, opts).await;
-    finish(&mut conn, result, key, &fingerprint, created, raced, None).await
 }
 
 pub async fn create_transfer(
@@ -620,6 +592,7 @@ pub async fn create_transfer(
             "recipient must be a user wallet".to_string(),
         ));
     }
+    ctx.require_recipient_active()?;
     if from.currency.code() != req.currency {
         return Err(ApiError::BadRequest(format!(
             "wallet holds {}, not {}",

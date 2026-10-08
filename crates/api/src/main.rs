@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use api::config::{env_flag, env_or, env_or_file};
 use api::{
-    build_router, warm_password_hasher, AmlConfig, AppState, AuthConfig, BiometricConfig,
-    FeeConfig, RateLimitState,
+    build_router, run_migrations, warm_password_hasher, AmlConfig, AppState, AuthConfig,
+    BiometricConfig, DepositConfig, FeeConfig, RateLimitState,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use storage::PostgresLedger;
@@ -36,6 +36,7 @@ async fn main() -> Result<(), BoxError> {
         }
         None => "postgres://payment:payment_dev_pw@localhost:5432/payment".to_string(),
     };
+    let migration_url = env_or_file("MIGRATION_DATABASE_URL")?;
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
     let refresh_reuse_grace_secs: u64 = env_or("REFRESH_REUSE_GRACE_SECS", 30)?;
@@ -64,11 +65,19 @@ async fn main() -> Result<(), BoxError> {
 
     let fees = FeeConfig::from_env()?;
     let aml = AmlConfig::from_env()?;
+    let deposits = DepositConfig::from_env(is_prod)?;
     let biometric = BiometricConfig::from_env(is_prod)?;
     tracing::info!(
         matcher = biometric.matcher.name(),
         max_minor = biometric.max_minor,
+        identify = biometric.identify,
+        max_attempts = biometric.max_attempts,
         "biometric payments configured"
+    );
+    tracing::info!(
+        dual_control = deposits.dual_control,
+        max_minor = deposits.max_minor,
+        "deposits configured"
     );
     let request_timeout = Duration::from_secs(env_or("REQUEST_TIMEOUT_SECS", 10u64)?);
     api::middleware::configure_request_timeout(request_timeout);
@@ -105,8 +114,11 @@ async fn main() -> Result<(), BoxError> {
         .await?;
 
     let ledger = PostgresLedger::new(pool.clone());
-    ledger.migrate().await?;
-    tracing::info!("migrations applied");
+    run_migrations(&ledger, migration_url.as_deref()).await?;
+    tracing::info!(
+        separate_owner_credentials = migration_url.is_some(),
+        "migrations applied"
+    );
 
     {
         let pool = pool.clone();
@@ -178,6 +190,7 @@ async fn main() -> Result<(), BoxError> {
         document_dir,
         kyc_upload_daily_max,
         fees,
+        deposits,
         biometric,
         trust_proxy,
     });
