@@ -10,13 +10,18 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.createSavedStateHandle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import kotlinx.coroutines.launch
 import tj.payment.core.ApiOutcome
 import tj.payment.wallet.AppContainer
 import tj.payment.wallet.data.AuthRepository
@@ -56,14 +61,19 @@ private object Routes {
 @Composable
 fun AppRoot(container: AppContainer) {
     val nav = rememberNavController()
+    val scope = rememberCoroutineScope()
+    val locked by container.appLock.locked.collectAsStateWithLifecycle()
 
     // Every sign-out — an explicit logout, or a refresh the server refused, from
     // whichever thread noticed — routes to Login from here, once, in an effect.
-    // No screen navigates during composition.
+    // No screen navigates during composition. The wallet cache and the pending
+    // payment VIEW are dropped (the record stays with its owner, invisible to
+    // whoever signs in next); there is nothing left to lock.
     LaunchedEffect(Unit) {
         container.session.signedOut.collect { signedOut ->
             if (!signedOut) return@collect
             container.walletRepository.clearCache()
+            container.appLock.unlock()
             if (nav.currentBackStackEntry?.destination?.route != Routes.LOGIN) {
                 nav.navigate(Routes.LOGIN) {
                     popUpTo(0) { inclusive = true }
@@ -74,6 +84,23 @@ fun AppRoot(container: AppContainer) {
         }
     }
 
+    Box(Modifier.fillMaxSize()) {
+        AppNavHost(container, nav)
+        // The app lock covers everything, balances included, until the device's
+        // own authentication succeeds (at launch with a session, and after
+        // AppLockPolicy.timeoutMs in the background).
+        if (locked) {
+            LockScreen(
+                authorizer = container.authorizer,
+                onUnlocked = container.appLock::unlock,
+                onSignOut = { scope.launch { container.authRepository.logout() } },
+            )
+        }
+    }
+}
+
+@Composable
+private fun AppNavHost(container: AppContainer, nav: NavHostController) {
     val slideDuration = 300
     NavHost(
         navController = nav,
@@ -96,6 +123,8 @@ fun AppRoot(container: AppContainer) {
         composable(Routes.GATE) {
             GateScreen(
                 repo = container.authRepository,
+                // A persisted session opens behind the app lock.
+                onSessionFound = container.appLock::lock,
                 signedOutPending = { container.session.signedOut.value },
                 // launchSingleTop: the signed-out observer above may already have
                 // routed to Login by the time restore() returns — never stack two.
@@ -116,6 +145,8 @@ fun AppRoot(container: AppContainer) {
         composable(Routes.LOGIN) {
             val vm = viewModel { AuthViewModel(container.authRepository) }
             LoginScreen(vm, onAuthenticated = {
+                // The password was just proven: no app lock on top of it.
+                container.appLock.unlock()
                 nav.navigate(Routes.HOME) { popUpTo(Routes.LOGIN) { inclusive = true } }
             })
         }
@@ -196,6 +227,7 @@ fun AppRoot(container: AppContainer) {
 @Composable
 private fun GateScreen(
     repo: AuthRepository,
+    onSessionFound: () -> Unit,
     signedOutPending: () -> Boolean,
     toHome: () -> Unit,
     toLogin: () -> Unit,
@@ -205,6 +237,7 @@ private fun GateScreen(
             toLogin()
             return@LaunchedEffect
         }
+        onSessionFound()
         when (repo.restore()) {
             is ApiOutcome.Ok -> toHome()
             // Unreachable server with an intact session: land on Home anyway —

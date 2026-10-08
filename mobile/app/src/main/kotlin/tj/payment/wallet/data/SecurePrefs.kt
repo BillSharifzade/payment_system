@@ -5,89 +5,202 @@ import android.content.SharedPreferences
 import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import java.io.File
+import java.io.IOException
+import java.security.GeneralSecurityException
 import java.security.KeyStore
+import java.security.ProviderException
+import tj.payment.core.LocalStorageException
+import tj.payment.core.SecureKeyValue
+import tj.payment.core.SecureStoreOpener
+import tj.payment.core.StorageFault
+import tj.payment.core.StorageFaults
 
 /**
- * The one way to open a Keystore-encrypted preferences file, shared by the
- * session and the pending-payment store.
+ * One Keystore-encrypted preferences file with **its own master key**. The
+ * session and the pending-payment store used to share the library's default
+ * master key, and recovery deleted that shared key on any exception — a
+ * transient Keystore hiccup while opening one store destroyed the other
+ * (losing an unsettled payment's key). Now:
  *
- * Creation is guarded. A corrupt Tink keyset or an unusable master key (OS
- * upgrade, restore onto another device, a Keystore fault) used to throw out of
- * a field initialiser — a crash loop at launch with no way out but a reinstall.
- * Now the corrupt file is deleted and recreated; if the master key itself is
- * the problem, that is reset too. The caller learns it happened through
- * [Opened.recovered] and decides what the user must be told.
+ *  - each store has its own key alias, so resetting one can never affect the other;
+ *  - opening follows [SecureStoreOpener]: transient faults are retried and,
+ *    if they persist, the store runs memory-only for this process WITHOUT
+ *    deleting anything; only positive evidence of corruption (or the same
+ *    failure on several consecutive launches) recreates this store alone;
+ *  - a pre-hardening file (encrypted with the shared default key) is migrated
+ *    into the new file once, then deleted; the default key itself is never
+ *    deleted (some other file might still need it).
+ *
+ * The caller learns what happened through [Opened.recovered] (the store had
+ * to be recreated: whatever it held is gone) and [Opened.persistent] (false =
+ * memory-only fallback for this process).
  */
-internal object SecurePrefs {
+internal class SecureStore(
+    context: Context,
+    private val fileName: String,
+    private val keyAlias: String,
+    /** The pre-hardening file to migrate from (encrypted with the shared default key), if any. */
+    private val legacyFileName: String?,
+) {
     class Opened(
         val prefs: SharedPreferences,
         /** The store had to be wiped and recreated: whatever it held is gone. */
         val recovered: Boolean,
-        /** False only in the last-resort memory fallback (nothing survives the process). */
+        /** False only in the memory fallback (nothing survives the process; nothing was deleted). */
         val persistent: Boolean,
     )
 
-    private const val TAG = "SecurePrefs"
+    private val app = context.applicationContext
+
+    /** Opened once per process, at construction (callers construct off the main thread). */
+    val opened: Opened = open()
+
+    private fun open(): Opened {
+        val failedLaunches = health.getInt(fileName, 0)
+        val giveUpOnLegacy = failedLaunches + 1 >= ESCALATE_AFTER_FAILED_LAUNCHES
+        var legacyLost = false
+        val result = SecureStoreOpener(escalateAfterFailedLaunches = ESCALATE_AFTER_FAILED_LAUNCHES).open(
+            create = {
+                val prefs = create(fileName, keyAlias)
+                if (migrateLegacy(prefs, giveUpOnLegacy)) legacyLost = true
+                prefs
+            },
+            wipe = { app.deleteSharedPreferences(fileName) },
+            resetKey = { deleteKey(keyAlias) },
+            failedLaunches = failedLaunches,
+        )
+        return when (result) {
+            is SecureStoreOpener.Result.Opened -> {
+                health.edit().remove(fileName).commit()
+                if (result.recovered) Log.w(TAG, "$fileName was unreadable and has been recreated")
+                Opened(result.value, recovered = result.recovered || legacyLost, persistent = true)
+            }
+            is SecureStoreOpener.Result.Unavailable -> {
+                health.edit().putInt(fileName, failedLaunches + 1).commit()
+                Log.e(TAG, "$fileName: secure storage unavailable this launch; memory only, nothing deleted", result.cause)
+                // Last resort: usable and safe beats a crash loop. Nothing
+                // persists across the process; PendingPaymentPrefsStore refuses
+                // to save (or even read) so no payment is ever sent without a
+                // durable key.
+                Opened(MemoryPrefs(), recovered = false, persistent = false)
+            }
+        }
+    }
 
     /**
-     * One builder for every store. StrongBox (a separate secure element) is
-     * requested where the device has one; MasterKey silently falls back to the
-     * TEE-backed key where it doesn't, and an existing key is reused as is.
+     * Move the pre-hardening file's entries into [into] (once), then delete it.
+     * Returns true if the legacy data had to be given up (unreadable).
+     * A transient failure throws, so the whole open is retried and nothing is lost.
      */
-    private fun masterKey(context: Context): MasterKey =
-        MasterKey.Builder(context, MasterKey.DEFAULT_MASTER_KEY_ALIAS)
+    private fun migrateLegacy(into: SharedPreferences, giveUp: Boolean): Boolean {
+        val legacy = legacyFileName ?: return false
+        if (!File(app.dataDir, "shared_prefs/$legacy.xml").exists()) return false
+        if (into.all.isNotEmpty()) {
+            // Already migrated (the delete below didn't happen last time).
+            app.deleteSharedPreferences(legacy)
+            return false
+        }
+        val old = try {
+            create(legacy, MasterKey.DEFAULT_MASTER_KEY_ALIAS)
+        } catch (e: Exception) {
+            if (!giveUp && StorageFaults.classify(e) == StorageFault.TRANSIENT) throw e
+            Log.w(TAG, "$legacy unreadable (${e.javaClass.simpleName}); giving it up")
+            app.deleteSharedPreferences(legacy)
+            return true
+        }
+        val editor = into.edit()
+        for ((key, value) in old.all) {
+            when (value) {
+                is String -> editor.putString(key, value)
+                is Boolean -> editor.putBoolean(key, value)
+                is Int -> editor.putInt(key, value)
+                is Long -> editor.putLong(key, value)
+                is Float -> editor.putFloat(key, value)
+                is Set<*> -> editor.putStringSet(key, value.filterIsInstance<String>().toSet())
+            }
+        }
+        if (!editor.commit()) throw IOException("could not write the migrated $legacy entries")
+        app.deleteSharedPreferences(legacy)
+        return false
+    }
+
+    /**
+     * StrongBox (a separate secure element) is requested where the device has
+     * one; MasterKey silently falls back to the TEE-backed key where it doesn't,
+     * and an existing key is reused as is.
+     */
+    private fun create(name: String, alias: String): SharedPreferences {
+        val masterKey = MasterKey.Builder(app, alias)
             .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
             .setRequestStrongBoxBacked(true)
             .build()
-
-    private fun create(context: Context, name: String): SharedPreferences =
-        EncryptedSharedPreferences.create(
-            context,
+        return EncryptedSharedPreferences.create(
+            app,
             name,
-            masterKey(context),
+            masterKey,
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
         )
-
-    fun open(context: Context, name: String): Opened {
-        val app = context.applicationContext
-        try {
-            return Opened(create(app, name), recovered = false, persistent = true)
-        } catch (first: Exception) {
-            Log.w(TAG, "$name unreadable (${first.javaClass.simpleName}); recreating it")
-        }
-
-        // 1. The Tink keysets live inside the prefs file itself, so dropping the
-        //    file drops the corrupt keyset with it.
-        app.deleteSharedPreferences(name)
-        try {
-            return Opened(create(app, name), recovered = true, persistent = true)
-        } catch (second: Exception) {
-            Log.w(TAG, "$name still unreadable (${second.javaClass.simpleName}); resetting the master key")
-        }
-
-        // 2. The master key is unusable. Deleting it orphans every file it
-        //    encrypted — each of them recovers through this same path on its
-        //    next open (the session: sign in again; payments: see the notice).
-        try {
-            KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-                .deleteEntry(MasterKey.DEFAULT_MASTER_KEY_ALIAS)
-        } catch (e: Exception) {
-            Log.w(TAG, "could not delete the master key", e)
-        }
-        app.deleteSharedPreferences(name)
-        try {
-            return Opened(create(app, name), recovered = true, persistent = true)
-        } catch (third: Exception) {
-            Log.e(TAG, "$name: secure storage unavailable on this device; memory only", third)
-        }
-
-        // 3. Last resort: usable and safe beats a crash loop. Nothing persists
-        //    across the process — the user signs in each launch, and
-        //    PendingPaymentPrefsStore.save() reports false so no payment is
-        //    ever sent without a durable key.
-        return Opened(MemoryPrefs(), recovered = true, persistent = false)
     }
+
+    /** Only ever this store's own alias — never the shared default. */
+    private fun deleteKey(alias: String) {
+        check(alias != MasterKey.DEFAULT_MASTER_KEY_ALIAS) { "the shared default master key is never deleted" }
+        try {
+            KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(alias)
+        } catch (e: Exception) {
+            Log.w(TAG, "could not delete $alias", e)
+        }
+    }
+
+    /** Plain prefs (non-sensitive): consecutive launches whose open failed, per store. */
+    private val health: SharedPreferences
+        get() = app.getSharedPreferences(HEALTH_FILE, Context.MODE_PRIVATE)
+
+    private companion object {
+        const val TAG = "SecureStore"
+        const val HEALTH_FILE = "secure_store_health"
+        const val ESCALATE_AFTER_FAILED_LAUNCHES = 3
+    }
+}
+
+/**
+ * Runs [block] against encrypted prefs, turning a Keystore/crypto failure into
+ * the typed [LocalStorageException] (EncryptedSharedPreferences throws
+ * SecurityException("Could not decrypt value…") and friends).
+ */
+internal inline fun <T> secureIo(block: () -> T): T = try {
+    block()
+} catch (e: SecurityException) {
+    throw LocalStorageException("secure storage unavailable", e)
+} catch (e: GeneralSecurityException) {
+    throw LocalStorageException("secure storage unavailable", e)
+} catch (e: ProviderException) {
+    throw LocalStorageException("secure storage unavailable", e)
+}
+
+/**
+ * [SecureKeyValue] over a [SecureStore] for the pending-payment store. In the
+ * memory fallback it refuses reads as well as writes: a payment record may be
+ * sitting unreadable on disk, so "nothing stored" would be a lie.
+ */
+internal class PrefsKeyValue(private val store: SecureStore) : SecureKeyValue {
+    private fun prefs(): SharedPreferences {
+        val opened = store.opened
+        if (!opened.persistent) throw LocalStorageException("secure storage unavailable this launch")
+        return opened.prefs
+    }
+
+    override fun get(key: String): String? = secureIo { prefs().getString(key, null) }
+
+    override fun put(key: String, value: String): Boolean = secureIo { prefs().edit().putString(key, value).commit() }
+
+    override fun remove(key: String): Boolean = secureIo { prefs().edit().remove(key).commit() }
+
+    override fun getFlag(key: String): Boolean = secureIo { prefs().getBoolean(key, false) }
+
+    override fun putFlag(key: String, value: Boolean): Boolean = secureIo { prefs().edit().putBoolean(key, value).commit() }
 }
 
 /** In-memory [SharedPreferences] for the secure-storage-unavailable fallback. */

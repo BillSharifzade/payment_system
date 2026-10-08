@@ -10,11 +10,11 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import tj.payment.core.ApiOutcome
+import tj.payment.core.PendingPaymentResolver
 import tj.payment.core.StatementEntryDto
 import tj.payment.core.WalletDto
 import tj.payment.wallet.data.AuthRepository
 import tj.payment.wallet.data.WalletRepository
-import tj.payment.wallet.ui.OFFLINE_MESSAGE
 import tj.payment.wallet.ui.userMessage
 
 data class HomeUiState(
@@ -52,6 +52,17 @@ class HomeViewModel(
     private var refreshJob: Job? = null
     private var lastSuccessAtMs = 0L
 
+    /**
+     * This user's unsettled payment, surfaced here — at startup and on every
+     * refresh — not only when Send opens (FRONTEND.md §2.2). Each load asks the
+     * server once whether it already posted (read-only) and clears it if so;
+     * otherwise the card offers Finish (same key) and Discard (void first).
+     */
+    val pending = PendingPaymentResolver(repo.submitter, viewModelScope, onResolved = {
+        repo.markWalletsStale()
+        refresh()
+    })
+
     init {
         // Balances are shared with Send/FX: whoever fetched last, Home shows it.
         viewModelScope.launch {
@@ -75,6 +86,7 @@ class HomeViewModel(
     }
 
     fun refresh() {
+        pending.load(check = true)
         // A newer refresh supersedes an in-flight one, so a slow old answer can
         // never overwrite a fresh one.
         refreshJob?.cancel()
@@ -97,7 +109,7 @@ class HomeViewModel(
                     return@launch
                 }
                 is ApiOutcome.Offline -> {
-                    _state.update { it.copy(loading = false, error = OFFLINE_MESSAGE) }
+                    _state.update { it.copy(loading = false, error = outcome.userMessage()) }
                     kycDeferred.await()
                     return@launch
                 }

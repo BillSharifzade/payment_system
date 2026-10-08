@@ -47,6 +47,18 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    // The device authorizer shows its Keystore-bound prompt over the resumed
+    // activity; outside that window a money move is refused (NO_SCREEN).
+    override fun onResume() {
+        super.onResume()
+        (application as PaymentApp).container.authorizer.attach(this)
+    }
+
+    override fun onPause() {
+        (application as PaymentApp).container.authorizer.detach(this)
+        super.onPause()
+    }
+
     /**
      * Opt the window into the display's fastest mode at the current resolution.
      * Without this, many phones (Xiaomi/MIUI especially) render apps at 60 Hz even

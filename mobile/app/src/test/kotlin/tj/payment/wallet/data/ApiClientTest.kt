@@ -29,14 +29,17 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import tj.payment.core.ApiOutcome
+import tj.payment.core.Authorization
 import tj.payment.core.ErrorCode
 import tj.payment.core.PayCheckRequest
 import tj.payment.core.PaymentSubmitter
 import tj.payment.core.PendingPayment
 import tj.payment.core.PendingPaymentStore
+import tj.payment.core.Settlement
 import tj.payment.core.SubmitResult
 import tj.payment.core.TokenResponse
 import tj.payment.core.TransferRequest
+import tj.payment.core.map
 import tj.payment.wallet.ui.userMessage
 
 /**
@@ -82,15 +85,29 @@ class ApiClientTest {
 
     private class MemoryStore : PendingPaymentStore {
         @Volatile var stored: PendingPayment? = null
-        override fun load(): PendingPayment? = stored
+        override fun load(userId: String): PendingPayment? = stored?.takeIf { it.userId == userId }
         override fun save(payment: PendingPayment): Boolean {
             stored = payment
             return true
         }
-        override fun clear() {
-            stored = null
+        override fun clear(userId: String, idempotencyKey: String) {
+            if (stored?.idempotencyKey == idempotencyKey) stored = null
         }
     }
+
+    /** The production wiring in miniature: transfers through this ApiClient, approval always granted. */
+    private fun transferSubmitter(store: MemoryStore, key: String) = PaymentSubmitter(
+        store = store,
+        currentUser = { "u1" },
+        newKey = { key },
+        authorizer = { Authorization.Granted("sig") },
+        execute = { p ->
+            api.transfer(TransferRequest(p.fromAccount, p.toAccount, p.amountMinor, p.currency), p.idempotencyKey)
+                .map { Settlement(it.transactionId, it.status == "already_posted") }
+        },
+        lookup = { api.transaction(it) },
+        void = { api.voidTransaction(it) },
+    )
 
     @Before
     fun setUp() {
@@ -286,13 +303,7 @@ class ApiClientTest {
                 .setBody("<html><body>Created</body></html>")
         }
         val store = MemoryStore()
-        val submitter = PaymentSubmitter(
-            store = store,
-            newKey = { "key-77" },
-            transfer = { p ->
-                api.transfer(TransferRequest(p.fromAccount, p.toAccount, p.amountMinor, p.currency), p.idempotencyKey)
-            },
-        )
+        val submitter = transferSubmitter(store, "key-77")
 
         val result = submitter.submitNew("from", "to", 2_500, "TJS", "+992900000001")
 
@@ -310,13 +321,7 @@ class ApiClientTest {
                 error(status, code).setHeader("Retry-After", "2")
             }
             val store = MemoryStore()
-            val submitter = PaymentSubmitter(
-                store = store,
-                newKey = { "key-$status" },
-                transfer = { p ->
-                    api.transfer(TransferRequest(p.fromAccount, p.toAccount, p.amountMinor, p.currency), p.idempotencyKey)
-                },
-            )
+            val submitter = transferSubmitter(store, "key-$status")
 
             val result = submitter.submitNew("from", "to", 100, "TJS", "x")
 
@@ -377,11 +382,13 @@ class ApiClientTest {
 
         assertEquals(ErrorCode.INTERNAL_ERROR, result.code)
         assertEquals("rq-42", result.requestId)
-        assertTrue(result.userMessage(), result.userMessage().endsWith("Ref: rq-42"))
+        // Language-independent: the copy comes from string resources; the
+        // request id must be part of it for a 5xx.
+        assertTrue(result.userMessage(), result.userMessage().contains("rq-42"))
 
         serve(refresh = { error(500, "internal_error") }) { error(422, "insufficient_funds", requestId = "rq-43") }
         val refusal = api.wallets() as ApiOutcome.Failed
-        assertFalse("no Ref for a 4xx", refusal.userMessage().contains("Ref:"))
+        assertFalse("no Ref for a 4xx", refusal.userMessage().contains("rq-43"))
     }
 
     // --- Proactive rotation at ~80% of expires_in ---

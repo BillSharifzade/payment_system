@@ -18,10 +18,12 @@ import tj.payment.core.PendingPayment
 import tj.payment.core.ResolveResponse
 import tj.payment.core.SubmitResult
 import tj.payment.core.WalletDto
-import tj.payment.core.transferFeeMinor
+import tj.payment.core.transferFeePreviewMinor
 import tj.payment.wallet.data.WalletRepository
-import tj.payment.wallet.ui.OFFLINE_MESSAGE
+import tj.payment.wallet.ui.NOT_STARTED_MESSAGE
 import tj.payment.wallet.ui.userMessage
+import tj.payment.wallet.R
+import tj.payment.wallet.ui.Copy
 
 enum class SendStep { RECIPIENT, AMOUNT, CONFIRM, RESULT }
 
@@ -58,6 +60,8 @@ data class SendUiState(
     val feeBps: Int? = null,
 
     val submitting: Boolean = false,
+    /** Why the device did not approve the payment (shown on the confirm step); nothing was sent. */
+    val authError: String? = null,
     val outcome: SendOutcome? = null,
     /** What the user confirmed — kept for the result screen. */
     val confirmedAmount: Money? = null,
@@ -71,8 +75,9 @@ data class SendUiState(
     val insufficient: Boolean
         get() = amount?.let { a -> fromWallet?.let { a.minorUnits > it.balanceMinor } } == true
 
+    /** Display-only fee line; TJS only, exactly like the backend (null = no fee line). */
     val feeMinor: Long?
-        get() = feeBps?.let { bps -> amount?.let { transferFeeMinor(it.minorUnits, bps) } }
+        get() = amount?.let { transferFeePreviewMinor(it.minorUnits, it.currency.code, feeBps) }
 
     val canContinueAmount: Boolean
         get() = amount?.isPositive == true && !insufficient
@@ -141,14 +146,14 @@ class SendViewModel(
                     it.copy(
                         resolving = false,
                         recipientError = if (outcome.code == ErrorCode.NOT_FOUND) {
-                            "No wallet with that number."
+                            Copy.text(R.string.send_error_no_wallet)
                         } else {
                             outcome.userMessage()
                         },
                     )
                 }
                 is ApiOutcome.Offline -> _state.update {
-                    it.copy(resolving = false, recipientError = OFFLINE_MESSAGE)
+                    it.copy(resolving = false, recipientError = outcome.userMessage())
                 }
             }
         }
@@ -190,7 +195,7 @@ class SendViewModel(
     fun toConfirm() {
         val s = _state.value
         if (!s.canContinueAmount) return
-        _state.value = s.copy(step = SendStep.CONFIRM)
+        _state.value = s.copy(step = SendStep.CONFIRM, authError = null)
     }
 
     fun backTo(step: SendStep) {
@@ -200,6 +205,10 @@ class SendViewModel(
 
     // --- Submission (all through the PaymentSubmitter machine) ---
 
+    /**
+     * The submitter first asks the device owner to approve (fingerprint/face
+     * or the screen lock, bound to a Keystore key), then persists and sends.
+     */
     fun confirmAndSend() {
         val s = _state.value
         val from = s.fromWallet ?: return
@@ -208,6 +217,7 @@ class SendViewModel(
         if (s.submitting) return
         _state.value = s.copy(
             submitting = true,
+            authError = null,
             confirmedAmount = amount,
             confirmedLabel = s.recipientLabel,
         )
@@ -257,9 +267,10 @@ class SendViewModel(
     }
 
     /**
-     * The user confirmed. The submitter checks the statement first: a payment
-     * that did post is shown as sent instead of silently forgotten, and one
-     * that can't be checked is kept.
+     * The user confirmed. The submitter voids the key with the server first:
+     * afterwards it can never post, so dropping it is safe; a payment that did
+     * post is shown as sent instead of silently forgotten; and one whose void
+     * got no answer is kept.
      */
     fun confirmDiscard() {
         val p = _state.value.pendingResume ?: return
@@ -283,9 +294,9 @@ class SendViewModel(
                     it.copy(
                         discarding = false,
                         pendingError = if (result.offline) {
-                            "Can't check whether it went through while offline. Connect and try again."
+                            Copy.text(R.string.pending_notice_discard_failed_offline)
                         } else {
-                            "Couldn't check whether it went through. Try again in a moment."
+                            Copy.text(R.string.pending_notice_discard_failed)
                         },
                     )
                 }
@@ -295,13 +306,27 @@ class SendViewModel(
 
     private fun settle(result: SubmitResult?) {
         val outcome = when (result) {
-            null -> SendOutcome.Rejected("Nothing to submit.")
+            null -> SendOutcome.Rejected(Copy.text(R.string.payment_nothing_to_submit))
             is SubmitResult.Posted -> SendOutcome.Success(result.alreadyPosted)
             is SubmitResult.Rejected -> SendOutcome.Rejected(result.code.userMessage(), result.code)
             is SubmitResult.Unsettled -> SendOutcome.Unsettled(result.offline)
-            SubmitResult.NotStarted -> SendOutcome.Rejected(
-                "Couldn't save this payment on your device, so nothing was sent. Please try again.",
-            )
+            SubmitResult.NotStarted -> SendOutcome.Rejected(NOT_STARTED_MESSAGE)
+            // Not approved on the device: nothing stored, nothing sent. Stay on
+            // the confirm step (a dismissed prompt needs no message).
+            is SubmitResult.NotAuthorized -> {
+                _state.update {
+                    it.copy(submitting = false, step = SendStep.CONFIRM, authError = result.denial?.userMessage())
+                }
+                return
+            }
+            // This user already has an unsettled payment: show it (finish or
+            // discard) before anything new — one key per intent.
+            is SubmitResult.Blocked -> {
+                _state.update {
+                    it.copy(submitting = false, step = SendStep.RECIPIENT, pendingResume = result.pending, outcome = null)
+                }
+                return
+            }
         }
         _state.update {
             it.copy(submitting = false, step = SendStep.RESULT, outcome = outcome)

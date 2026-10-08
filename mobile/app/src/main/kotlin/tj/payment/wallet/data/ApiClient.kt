@@ -1,6 +1,7 @@
 package tj.payment.wallet.data
 
 import java.io.IOException
+import java.security.GeneralSecurityException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -43,12 +44,14 @@ import tj.payment.core.FxRequest
 import tj.payment.core.FxResponse
 import tj.payment.core.KycStatusResponse
 import tj.payment.core.KycSubmissionDto
+import tj.payment.core.LocalStorageException
 import tj.payment.core.PostResponse
 import tj.payment.core.RefreshRequest
 import tj.payment.core.ResolveResponse
 import tj.payment.core.StatementResponse
 import tj.payment.core.SubmitKycRequest
 import tj.payment.core.TokenResponse
+import tj.payment.core.TransactionStatusDto
 import tj.payment.core.TransferRequest
 import tj.payment.core.WalletDto
 
@@ -67,7 +70,13 @@ import tj.payment.core.WalletDto
  *    to the refresh token ends a session. The backend keeps a short reuse-grace
  *    window for a just-rotated refresh token, so a lost refresh answer recovers;
  *  - a proactive rotation is scheduled at ~80% of `expires_in` while the app is
- *    on screen.
+ *    on screen;
+ *  - with [certificatePins] the API host's certificate chain must contain one
+ *    of the pinned public keys (OkHttp `CertificatePinner`) — for every call,
+ *    the token refresh included;
+ *  - a secure-storage fault while preparing a request (reading or rotating the
+ *    session) is reported as [ApiOutcome.Offline] carrying a
+ *    [LocalStorageException] — typed, never a crash, never "signed out".
  *
  * No Android types here: this class unit-tests on the JVM against MockWebServer.
  */
@@ -79,6 +88,10 @@ class ApiClient(
     private val foreground: StateFlow<Boolean> = MutableStateFlow(true),
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
     private val clock: () -> Long = System::currentTimeMillis,
+    /** `sha256/<base64 SPKI hash>` pins for the API host; empty = no pinning (dev). See [CertificatePins]. */
+    certificatePins: List<String> = emptyList(),
+    /** Last-word tweaks to the HTTP client (tests: trust a local CA). Not for production policy. */
+    configureClient: OkHttpClient.Builder.() -> Unit = {},
 ) {
     data class Timeouts(
         val connectMs: Long = 10_000,
@@ -115,10 +128,12 @@ class ApiClient(
         // wherever it pointed. The API never redirects; treat one as an error.
         .followRedirects(false)
         .followSslRedirects(false)
-        // TODO(prod TLS): .certificatePinner(...) goes here — the bare client
-        // below derives from this one, so pinning applies to the refresh call too.
+        // The bare client below derives from this one, so pinning applies to
+        // the refresh call too.
+        .apply { CertificatePins.pinnerFor(baseUrl, certificatePins)?.let { certificatePinner(it) } }
         .addInterceptor(AuthHeaderInterceptor())
         .authenticator(RefreshAuthenticator())
+        .apply(configureClient)
         .build()
 
     /**
@@ -158,13 +173,31 @@ class ApiClient(
      * (launch restore). Adopts the new tokens; clears the session on [RefreshOutcome.Dead].
      */
     suspend fun refreshSession(): RefreshOutcome = withContext(Dispatchers.IO) {
-        ensureFreshToken(staleToken = session.accessToken())
+        try {
+            ensureFreshToken(staleToken = session.accessToken())
+        } catch (e: IOException) {
+            // Incl. LocalStorageException from the session store: unknown, keep the session.
+            RefreshOutcome.Unreachable(e)
+        } catch (e: SecurityException) {
+            RefreshOutcome.Unreachable(LocalStorageException("secure storage unavailable", e))
+        } catch (e: GeneralSecurityException) {
+            RefreshOutcome.Unreachable(LocalStorageException("secure storage unavailable", e))
+        }
     }
 
     /**
-     * Make [tokens] the session: refresh token persisted first (if we die right
-     * here, the next launch still holds the valid, newest one), then the access
-     * token in memory with its lifetime, then a proactive rotation scheduled.
+     * Make [tokens] the session: refresh token persisted first — synchronously
+     * (`commit`), so if we die right here the next launch still holds the
+     * valid, newest one — then the access token in memory with its lifetime,
+     * then a proactive rotation scheduled. Blocking (disk + Keystore): call off
+     * the main thread.
+     *
+     * A write that completes unsuccessfully (`commit` false) does not stop the
+     * session: the server already rotated, so the new token is the only one
+     * that works now; it lives in memory for this process, and the next launch
+     * falls back on the server's reuse-grace window for the previous token, or
+     * a password sign-in. A Keystore fault (LocalStorageException) propagates
+     * to the caller, which reports it as a typed storage outcome.
      */
     fun adoptTokens(tokens: TokenResponse) {
         session.persistTokens(tokens.userId, tokens.refreshToken)
@@ -251,6 +284,31 @@ class ApiClient(
             PostResponse.serializer(),
         )
 
+    // --- Transaction status / void (by idempotency key = transaction id) ---
+
+    /**
+     * Has the money move with this id (= the idempotency key we sent) posted?
+     * 200 `posted` / `voided`; a coded 404 = neither (unknown, or not ours).
+     * Read-only.
+     */
+    suspend fun transaction(id: String): ApiOutcome<TransactionStatusDto> =
+        call(get("/v1/transactions/${id.urlEncode()}"), TransactionStatusDto.serializer())
+
+    /**
+     * Guarantee the key can never post afterwards: an unused key is claimed as
+     * voided (200 `voided`, idempotent); one that already posted answers 200
+     * with the posted body. Only the PaymentSubmitter calls this, before it
+     * forgets a payment.
+     */
+    suspend fun voidTransaction(id: String): ApiOutcome<TransactionStatusDto> =
+        call(
+            Request.Builder()
+                .url("$baseUrl/v1/transactions/${id.urlEncode()}/void")
+                .post(ByteArray(0).toRequestBody(null)) // the contract says: no body
+                .build(),
+            TransactionStatusDto.serializer(),
+        )
+
     // --- Request building ---
 
     /** Typed request tag: carries no bearer and must never enter the refresh path. */
@@ -276,26 +334,32 @@ class ApiClient(
     // --- Execution (everything — I/O and JSON decode — off the caller's thread) ---
 
     private suspend fun <T> call(request: Request, serializer: KSerializer<T>): ApiOutcome<T> =
-        withContext(Dispatchers.IO) {
-            try {
-                client.newCall(request).execute().use { resp ->
-                    val body = resp.body?.string().orEmpty()
-                    if (resp.isSuccessful) decode(resp.code, body, serializer) else failure(resp.code, body)
-                }
-            } catch (e: IOException) {
-                ApiOutcome.Offline(e)
-            }
-        }
+        execute(request) { status, body -> decode(status, body, serializer) }
 
     private suspend fun callIgnoringBody(request: Request): ApiOutcome<Unit> =
+        execute(request) { _, _ -> ApiOutcome.Ok(Unit) }
+
+    /**
+     * The one boundary every request crosses. Transport failures are Offline;
+     * so is a secure-storage fault raised while the interceptor/authenticator
+     * read or rotate the session (Keystore errors surface as SecurityException
+     * or GeneralSecurityException) — typed as [LocalStorageException] so the
+     * UI can say what happened, and so a money move treats it like any other
+     * "nothing was ruled on" outcome (keep the key). Never a crash.
+     */
+    private suspend fun <T> execute(request: Request, onSuccess: (Int, String) -> ApiOutcome<T>): ApiOutcome<T> =
         withContext(Dispatchers.IO) {
             try {
                 client.newCall(request).execute().use { resp ->
                     val body = resp.body?.string().orEmpty()
-                    if (resp.isSuccessful) ApiOutcome.Ok(Unit) else failure(resp.code, body)
+                    if (resp.isSuccessful) onSuccess(resp.code, body) else failure(resp.code, body)
                 }
             } catch (e: IOException) {
                 ApiOutcome.Offline(e)
+            } catch (e: SecurityException) {
+                ApiOutcome.Offline(LocalStorageException("secure storage unavailable", e))
+            } catch (e: GeneralSecurityException) {
+                ApiOutcome.Offline(LocalStorageException("secure storage unavailable", e))
             }
         }
 
@@ -314,18 +378,21 @@ class ApiClient(
         ApiOutcome.Failed(ErrorCode.UNKNOWN, status, "malformed response: ${e.message}")
     }
 
+    /**
+     * The envelope's code when there is one (`coded`), else a conservative
+     * status-only guess that never invents a business refusal (a bare 422 is
+     * UNKNOWN, not `limit_exceeded`) — see [ErrorCode.fromResponse].
+     */
     private fun failure(status: Int, body: String): ApiOutcome.Failed {
         val error = parseEnvelope(body)?.error
-        val code = error?.code?.let { ErrorCode.fromWire(it) } ?: when (status) {
-            401 -> ErrorCode.UNAUTHORIZED
-            403 -> ErrorCode.FORBIDDEN
-            404 -> ErrorCode.NOT_FOUND
-            409 -> ErrorCode.CONFLICT
-            422 -> ErrorCode.LIMIT_EXCEEDED
-            429 -> ErrorCode.RATE_LIMITED
-            else -> ErrorCode.UNKNOWN
-        }
-        return ApiOutcome.Failed(code, status, error?.message, error?.requestId)
+        val wireCode = error?.code
+        return ApiOutcome.Failed(
+            code = ErrorCode.fromResponse(status, wireCode),
+            httpStatus = status,
+            serverMessage = error?.message,
+            requestId = error?.requestId,
+            coded = wireCode != null,
+        )
     }
 
     private fun parseEnvelope(body: String): ErrorEnvelope? = try {
@@ -412,7 +479,16 @@ class ApiClient(
                 if (session.accessToken() != accessToken) return@launch // already rotated
                 // Unreachable is ignored here: the interceptor / 401 path retries
                 // on the next real request, and Dead has already cleared the session.
-                withContext(Dispatchers.IO) { ensureFreshToken(accessToken) }
+                // A storage fault is ignored the same way — an uncaught exception
+                // in this background job would crash the app.
+                withContext(Dispatchers.IO) {
+                    try {
+                        ensureFreshToken(accessToken)
+                    } catch (_: IOException) {
+                    } catch (_: SecurityException) {
+                    } catch (_: GeneralSecurityException) {
+                    }
+                }
             }
         }
     }

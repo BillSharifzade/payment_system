@@ -1,7 +1,10 @@
 package tj.payment.wallet.data
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import tj.payment.core.ApiOutcome
 import tj.payment.core.ErrorCode
+import tj.payment.core.LocalStorageException
 import tj.payment.core.TokenResponse
 
 /**
@@ -48,18 +51,34 @@ class AuthRepository(
      * server-side revocation, which may be slow or impossible offline. A
      * revocation that never arrives costs nothing: the refresh token is gone
      * from the device either way, and the server expires it on its own.
+     * The wipe is a synchronous disk write, so it runs on the IO dispatcher.
      */
     suspend fun logout() {
-        val refreshToken = session.refreshToken()
-        session.clear()
+        val refreshToken = withContext(Dispatchers.IO) {
+            val token = try {
+                session.refreshToken()
+            } catch (_: LocalStorageException) {
+                null
+            }
+            session.clear()
+            token
+        }
         if (refreshToken != null) api.logout(refreshToken)
     }
 
-    private fun adopt(outcome: ApiOutcome<TokenResponse>, phone: String): ApiOutcome<Unit> = when (outcome) {
-        is ApiOutcome.Ok -> {
-            api.adoptTokens(outcome.value)
-            session.persistPhone(phone)
-            ApiOutcome.Ok(Unit)
+    /**
+     * Persist the new session synchronously, off the main thread, before the
+     * caller moves on. A storage fault here is reported (typed), never a crash.
+     */
+    private suspend fun adopt(outcome: ApiOutcome<TokenResponse>, phone: String): ApiOutcome<Unit> = when (outcome) {
+        is ApiOutcome.Ok -> withContext(Dispatchers.IO) {
+            try {
+                api.adoptTokens(outcome.value)
+                session.persistPhone(phone)
+                ApiOutcome.Ok(Unit)
+            } catch (e: LocalStorageException) {
+                ApiOutcome.Offline(e)
+            }
         }
         is ApiOutcome.Failed -> outcome
         is ApiOutcome.Offline -> outcome

@@ -15,3 +15,18 @@ fun transferFeeMinor(amountMinor: Long, bps: Int): Long {
         Long.MAX_VALUE
     }
 }
+
+/**
+ * The fee line a confirm screen may show, or null when there is none to show.
+ * The backend charges the transfer fee on **TJS only** (`payments.rs`,
+ * `biometric.rs`: `if currency.code() == "TJS"`); any other currency moves
+ * fee-free, so previewing a fee there would promise a deduction that never
+ * happens. Null also while the fee rate is unknown.
+ */
+fun transferFeePreviewMinor(amountMinor: Long, currency: String, bps: Int?): Long? {
+    if (bps == null || currency != FEE_CURRENCY) return null
+    return transferFeeMinor(amountMinor, bps)
+}
+
+/** The only currency the backend charges a transfer fee in. */
+const val FEE_CURRENCY = "TJS"
