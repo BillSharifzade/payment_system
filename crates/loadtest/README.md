@@ -211,6 +211,27 @@ keys fixed both.
 | mimalloc in the server | server CPU 0.382 → 0.339 ms/op, throughput 1671 → 1704 ok/s (within noise), one signed run with stalls: not worth a new allocator |
 | Pool size (`DB_MAX_CONNECTIONS`) | HTTP 8 / 16 / 32 / 64: 1013 / 1235 / 1620 / 1431 ok/s; direct 1142 / 1938 / 2004 / 2020. 32 (the default) stays right for 4 cores |
 
+### Re-check on the final tree, quiet box (0027c64, October 2026)
+
+After the HA, anchoring, fuzzing and TigerBeetle work landed on top of the perf pass, the
+three cases that moved most were re-run with nothing else on the box: same VM, harness, server
+and Postgres alone on the 4 cores, a private Postgres 16 with the production flags above (no
+data checksums, default lock-wait logging). `base` is the 80945b0 server, `final` the 0027c64
+server (default build, `LEDGER_BACKEND=postgres`), one harness binary for both. Interleaved,
+order flipped per repeat, fresh database per run, median (min–max) of 3; 18 runs, all verified,
+zero failed requests:
+
+| Case | ok/s base → final | p50 ms | p99 ms | p99.9 ms | Postgres CPU ms/op | server CPU ms/op |
+|---|---|---|---|---|---|---|
+| http-uniform | 1547 (1503–1608) → 1871 (1866–1978) (**+21%**) | 40.9 → 33.9 | 65.9 → 50.4 | 170.8 → 196.1 | 1.888 → 1.534 | 0.445 → 0.388 |
+| http-hot | 829 (824–840) → 1222 (1219–1241) (**+47%**) | 45.7 → 32.9 | 469.5 → 267.0 | 766.5 → 431.6 | 2.366 → 1.719 | 0.642 → 0.510 |
+| http-contention | 204 (204–229) → 454 (428–454) (**+123%**) | 76.6 → 34.6 | 114.5 → 44.5 | 130.1 → 89.3 | 5.215 → 2.105 | 0.814 → 0.636 |
+
+The gains survived the later work, and the throughput ranges no longer overlap in any row. The quiet box tightened the spread (uniform base 1503–1608 against 1316–1591 above), and
+single-payer contention gained more than on the shared box (+123% against +92%). One number got
+worse: the uniform p99.9 (170.8 → 196.1 ms) at 21% more throughput, so at saturation the rare
+slow commit now queues behind more work. It is the next thing to look at, not a win to claim.
+
 ### Postgres vs TigerBeetle (`LEDGER_BACKEND`, October 2026)
 
 The same release binaries (`--features api/tigerbeetle,loadtest/tigerbeetle`), HTTP, 1 000
