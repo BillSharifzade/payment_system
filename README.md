@@ -138,3 +138,21 @@ checks), the two binaries, Postgres, Redis, NATS JetStream, backup sidecars,
 optional monitoring (Loki/Prometheus/Alertmanager/Grafana) and optional WAL
 archiving. Secrets are files, config typos refuse to boot, every service is
 health-checked, capability-dropped and log-rotated.
+
+Since the hardening pass:
+
+- **`ADMIN_ALLOW_CIDR` is required.** Caddy applies it to every admin-capable
+  path (`/admin`, `/v1/admin/*`, `/v1/deposits*`, KYC approve/reject);
+  `0.0.0.0/0 ::/0` is the explicit, loudly-warned "anyone" setting.
+- **Least-privilege database.** `payment_owner` owns the schema and runs
+  migrations (`MIGRATION_DATABASE_URL_FILE`); the server and workers run as
+  `payment_app`, which can neither bypass the append-only triggers nor
+  UPDATE/DELETE ledger history; `payment_backup` dumps read-only.
+- **Segmented networks;** Redis and NATS require passwords; Postgres runs
+  without capabilities. Images are pinned by digest (`scripts/image-digest.sh`).
+- **Encrypted backups** (age or GPG, optional off-box copy via rclone), a
+  pre-deploy dump before every rollout, freshness alerts, and a restore drill
+  that verifies the signed checkpoint chain — exercised in CI on every push.
+- **Existing installs** upgrade once with `deploy/upgrade-hardening.sh`
+  (idempotent; moves secrets into files, creates the roles, transfers
+  ownership), then `deploy/deploy.sh`.

@@ -341,6 +341,7 @@ Notes:
 - **Fraud/AML hooks:** every transfer passes through a screening step (velocity checks, sanctions list, anomaly scoring) — can run inline for blocking rules and async for scoring.
 - **Audit:** append-only `audit_log` for every privileged/admin action and every money movement; tamper-evident via the checkpoint chain.
 - **Least privilege:** DB roles scoped per service; the API role *cannot* `DELETE` from `entries`.
+  *As built (migration 0027 + `deploy/postgres/10-roles.sh`):* `payment_owner` owns the schema and only runs migrations; `payment_app` (server + workers) is neither owner nor superuser, so it cannot disable the 0025 triggers, and its grants already exclude UPDATE/DELETE on the append-only tables and every `transactions` column but `sealed_seq`; `payment_backup` is read-only; `payment_monitor` serves the Postgres exporter. Default privileges give tables from later migrations ordinary DML grants — **a migration that adds an append-only table must REVOKE UPDATE/DELETE from `payment_app` itself.** Admin endpoints must live under `/v1/admin/` (or be added to `@admin_denied` in the Caddyfile) to inherit the IP allowlist. Workers' `DATABASE_URL` must be a direct or session-mode connection (leader election uses session advisory locks).
 - **Secure SDLC:** `cargo audit` / `cargo deny` in CI for dependency CVEs; secret scanning; code review required for ledger-touching code.
 
 ---
