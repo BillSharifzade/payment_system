@@ -1418,6 +1418,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledger-tigerbeetle"
+version = "0.1.0"
+dependencies = [
+ "ledger",
+ "money",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "storage",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "left-right"
 version = "0.11.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
