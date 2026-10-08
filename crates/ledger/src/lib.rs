@@ -141,6 +141,133 @@ mod tests {
         assert!(ledger.is_conserved());
     }
 
+    fn permutations(entries: &[Entry]) -> Vec<Vec<Entry>> {
+        if entries.len() <= 1 {
+            return vec![entries.to_vec()];
+        }
+        let mut out = Vec::new();
+        for i in 0..entries.len() {
+            let mut rest = entries.to_vec();
+            let first = rest.remove(i);
+            for mut p in permutations(&rest) {
+                p.insert(0, first.clone());
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    // Found by fuzz/ledger_validate: a running net accepted [C, D, D, C] with credits of
+    // 2·(MAX − 97) but refused other orders of the same entries.
+    #[test]
+    fn validity_does_not_depend_on_entry_order() {
+        let (a, b) = (AccountId::new(), AccountId::new());
+        let m = |minor| Money::from_minor(minor, tjs());
+        let overflowing = [
+            Entry::credit(a, m(i128::MAX - 97)),
+            Entry::debit(b, m(i128::MAX)),
+            Entry::debit(b, m(i128::MAX - 194)),
+            Entry::credit(a, m(i128::MAX - 97)),
+        ];
+        let large = [
+            Entry::debit(a, m(i128::MAX)),
+            Entry::credit(b, m(i128::MAX - 1)),
+            Entry::credit(b, m(1)),
+        ];
+        for (entries, want) in [
+            (
+                &overflowing[..],
+                Err(LedgerError::Money(money::MoneyError::Overflow {
+                    operation: "add",
+                })),
+            ),
+            (&large[..], Ok(())),
+        ] {
+            for p in permutations(entries) {
+                assert_eq!(Transaction::with_entries(p).validate(), want);
+            }
+        }
+    }
+
+    #[test]
+    fn reopening_an_account_keeps_the_original() {
+        let (mut ledger, settlement, users) = ledger_with_users(1);
+        ledger.post(&deposit(settlement, users[0], 100)).unwrap();
+        // Before: the settlement account (raw −100) became a wallet holding −100.
+        ledger
+            .open_account(Account::new(settlement, AccountType::UserWallet, tjs()))
+            .unwrap();
+        assert_eq!(ledger.balance(settlement).unwrap().minor_units(), 100);
+        ledger.post(&deposit(settlement, users[0], 50)).unwrap();
+        assert_eq!(ledger.balance(settlement).unwrap().minor_units(), 150);
+        assert!(ledger.is_conserved());
+    }
+
+    #[test]
+    fn a_debit_normal_balance_stays_representable() {
+        let (mut ledger, settlement, users) = ledger_with_users(2);
+        ledger
+            .post(&deposit(settlement, users[0], i128::MAX))
+            .unwrap();
+        let err = ledger.post(&deposit(settlement, users[1], 1)).unwrap_err();
+        assert!(matches!(err, LedgerError::Money(_)), "{err:?}");
+        assert_eq!(ledger.balance(settlement).unwrap().minor_units(), i128::MAX);
+        assert_eq!(ledger.balance(users[1]).unwrap().minor_units(), 0);
+    }
+
+    #[test]
+    fn insufficient_funds_reports_the_net_change_and_the_lowest_account() {
+        for _ in 0..20 {
+            let (mut ledger, settlement, mut users) = ledger_with_users(3);
+            users.sort();
+            ledger.post(&deposit(settlement, users[0], 5)).unwrap();
+            ledger.post(&deposit(settlement, users[1], 5)).unwrap();
+            let overdraw_both = Transaction::with_entries(vec![
+                Entry::debit(users[1], Money::from_minor(i128::MAX - 10, tjs())),
+                Entry::debit(users[0], Money::from_minor(1, tjs())),
+                Entry::debit(users[0], Money::from_minor(9, tjs())),
+                Entry::credit(users[2], Money::from_minor(i128::MAX, tjs())),
+            ]);
+            assert_eq!(
+                ledger.post(&overdraw_both).unwrap_err(),
+                LedgerError::InsufficientFunds {
+                    account: users[0],
+                    balance_minor: 5,
+                    delta_minor: -10,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn conservation_is_exact_near_the_limits() {
+        let mut ledger = InMemoryLedger::new();
+        let mut open = |ty| {
+            let id = AccountId::new();
+            ledger.open_account(Account::new(id, ty, tjs())).unwrap();
+            id
+        };
+        let pairs: Vec<(AccountId, AccountId)> = (0..16)
+            .map(|_| {
+                (
+                    open(AccountType::SystemSettlement),
+                    open(AccountType::UserWallet),
+                )
+            })
+            .collect();
+        for (s, w) in pairs {
+            ledger.post(&deposit(s, w, i128::MAX)).unwrap();
+        }
+        // Raw balances: 16 of +MAX and 16 of −MAX. An i128 running sum overflows unless the
+        // hash order alternates them exactly (p ≈ 3e-9).
+        assert!(ledger.is_conserved());
+        assert_eq!(ledger.net_minor_units(tjs()), Some(0));
+        assert_eq!(
+            ledger.net_minor_units(Currency::new("USD", 2).unwrap()),
+            Some(0)
+        );
+    }
+
     struct MultiCurrency {
         ledger: InMemoryLedger,
         usd: Currency,
@@ -267,7 +394,7 @@ mod tests {
 
                 prop_assert!(book.ledger.is_conserved());
                 for (i, currency) in currencies.iter().enumerate() {
-                    prop_assert_eq!(book.ledger.net_minor_units(*currency), 0);
+                    prop_assert_eq!(book.ledger.net_minor_units(*currency), Some(0));
                     prop_assert_eq!(
                         book.ledger.balance(book.settlement[i]).unwrap().minor_units(),
                         deposited[i]
