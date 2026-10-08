@@ -77,6 +77,10 @@ done
 [[ "$MAX_AGE_H" =~ ^[0-9]+$ ]] || { echo "--max-age must be whole hours" >&2; exit 2; }
 [[ -z "$IDENTITY" && -f secrets/backup_age_identity ]] && IDENTITY=secrets/backup_age_identity
 [[ -z "$TRUSTED" && -f secrets/worker_trusted_public_keys ]] && TRUSTED=secrets/worker_trusted_public_keys
+# TSA roots for the RFC 3161 checkpoint anchors (DESIGN.md §6.5): with them the
+# anchor tokens are verified cryptographically, without them only for imprint.
+TSA_CERTS=${ANCHOR_RFC3161_CERTS_FILE:-anchor/tsa-certs.pem}
+[[ -s "$TSA_CERTS" ]] || TSA_CERTS=""
 
 PG_IMAGE=${PG_IMAGE:-$(pg_image_ref)}
 WORKERS_IMAGE=${WORKERS_IMAGE:-payment-system:${IMAGE_TAG:-latest}}
@@ -344,12 +348,15 @@ else
   set +e
   if [[ -n "$WORKERS_BIN" ]]; then
     report=$(APP_ENV=prod DATABASE_URL="$VERIFY_URL" WORKER_TRUSTED_PUBLIC_KEYS="$keys" \
-             RUST_LOG=warn "$WORKERS_BIN" verify-chain)
+             ANCHOR_RFC3161_CERTS_FILE="$TSA_CERTS" RUST_LOG=warn "$WORKERS_BIN" verify-chain)
     vrc=$?
   else
+    tsa=()
+    [[ -n "$TSA_CERTS" ]] && tsa=(-v "$(cd "$(dirname "$TSA_CERTS")" && pwd)/$(basename "$TSA_CERTS"):/run/tsa-certs.pem:ro"
+                                 -e ANCHOR_RFC3161_CERTS_FILE=/run/tsa-certs.pem)
     report=$(docker run --rm --network "$NET" --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
              -e APP_ENV=prod -e RUST_LOG=warn -e DATABASE_URL="$VERIFY_URL" -e WORKER_TRUSTED_PUBLIC_KEYS="$keys" \
-             --entrypoint /usr/local/bin/payment-workers "$WORKERS_IMAGE" verify-chain)
+             "${tsa[@]}" --entrypoint /usr/local/bin/payment-workers "$WORKERS_IMAGE" verify-chain)
     vrc=$?
   fi
   set -e

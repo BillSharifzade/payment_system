@@ -92,10 +92,12 @@ expect_denied() {
 }
 
 echo "==> payment_app: forbidden statements"
-for t in entries checkpoints admin_actions screening_events biometric_events voided_transactions; do
+for t in entries checkpoints admin_actions screening_events biometric_events voided_transactions \
+         checkpoint_anchors tb_intents; do
   if [[ "$(as_super -d "$db" -tAc "SELECT to_regclass('public.$t') IS NOT NULL")" != t ]]; then
-    # voided_transactions arrives with migration 0023; the others must exist.
-    [[ "$t" == voided_transactions ]] && { echo "    skip  $t (not in this schema)"; continue; }
+    # Later migrations add these (0023, 0031, 0033); the others must exist.
+    case $t in voided_transactions|checkpoint_anchors|tb_intents)
+      echo "    skip  $t (not in this schema)"; continue ;; esac
     bad "table $t missing"; continue
   fi
   expect_denied "UPDATE $t"   "UPDATE $t SET created_at = created_at"
@@ -186,6 +188,20 @@ BEGIN
                VALUES ('00000000-0000-0000-0000-000000001000', 1)
                ON CONFLICT (account_id) DO UPDATE
                SET sum_minor = reconciled_sums.sum_minor + EXCLUDED.sum_minor, updated_at = now()$q$;
+  END IF;
+  IF to_regclass('public.checkpoint_anchors') IS NOT NULL THEN
+    -- what the anchoring leader does: one witness token for the checkpoint above
+    EXECUTE $q$INSERT INTO checkpoint_anchors (id, checkpoint_seq, checkpoint_hash, kind, witness, status, proof, attested_at)
+               VALUES ('0192f0c0-0000-7000-8000-00000000a005', 9000000001, decode(repeat('00', 32), 'hex'),
+                       'rfc3161', 'https://tsa.example', 'complete', '\x01', now())$q$;
+  END IF;
+  IF to_regclass('public.tb_intents') IS NOT NULL THEN
+    -- the TigerBeetle hybrid ledger's commit record and recovery watermark
+    EXECUTE $q$INSERT INTO tb_intents (attempt_id, transaction_id, outcome)
+               VALUES ('0192f0c0-0000-7000-8000-00000000a006', '0192f0c0-0000-7000-8000-00000000a001', 'commit')$q$;
+    EXECUTE $q$INSERT INTO tb_recovery_watermark (cluster_id, through_timestamp)
+               VALUES ('0192f0c0-0000-7000-8000-00000000a007', 0)
+               ON CONFLICT (cluster_id) DO UPDATE SET through_timestamp = EXCLUDED.through_timestamp$q$;
   END IF;
   IF to_regclass('public.terminals') IS NOT NULL THEN
     EXECUTE $q$INSERT INTO terminals (id, merchant_user_id, label, key_hash, created_by)

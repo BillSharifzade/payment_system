@@ -305,13 +305,17 @@ jobs:
           for s in postgres_password pg_owner_password pg_app_password pg_backup_password pg_monitor_password \
                    database_url migration_database_url jwt_secret worker_signing_key worker_trusted_public_keys \
                    biometric_template_key redis_acl redis_url nats_auth.conf nats_url backup_recipients \
-                   backup_rclone_conf pgbackrest.conf; do echo ci > "secrets/$s"; done
+                   backup_rclone_conf pgbackrest.conf vault_role_id vault_secret_id; do echo ci > "secrets/$s"; done
           cp app.env.example app.env
+          mkdir -p anchor && echo ci > anchor/tsa-certs.pem
           for combo in docker-compose.prod.yml docker-compose.lan.yml \
                        docker-compose.prod.yml:docker-compose.monitoring.yml \
                        docker-compose.prod.yml:docker-compose.wal-archive.yml \
                        docker-compose.prod.yml:docker-compose.monitoring.yml:docker-compose.wal-archive.yml \
-                       docker-compose.lan.yml:docker-compose.monitoring.yml; do
+                       docker-compose.lan.yml:docker-compose.monitoring.yml \
+                       docker-compose.prod.yml:docker-compose.anchor.yml \
+                       docker-compose.prod.yml:docker-compose.vault.yml:docker-compose.anchor.yml \
+                       docker-compose.lan.yml:docker-compose.anchor.yml; do
             echo "compose config: $combo"
             COMPOSE_FILE=$combo docker compose config -q
           done
@@ -320,7 +324,11 @@ jobs:
             | jq -e '[.services | to_entries[] | select(.value.ports) | .key] | sort == ["caddy", "grafana"]'
           COMPOSE_FILE=docker-compose.prod.yml:docker-compose.monitoring.yml docker compose config --format json \
             | jq -e '[.services.grafana.ports[].host_ip] == ["127.0.0.1"]'
-          rm -rf secrets .env app.env
+          # The anchoring overlay gives the workers egress and the TSA roots.
+          COMPOSE_FILE=docker-compose.prod.yml:docker-compose.vault.yml:docker-compose.anchor.yml docker compose config --format json \
+            | jq -e '(.services."payment-workers".networks | keys | sort) == ["backend", "egress", "vault"]
+                     and .services."payment-workers".environment.ANCHOR_RFC3161_CERTS_FILE == "/etc/payment/tsa-certs.pem"'
+          rm -rf secrets anchor .env app.env
 
       - name: End-to-end backup + restore drill (images from this run)
         env:

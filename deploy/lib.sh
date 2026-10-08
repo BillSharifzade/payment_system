@@ -84,21 +84,30 @@ generate_secrets() {
 
   # Application keys.
   gen_secret jwt_secret              32
-  gen_secret worker_signing_key      32
   gen_secret biometric_template_key  32
 
   # The workers' verifier (and restore-drill.sh) trust these Ed25519 public
   # keys, comma-separated. The current signing key's public key is always in
   # it; when rotating the signing key, KEEP the old public key in this list or
   # old checkpoints stop verifying.
-  local pub keys
-  pub=$(ed25519_public_hex "$(read_secret worker_signing_key)") \
-    || die "secrets/worker_signing_key must be 64 hex characters"
-  keys=$(cat secrets/worker_trusted_public_keys 2>/dev/null | tr -d ' \r\n' || true)
-  if [[ ",$keys," != *",$pub,"* ]]; then
-    keys=${keys:+$keys,}$pub
-    write_secret worker_trusted_public_keys "$keys"
-    say "trusted public key $pub added to secrets/worker_trusted_public_keys"
+  # With an external signer (the Vault overlay, or WORKER_SIGNER=vault|pkcs11)
+  # the local key is retired: never mint a new one, and never auto-trust it —
+  # a shredded worker_signing_key must not silently come back as a trusted key.
+  local pub keys signer
+  signer=$(env_get app.env WORKER_SIGNER)
+  if [[ ":${COMPOSE_FILE:-}:" == *":docker-compose.vault.yml:"* || "$signer" == vault || "$signer" == pkcs11 ]]; then
+    say "external checkpoint signer: no local worker_signing_key generated or trusted"
+  else
+    gen_secret worker_signing_key 32
+    pub=$(ed25519_public_hex "$(read_secret worker_signing_key)") \
+      || die "secrets/worker_signing_key must be 64 hex characters"
+    keys=$(cat secrets/worker_trusted_public_keys 2>/dev/null | tr -d ' \r\n' || true)
+    # A retired key may be pinned as <hex>@<last seq>; that still counts as present.
+    if [[ ",$keys," != *",$pub,"* && ",$keys" != *",$pub@"* ]]; then
+      keys=${keys:+$keys,}$pub
+      write_secret worker_trusted_public_keys "$keys"
+      say "trusted public key $pub added to secrets/worker_trusted_public_keys"
+    fi
   fi
 
   # Redis: ACL file (password stored only as a SHA-256 hash) + the app's URL.

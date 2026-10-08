@@ -223,6 +223,45 @@ groups:
           summary: "Checkpoint chain verification FAILED"
           description: "A signed checkpoint no longer verifies — possible tampering. Preserve the database and logs before doing anything else."
 
+  # External anchoring and the checkpoint signer (DESIGN.md §6.5): metrics from
+  # crates/workers/src/anchor and crates/workers/src/signer.
+  - name: payment-anchoring
+    rules:
+      - alert: CheckpointAnchorLagging        # 2 x ANCHOR_INTERVAL_SECS + 10 min
+        expr: max by (witness) (checkpoint_anchor_unanchored_age_seconds and on (instance) (worker_leader == 1)) > 2 * 3600 + 600
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "No new checkpoint anchored by {{ $labels.witness }} for {{ $value | humanizeDuration }}"}
+      - alert: CheckpointAnchorStale
+        expr: min(checkpoint_anchor_unanchored_age_seconds and on (instance) (worker_leader == 1)) > 6 * 3600
+        for: 10m
+        labels: {severity: critical}
+        annotations: {summary: "No external witness has anchored a checkpoint for {{ $value | humanizeDuration }}"}
+      - alert: CheckpointAnchorFailing
+        expr: sum by (witness, op) (increase(checkpoint_anchor_failures_total[3h])) >= 3
+        labels: {severity: warning}
+        annotations: {summary: "{{ $labels.witness }}: {{ $value | printf \"%.0f\" }} anchor {{ $labels.op }} failures in 3 h"}
+      - alert: OpenTimestampsUnconfirmed
+        expr: max(checkpoint_anchor_unconfirmed_age_seconds{witness="opentimestamps"} and on (instance) (worker_leader == 1)) > 24 * 3600
+        for: 30m
+        labels: {severity: warning}
+        annotations: {summary: "An OpenTimestamps proof has waited {{ $value | humanizeDuration }} for a Bitcoin block"}
+      - alert: CheckpointAnchorRegressed   # anchors are append-only: a drop means rows were deleted
+        expr: max by (witness) (checkpoint_anchored_through_seq and on (instance) (worker_leader == 1)) < max by (witness) (max_over_time(checkpoint_anchored_through_seq[7d]))
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: "Anchored checkpoint seq for {{ $labels.witness }} went DOWN — anchors were deleted"}
+      - alert: CheckpointSignerUnavailable
+        expr: max(checkpoint_signer_ready and on (instance) (worker_leader == 1)) == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: "The checkpoint signer is unavailable: sealing is paused"}
+      - alert: CheckpointSignerLocal
+        expr: max(worker_signer_info{signer="local"}) == 1
+        for: 24h
+        labels: {severity: warning}
+        annotations: {summary: "Checkpoints are signed with a local key (WORKER_SIGNER=local)"}
+
   - name: payment-backups
     rules:
       - alert: BackupStale
