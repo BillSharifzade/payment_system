@@ -27,7 +27,7 @@ import {
 
 function StatusBadges({ u }: { u: { status: string; kyc_level: number; is_admin: boolean; is_blocked?: boolean } }) {
   return (
-    <span className="row" style={{ gap: "0.35rem", flexWrap: "nowrap" }}>
+    <span className="row tight nowrap">
       {u.status === "active" ? (
         <Badge tone="ok" icon="check">
           active
@@ -101,7 +101,7 @@ function UserDetail({
 
   return (
     <>
-      <div className="row" style={{ marginBottom: "0.9rem" }}>
+      <div className="row mb-09">
         <button className="quiet" onClick={onBack}>
           <Icon name="back" size={15} />
           All users
@@ -120,12 +120,12 @@ function UserDetail({
       {user && (
         <>
           <div className="panel">
-            <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start" }}>
+            <div className="row user-head">
               <div>
-                <h2 style={{ fontSize: "1.15rem" }} className="mono">
+                <h2 className="mono user-phone">
                   {user.phone}
                 </h2>
-                <div className="muted small" style={{ marginTop: "0.25rem" }}>
+                <div className="muted small mt-025">
                   joined {formatTime(user.created_at_ms)} · <IdChip id={user.id} />
                 </div>
               </div>
@@ -174,7 +174,7 @@ function UserDetail({
 
           <div className="panel danger-zone">
             <div className="panel-title">Enforcement</div>
-            <div className="row" style={{ marginBottom: "0.75rem" }}>
+            <div className="row mb-075">
               {user.status === "active" ? (
                 <ConfirmButton
                   className="danger"
@@ -214,7 +214,7 @@ function UserDetail({
                     placeholder="Block reason (sanctions / fraud …)"
                     value={blockReason}
                     onChange={(e) => setBlockReason(e.target.value)}
-                    style={{ width: 300 }}
+                    className="block-reason"
                   />
                   <ConfirmButton
                     className="danger"
@@ -327,7 +327,7 @@ export default function Users() {
 
       <div className="table-wrap">
         {rows === null ? (
-          <div style={{ padding: "1rem", display: "flex", flexDirection: "column", gap: "0.7rem" }}>
+          <div className="skeleton-stack">
             <Skeleton w="100%" h={18} />
             <Skeleton w="88%" h={18} />
             <Skeleton w="94%" h={18} />
