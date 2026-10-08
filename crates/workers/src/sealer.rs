@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::error::{Result, WorkerError};
-use crypto::{leaf_hash, merkle_root, sha256, Hash, Sealer, SigningError, TrustedKeys};
+use crate::signer::CheckpointSigner;
+use crypto::{leaf_hash, merkle_root, sha256, verify_hash, Hash, SigningError, TrustedKeys};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row};
 use uuid::Uuid;
@@ -164,9 +165,9 @@ async fn latest_checkpoint(pool: &PgPool) -> Result<(i64, i64, [u8; 32])> {
     }
 }
 
-pub async fn seal_next_batch(
+pub async fn seal_next_batch<S: CheckpointSigner>(
     pool: &PgPool,
-    sealer: &Sealer,
+    signer: &S,
     batch_size: i64,
 ) -> Result<Option<CheckpointSummary>> {
     let (last_cp_seq, last_to_seq, prev_hash) = latest_checkpoint(pool).await?;
@@ -219,7 +220,11 @@ pub async fn seal_next_batch(
     let leaves = transaction_leaves(&mut *db, &txn_ids).await?;
     let root = merkle_root(&leaves).expect("non-empty leaves");
     let checkpoint_hash = compute_checkpoint_hash(&prev_hash, &root, from_seq, to_seq);
-    let signature = sealer.sign_hash(&checkpoint_hash);
+    // An external signer answers over the network while this transaction
+    // holds the batch; its signature is checked before anything is written.
+    let public_key = signer.public_key();
+    let signature = signer.sign(&checkpoint_hash).await?;
+    verify_hash(&public_key, &checkpoint_hash, &signature)?;
     let new_seq = last_cp_seq + 1;
 
     sqlx::query(
@@ -237,7 +242,7 @@ pub async fn seal_next_batch(
     .bind(prev_hash.to_vec())
     .bind(checkpoint_hash.as_bytes().to_vec())
     .bind(signature.to_vec())
-    .bind(sealer.public_key_bytes().to_vec())
+    .bind(public_key.to_vec())
     .execute(&mut *db)
     .await?;
 
@@ -253,9 +258,13 @@ pub async fn seal_next_batch(
     }))
 }
 
-pub async fn seal_all(pool: &PgPool, sealer: &Sealer, batch_size: i64) -> Result<u64> {
+pub async fn seal_all<S: CheckpointSigner>(
+    pool: &PgPool,
+    signer: &S,
+    batch_size: i64,
+) -> Result<u64> {
     let mut count = 0;
-    while seal_next_batch(pool, sealer, batch_size).await?.is_some() {
+    while seal_next_batch(pool, signer, batch_size).await?.is_some() {
         count += 1;
     }
     Ok(count)
@@ -343,9 +352,13 @@ fn authenticate(
         return Err(broken(seq, "checkpoint hash mismatch"));
     }
     trusted
-        .verify(&public_key, &recomputed, &signature)
+        .verify(seq, &public_key, &recomputed, &signature)
         .map_err(|e| match e {
             SigningError::UntrustedKey => broken(seq, "untrusted signing key"),
+            SigningError::RetiredKey(last) => broken(
+                seq,
+                format!("signed by a key retired after checkpoint {last}"),
+            ),
             _ => broken(seq, "invalid signature"),
         })?;
     Ok(Header {

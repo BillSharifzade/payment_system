@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crypto::rfc3161::TsaTrust;
 use crypto::{Sealer, TrustedKeys};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
@@ -11,6 +12,9 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+use workers::anchor::{Anchor, AnchorConfig, AnchorCursor, AnchorReport, AnyAnchor, KIND_OTS};
+use workers::env::Env;
+use workers::signer::{AnySigner, CheckpointSigner, SignerConfig};
 use workers::{
     EventPublisher, FullReconciliation, LeaderLock, LoggingPublisher, NatsPublisher,
     ReconcileConfig, RetentionConfig, VerifyReport, VerifyState, WorkerError, LEADER_LOCK_KEY,
@@ -175,6 +179,15 @@ async fn verify_chain_report() -> Result<(bool, serde_json::Value), BoxError> {
             Err(e) => break Err(e),
         }
     };
+    let tsa_trust = AnchorConfig::from_env(&Env::process())?.tsa_trust;
+    let outcome = match outcome {
+        Ok(()) => {
+            workers::anchor::verify_anchors(&pool, tsa_trust.as_ref(), &AnchorCursor::default())
+                .await
+                .map(|(anchors, _)| anchors)
+        }
+        Err(e) => Err(e),
+    };
     let (unsealed, _) = workers::unsealed_lag(&pool).await?;
     let mut json = serde_json::json!({
         "checkpoints_verified": report.checkpoints_verified,
@@ -186,8 +199,16 @@ async fn verify_chain_report() -> Result<(bool, serde_json::Value), BoxError> {
         "trusted_keys": trusted.to_hex(),
     });
     match outcome {
-        Ok(()) => {
+        Ok(anchors) => {
             json["status"] = "intact".into();
+            json["anchored_through_seq"] = anchors.anchored_through_seq.into();
+            json["anchor_age_seconds"] = anchors
+                .newest_anchor_at
+                .map(|at| (now_epoch_secs() as i64 - at).max(0))
+                .into();
+            json["unanchored_checkpoints"] =
+                (state.last_checkpoint_seq - anchors.anchored_through_seq).into();
+            json["anchors"] = anchors_json(&anchors, tsa_trust.as_ref());
             Ok((true, json))
         }
         Err(WorkerError::ChainBroken { seq, reason }) => {
@@ -197,6 +218,46 @@ async fn verify_chain_report() -> Result<(bool, serde_json::Value), BoxError> {
             Ok((false, json))
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+fn anchors_json(r: &AnchorReport, tsa: Option<&TsaTrust>) -> serde_json::Value {
+    let bitcoin: Vec<serde_json::Value> = r
+        .bitcoin
+        .iter()
+        .map(|b| {
+            let mut rpc = b.merkle_root;
+            rpc.reverse();
+            serde_json::json!({
+                "checkpoint_seq": b.checkpoint_seq,
+                "block_height": b.height,
+                "merkle_root": hex::encode(b.merkle_root),
+                "merkle_root_rpc": hex::encode(rpc),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "verified": r.verified,
+        "rfc3161": r.rfc3161,
+        "rfc3161_signatures_trusted": tsa.is_some(),
+        "ots_pending": r.ots_pending,
+        "ots_bitcoin": r.ots_bitcoin,
+        "bitcoin_attestations": bitcoin,
+    })
+}
+
+/// WORKER_TRUSTED_PUBLIC_KEYS must pin an external signer's key: the worker
+/// never trusts a key just because Vault or an HSM presented it.
+fn check_pinned(signer: &AnySigner, trusted: &TrustedKeys) -> Result<(), String> {
+    let key = signer.public_key();
+    if trusted.is_current(&key) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the {} signer's public key {} is not a current (unretired) key in WORKER_TRUSTED_PUBLIC_KEYS: add it there first",
+            signer.kind(),
+            hex::encode(key)
+        ))
     }
 }
 
@@ -260,18 +321,52 @@ async fn main() -> Result<(), BoxError> {
         .map_err(|e| format!("metrics exporter on {metrics_addr}: {e}"))?;
     tracing::info!(%metrics_addr, "metrics exporter listening");
 
-    let sealer = match signing_key()? {
-        Some(sealer) => sealer,
-        None if is_prod() => {
-            return Err("WORKER_SIGNING_KEY must be set when APP_ENV != dev".into());
+    let env = Env::process();
+    let signer_cfg = SignerConfig::from_env(&env)?;
+    let anchor_cfg = AnchorConfig::from_env(&env)?;
+    let (signer, trusted) = match signer_cfg {
+        SignerConfig::Local => {
+            let sealer = match signing_key()? {
+                Some(sealer) => sealer,
+                None if is_prod() => {
+                    return Err("WORKER_SIGNING_KEY must be set when APP_ENV != dev".into());
+                }
+                None => {
+                    tracing::warn!("WORKER_SIGNING_KEY not set — generating an EPHEMERAL key. Checkpoints will not verify across restarts. Do not use in production.");
+                    Sealer::generate()
+                }
+            };
+            if is_prod() {
+                tracing::warn!(public_key = %sealer.public_key_hex(), "WORKER_SIGNER=local: the checkpoint signing key is in this process's memory, so whoever obtains it can re-sign rewritten history. Move it to Vault or an HSM (WORKER_SIGNER=vault|pkcs11) and anchor checkpoints externally (ANCHOR_*)");
+            }
+            let trusted = trusted_keys(Some(&sealer))?;
+            (Some(AnySigner::Local(sealer)), trusted)
         }
-        None => {
-            tracing::warn!("WORKER_SIGNING_KEY not set — generating an EPHEMERAL key. Checkpoints will not verify across restarts. Do not use in production.");
-            Sealer::generate()
+        _ => {
+            let trusted = trusted_keys(None)?;
+            if trusted.is_empty() {
+                return Err(format!(
+                    "WORKER_SIGNER={} needs WORKER_TRUSTED_PUBLIC_KEYS to pin the signer's public key",
+                    signer_cfg.kind()
+                )
+                .into());
+            }
+            (None, trusted)
         }
     };
-    let trusted = trusted_keys(Some(&sealer))?;
-    tracing::info!(public_key = %sealer.public_key_hex(), trusted_keys = ?trusted.to_hex(), "sealer ready");
+    metrics::gauge!("worker_signer_info", "signer" => signer_cfg.kind()).set(1.0);
+    tracing::info!(signer = signer_cfg.kind(), trusted_keys = ?trusted.to_hex(), "checkpoint signer configured");
+    let anchors = anchor_cfg.anchors()?;
+    if anchors.is_empty() {
+        tracing::info!("no ANCHOR_RFC3161_URLS / ANCHOR_OTS_CALENDARS: external anchoring is off");
+    } else {
+        let witnesses: Vec<&str> = anchors.iter().map(|a| a.witness()).collect();
+        tracing::info!(
+            ?witnesses,
+            interval_secs = anchor_cfg.interval.as_secs(),
+            "anchoring checkpoints externally"
+        );
+    }
 
     let connect_options = connect_options(&database_url)?;
     let pool = PgPoolOptions::new()
@@ -283,8 +378,15 @@ async fn main() -> Result<(), BoxError> {
     let cfg = Config {
         pool,
         connect_options,
-        sealer,
+        signer: SignerSlot {
+            cfg: signer_cfg,
+            signer,
+            trusted: trusted.clone(),
+        },
         trusted,
+        tsa_trust: anchor_cfg.tsa_trust.clone(),
+        anchors,
+        anchor_interval: anchor_cfg.interval,
         interval_secs,
         relay_interval_secs,
         batch_size,
@@ -319,8 +421,11 @@ async fn main() -> Result<(), BoxError> {
 struct Config {
     pool: PgPool,
     connect_options: PgConnectOptions,
-    sealer: Sealer,
+    signer: SignerSlot,
     trusted: TrustedKeys,
+    tsa_trust: Option<TsaTrust>,
+    anchors: Vec<AnyAnchor>,
+    anchor_interval: Duration,
     interval_secs: u64,
     relay_interval_secs: u64,
     batch_size: i64,
@@ -375,6 +480,7 @@ struct Liveness {
     relay: AtomicU64,
     seal: AtomicU64,
     duties: AtomicU64,
+    anchor: AtomicU64,
 }
 
 impl Liveness {
@@ -391,14 +497,19 @@ async fn heartbeat_loop(
     liveness: Arc<Liveness>,
     interval_secs: u64,
     relay_interval_secs: u64,
+    anchor_tick: Option<Duration>,
     mut stop: watch::Receiver<bool>,
 ) {
     let path = heartbeat_path();
-    let limits = [
+    let mut limits = vec![
         ("relay", &liveness.relay, 3 * relay_interval_secs + 120),
         ("seal", &liveness.seal, 3 * interval_secs + 120),
         ("duties", &liveness.duties, 3 * interval_secs + 600),
     ];
+    // An anchor tick may wait out several witnesses' HTTP timeouts.
+    if let Some(tick) = anchor_tick {
+        limits.push(("anchor", &liveness.anchor, 3 * tick.as_secs() + 900));
+    }
     let mut ticker = ticker(Duration::from_secs(interval_secs));
     loop {
         tokio::select! {
@@ -517,12 +628,49 @@ async fn relay_loop<P: EventPublisher + Send + Sync + 'static>(
     tracing::info!("relay loop stopped");
 }
 
+/// The checkpoint signer, connected lazily by the leader: an unreachable or
+/// sealed Vault (or HSM) pauses sealing — alerted on — but never the outbox
+/// relay or the other duties.
+struct SignerSlot {
+    cfg: SignerConfig,
+    signer: Option<AnySigner>,
+    trusted: TrustedKeys,
+}
+
+impl SignerSlot {
+    async fn get(&mut self, timeout: Duration) -> Option<&AnySigner> {
+        if self.signer.is_none() {
+            let connected = match tokio::time::timeout(timeout, self.cfg.connect()).await {
+                Ok(Ok(signer)) => check_pinned(&signer, &self.trusted).map(|()| signer),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("timed out".to_string()),
+            };
+            match connected {
+                Ok(signer) => {
+                    tracing::info!(signer = signer.kind(), public_key = %hex::encode(signer.public_key()), "checkpoint signer connected");
+                    self.signer = Some(signer);
+                }
+                Err(e) => {
+                    metrics::counter!("checkpoint_signer_failures_total", "signer" => self.cfg.kind()).increment(1);
+                    tracing::error!(signer = self.cfg.kind(), error = %e, "checkpoint signer unavailable; sealing paused");
+                }
+            }
+        }
+        metrics::gauge!("checkpoint_signer_ready").set(if self.signer.is_some() {
+            1.0
+        } else {
+            0.0
+        });
+        self.signer.as_ref()
+    }
+}
+
 /// Sealing has its own loop so a long verification or reconciliation pass
 /// never delays it.
 #[allow(clippy::too_many_arguments)]
 async fn seal_loop(
     pool: PgPool,
-    sealer: Sealer,
+    mut signer: SignerSlot,
     interval_secs: u64,
     batch_size: i64,
     max_batches_per_tick: u64,
@@ -542,11 +690,18 @@ async fn seal_loop(
         }
         metrics::counter!("worker_ticks_total").increment(1);
         let mut sealed = 0u64;
+        let connect_timeout = Duration::from_secs(interval_secs.max(30));
         for _ in 0..max_batches_per_tick {
-            match workers::seal_next_batch(&pool, &sealer, batch_size).await {
+            let Some(signer) = signer.get(connect_timeout).await else {
+                break;
+            };
+            match workers::seal_next_batch(&pool, signer, batch_size).await {
                 Ok(Some(_)) => sealed += 1,
                 Ok(None) => break,
                 Err(e) => {
+                    if matches!(e, WorkerError::Signer(_)) {
+                        metrics::counter!("checkpoint_signer_failures_total", "signer" => signer.kind()).increment(1);
+                    }
                     metrics::counter!("worker_errors_total", "duty" => "seal").increment(1);
                     tracing::error!(error = %e, "sealing failed");
                     break;
@@ -569,12 +724,27 @@ async fn seal_loop(
     tracing::info!("seal loop stopped");
 }
 
+/// A full re-verification walks the chain, then every anchor.
+enum FullVerify {
+    Chain {
+        state: VerifyState,
+        report: VerifyReport,
+    },
+    Anchors {
+        state: VerifyState,
+        report: VerifyReport,
+        cursor: AnchorCursor,
+        anchors: AnchorReport,
+    },
+}
+
 /// Verification, reconciliation and retention. Full passes advance in bounded
 /// steps under a per-tick time budget, so incremental checks keep their cadence
 /// while a full pass over a large ledger is in progress.
 struct Duties {
     pool: PgPool,
     trusted: TrustedKeys,
+    tsa_trust: Option<TsaTrust>,
     budget: Duration,
     verify_interval: Duration,
     verify_full_every: Duration,
@@ -589,10 +759,14 @@ struct Duties {
     verify_state: Option<VerifyState>,
     verify_pending: bool,
     last_verify: Option<Instant>,
-    full_verify: Option<(VerifyState, VerifyReport, Instant)>,
+    full_verify: Option<(FullVerify, Instant)>,
     next_full_verify: Instant,
     incremental_chain_broken: bool,
     full_chain_broken: bool,
+    anchor_cursor: AnchorCursor,
+    // The checkpoint the anchor loop may anchor: the newest verified one,
+    // withdrawn while verification reports the chain broken.
+    verified_tx: watch::Sender<Option<VerifyState>>,
 
     // Accounts whose balance disagreed; re-checked every pass until they agree.
     suspects: BTreeSet<Uuid>,
@@ -607,11 +781,12 @@ struct Duties {
 }
 
 impl Duties {
-    fn new(cfg: &Config) -> Self {
+    fn new(cfg: &Config, verified_tx: watch::Sender<Option<VerifyState>>) -> Self {
         let now = Instant::now();
         Self {
             pool: cfg.pool.clone(),
             trusted: cfg.trusted.clone(),
+            tsa_trust: cfg.tsa_trust.clone(),
             budget: Duration::from_secs(cfg.interval_secs.max(1)),
             verify_interval: cfg.verify_interval,
             verify_full_every: cfg.verify_full_every,
@@ -627,6 +802,8 @@ impl Duties {
             next_full_verify: now,
             incremental_chain_broken: false,
             full_chain_broken: false,
+            anchor_cursor: AnchorCursor::default(),
+            verified_tx,
             suspects: BTreeSet::new(),
             reconcile_backlog: false,
             last_reconcile: None,
@@ -646,7 +823,11 @@ impl Duties {
         let now = Instant::now();
         let deadline = now + self.budget;
         if self.full_verify.is_none() && now >= self.next_full_verify {
-            self.full_verify = Some((VerifyState::genesis(), VerifyReport::default(), now));
+            let chain = FullVerify::Chain {
+                state: VerifyState::genesis(),
+                report: VerifyReport::default(),
+            };
+            self.full_verify = Some((chain, now));
         }
         if self.full_reconcile.is_none() && now >= self.next_full_reconcile {
             self.full_reconcile = Some((FullReconciliation::new(), now));
@@ -704,7 +885,10 @@ impl Duties {
                     state = page.state;
                     if page.done {
                         self.verify_pending = false;
-                        self.incremental_chain_broken = false;
+                        match self.verify_anchors_incremental().await {
+                            Ok(()) => self.incremental_chain_broken = false,
+                            Err(e) => self.chain_error("incremental", &e),
+                        }
                         break;
                     }
                 }
@@ -716,6 +900,7 @@ impl Duties {
             }
         }
         self.verify_state = Some(state);
+        self.publish_verified();
         if report.checkpoints_verified > 0 {
             tracing::info!(
                 checkpoints = report.checkpoints_verified,
@@ -724,6 +909,33 @@ impl Duties {
                 "checkpoint chain verified"
             );
         }
+    }
+
+    /// Every anchor still matches its checkpoint (one statement), and anchors
+    /// added since the last pass verify.
+    async fn verify_anchors_incremental(&mut self) -> workers::Result<()> {
+        workers::anchor::check_anchor_consistency(&self.pool).await?;
+        let (report, cursor) = workers::anchor::verify_anchors(
+            &self.pool,
+            self.tsa_trust.as_ref(),
+            &self.anchor_cursor,
+        )
+        .await?;
+        self.anchor_cursor = cursor;
+        if report.verified > 0 {
+            tracing::info!(
+                anchors = report.verified,
+                anchored_through_seq = report.anchored_through_seq,
+                "checkpoint anchors verified"
+            );
+        }
+        Ok(())
+    }
+
+    fn publish_verified(&self) {
+        let broken = self.incremental_chain_broken || self.full_chain_broken;
+        self.verified_tx
+            .send_replace(if broken { None } else { self.verify_state });
     }
 
     fn chain_error(&mut self, pass: &str, e: &WorkerError) {
@@ -739,37 +951,92 @@ impl Duties {
             }
             _ => tracing::error!(pass, error = %e, "chain verification error"),
         }
+        self.publish_verified();
     }
 
-    /// One page of the full re-verification. Returns whether it did work.
+    /// One page of the full re-verification: the chain, then the anchors.
+    /// Returns whether it did work.
     async fn full_verify_step(&mut self) -> bool {
-        let Some((state, report, _)) = self.full_verify.as_mut() else {
+        let Some((phase, _)) = self.full_verify.as_mut() else {
             return false;
         };
-        match workers::verify_chain_page(&self.pool, &self.trusted, state).await {
-            Ok(page) => {
-                report.checkpoints_verified += page.report.checkpoints_verified;
-                report.transactions_covered += page.report.transactions_covered;
-                *state = page.state;
-                if page.done {
-                    let (state, report, started) = self.full_verify.take().expect("checked above");
-                    self.full_chain_broken = false;
-                    self.next_full_verify = started + self.verify_full_every;
-                    if self
-                        .verify_state
-                        .is_none_or(|s| s.last_checkpoint_seq < state.last_checkpoint_seq)
-                    {
-                        self.verify_state = Some(state);
+        let step = match phase {
+            FullVerify::Chain { state, report } => {
+                match workers::verify_chain_page(&self.pool, &self.trusted, state).await {
+                    Ok(page) => {
+                        report.checkpoints_verified += page.report.checkpoints_verified;
+                        report.transactions_covered += page.report.transactions_covered;
+                        *state = page.state;
+                        if page.done {
+                            let next = FullVerify::Anchors {
+                                state: *state,
+                                report: report.clone(),
+                                cursor: AnchorCursor::default(),
+                                anchors: AnchorReport::default(),
+                            };
+                            *phase = next;
+                        }
+                        Ok(false)
                     }
-                    metrics::gauge!("ledger_chain_full_verified_timestamp_seconds")
-                        .set(now_epoch_secs());
-                    tracing::info!(
-                        checkpoints = report.checkpoints_verified,
-                        transactions = report.transactions_covered,
-                        elapsed_secs = started.elapsed().as_secs(),
-                        "full checkpoint chain re-verification OK"
-                    );
+                    Err(e) => Err(e),
                 }
+            }
+            FullVerify::Anchors {
+                cursor, anchors, ..
+            } => {
+                match workers::anchor::verify_anchors_page(
+                    &self.pool,
+                    self.tsa_trust.as_ref(),
+                    cursor,
+                )
+                .await
+                {
+                    Ok(page) => {
+                        *cursor = page.cursor;
+                        anchors.absorb(page.report);
+                        Ok(page.done)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        };
+        match step {
+            Ok(false) => true,
+            Ok(true) => {
+                let Some((
+                    FullVerify::Anchors {
+                        state,
+                        report,
+                        cursor,
+                        anchors,
+                    },
+                    started,
+                )) = self.full_verify.take()
+                else {
+                    unreachable!("only the anchor phase finishes a full pass")
+                };
+                self.full_chain_broken = false;
+                self.next_full_verify = started + self.verify_full_every;
+                if self
+                    .verify_state
+                    .is_none_or(|s| s.last_checkpoint_seq < state.last_checkpoint_seq)
+                {
+                    self.verify_state = Some(state);
+                }
+                if self.anchor_cursor.last < cursor.last {
+                    self.anchor_cursor = cursor;
+                }
+                self.publish_verified();
+                metrics::gauge!("ledger_chain_full_verified_timestamp_seconds")
+                    .set(now_epoch_secs());
+                tracing::info!(
+                    checkpoints = report.checkpoints_verified,
+                    transactions = report.transactions_covered,
+                    anchors = anchors.verified,
+                    anchored_through_seq = anchors.anchored_through_seq,
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "full checkpoint chain re-verification OK"
+                );
                 true
             }
             Err(e) => {
@@ -915,6 +1182,128 @@ impl Duties {
     }
 }
 
+/// Pending OpenTimestamps proofs asked about per round (each may wait on a
+/// few calendars' timeouts).
+const OTS_UPGRADES_PER_ROUND: i64 = 4;
+/// A failed anchor is retried this soon, not a whole interval later.
+const ANCHOR_RETRY: Duration = Duration::from_secs(300);
+
+/// Anchors the newest VERIFIED checkpoint with every witness each
+/// ANCHOR_INTERVAL_SECS (at once on taking leadership), upgrades pending
+/// OpenTimestamps proofs, and exports each witness's state. Only verified
+/// checkpoints: an anchor vouches for history, so it must not vouch for rows
+/// nobody checked.
+#[allow(clippy::too_many_arguments)]
+async fn anchor_loop(
+    pool: PgPool,
+    anchors: Vec<AnyAnchor>,
+    interval: Duration,
+    tick: Duration,
+    verified: watch::Receiver<Option<VerifyState>>,
+    leader: watch::Receiver<bool>,
+    liveness: Arc<Liveness>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut ticker = ticker(tick);
+    let mut next_due: Vec<Option<Instant>> = vec![None; anchors.len()];
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = stop.changed() => break,
+        }
+        Liveness::beat(&liveness.anchor);
+        if !*leader.borrow() {
+            next_due.fill(None);
+            continue;
+        }
+        let target = (*verified.borrow()).filter(|s| s.last_checkpoint_seq > 0);
+        for (anchor, due) in anchors.iter().zip(next_due.iter_mut()) {
+            if let Some(state) = target.filter(|_| due.is_none_or(|at| Instant::now() >= at)) {
+                let ok = anchor_round(&pool, anchor, &state).await;
+                *due = Some(
+                    Instant::now()
+                        + if ok {
+                            interval
+                        } else {
+                            interval.min(ANCHOR_RETRY)
+                        },
+                );
+            }
+            export_witness_status(&pool, anchor).await;
+        }
+        Liveness::beat(&liveness.anchor);
+    }
+    tracing::info!("anchor loop stopped");
+}
+
+/// Stamps `state`'s checkpoint (unless already anchored) and, for
+/// OpenTimestamps, upgrades pending proofs. Returns whether stamping worked.
+async fn anchor_round(pool: &PgPool, anchor: &AnyAnchor, state: &VerifyState) -> bool {
+    let witness = anchor.witness().to_string();
+    let stamped = workers::anchor::anchor_checkpoint(
+        pool,
+        anchor,
+        state.last_checkpoint_seq,
+        &state.last_checkpoint_hash,
+    )
+    .await;
+    let ok = match stamped {
+        Ok(Some(record)) => {
+            metrics::gauge!("checkpoint_anchor_last_success_timestamp_seconds", "witness" => witness.clone())
+                .set(now_epoch_secs());
+            tracing::info!(%witness, checkpoint_seq = record.checkpoint_seq, complete = record.complete, "checkpoint anchored");
+            true
+        }
+        Ok(None) => true,
+        Err(e) => {
+            metrics::counter!("checkpoint_anchor_failures_total", "witness" => witness.clone(), "op" => "stamp")
+                .increment(1);
+            tracing::error!(%witness, error = %e, "anchoring failed");
+            false
+        }
+    };
+    if anchor.kind() == KIND_OTS {
+        match workers::anchor::upgrade_pending(pool, anchor, OTS_UPGRADES_PER_ROUND).await {
+            Ok(r) => {
+                if r.failed > 0 {
+                    metrics::counter!("checkpoint_anchor_failures_total", "witness" => witness.clone(), "op" => "upgrade")
+                        .increment(r.failed);
+                }
+                if r.upgraded > 0 {
+                    metrics::gauge!("checkpoint_anchor_last_success_timestamp_seconds", "witness" => witness.clone())
+                        .set(now_epoch_secs());
+                    tracing::info!(%witness, proofs = r.upgraded, "OpenTimestamps proofs reached a Bitcoin block");
+                }
+            }
+            Err(e) => {
+                metrics::counter!("checkpoint_anchor_failures_total", "witness" => witness.clone(), "op" => "upgrade")
+                    .increment(1);
+                tracing::error!(%witness, error = %e, "OpenTimestamps upgrade failed");
+            }
+        }
+    }
+    ok
+}
+
+async fn export_witness_status(pool: &PgPool, anchor: &AnyAnchor) {
+    let witness = anchor.witness().to_string();
+    match workers::anchor::witness_status(pool, anchor.kind(), anchor.witness()).await {
+        Ok(st) => {
+            metrics::gauge!("checkpoint_anchored_through_seq", "witness" => witness.clone())
+                .set(st.anchored_through_seq as f64);
+            if let Some(age) = st.anchor_age_seconds {
+                metrics::gauge!("checkpoint_anchor_age_seconds", "witness" => witness.clone())
+                    .set(age);
+            }
+            metrics::gauge!("checkpoint_anchor_unanchored_age_seconds", "witness" => witness.clone())
+                .set(st.unanchored_age_seconds);
+            metrics::gauge!("checkpoint_anchor_unconfirmed_age_seconds", "witness" => witness)
+                .set(st.unconfirmed_age_seconds);
+        }
+        Err(e) => tracing::warn!(%witness, error = %e, "anchor status query failed"),
+    }
+}
+
 async fn duty_loop(
     mut duties: Duties,
     interval_secs: u64,
@@ -950,10 +1339,18 @@ async fn run<P: EventPublisher + Send + Sync + 'static>(
         });
     }
     let liveness = Arc::new(Liveness::default());
-    for slot in [&liveness.relay, &liveness.seal, &liveness.duties] {
+    for slot in [
+        &liveness.relay,
+        &liveness.seal,
+        &liveness.duties,
+        &liveness.anchor,
+    ] {
         Liveness::beat(slot);
     }
     let (leader_tx, leader_rx) = watch::channel(false);
+    let (verified_tx, verified_rx) = watch::channel(None);
+    let anchor_tick =
+        (!cfg.anchors.is_empty()).then(|| cfg.anchor_interval.min(Duration::from_secs(60)));
 
     let election = tokio::spawn(election_loop(
         cfg.connect_options.clone(),
@@ -971,7 +1368,7 @@ async fn run<P: EventPublisher + Send + Sync + 'static>(
         stop_rx.clone(),
     ));
     let duties = tokio::spawn(duty_loop(
-        Duties::new(&cfg),
+        Duties::new(&cfg, verified_tx),
         cfg.interval_secs,
         leader_rx.clone(),
         liveness.clone(),
@@ -981,11 +1378,24 @@ async fn run<P: EventPublisher + Send + Sync + 'static>(
         liveness.clone(),
         cfg.interval_secs,
         cfg.relay_interval_secs,
+        anchor_tick,
         stop_rx.clone(),
     ));
+    let anchor = anchor_tick.map(|tick| {
+        tokio::spawn(anchor_loop(
+            cfg.pool.clone(),
+            cfg.anchors,
+            cfg.anchor_interval,
+            tick,
+            verified_rx,
+            leader_rx.clone(),
+            liveness.clone(),
+            stop_rx.clone(),
+        ))
+    });
     let seal = tokio::spawn(seal_loop(
         cfg.pool,
-        cfg.sealer,
+        cfg.signer,
         cfg.interval_secs,
         cfg.batch_size,
         cfg.max_batches_per_tick,
@@ -995,6 +1405,9 @@ async fn run<P: EventPublisher + Send + Sync + 'static>(
     ));
 
     let _ = tokio::join!(relay, seal, duties, heartbeat);
+    if let Some(anchor) = anchor {
+        let _ = anchor.await;
+    }
     // Released only after the leader-only loops have finished their batch.
     if let Ok(Some(lock)) = election.await {
         if let Err(e) = lock.release().await {

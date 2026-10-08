@@ -1,9 +1,12 @@
+pub mod anchor;
+pub mod env;
 mod error;
 mod leader;
 mod reconcile;
 mod relay;
 mod retention;
 mod sealer;
+pub mod signer;
 
 pub use error::{Result, WorkerError};
 pub use leader::{LeaderLock, LEADER_LOCK_KEY};
