@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { FxRate, describeError, getFxRates, isAbort, setFxRate } from "../api";
-import { decimalToFraction, describeRateChange } from "../money";
+import { describeRateChange, formatRate, parseRate, rateToInput } from "../money";
 import { Ago, Alert, ConfirmButton, EmptyState, Icon, Select, Skeleton, useToast } from "../ui";
 
 export default function FxRates() {
@@ -36,7 +36,8 @@ export default function FxRates() {
     return [...set].sort();
   }, [rates]);
 
-  const frac = decimalToFraction(rateStr);
+  // Exact num/den from the operator's text (decimal or "a/b"), integer math only.
+  const frac = parseRate(rateStr);
   const valid = frac !== null && base !== quote;
 
   const missingInverse = (rates ?? []).filter(
@@ -77,7 +78,10 @@ export default function FxRates() {
   function editRate(r: FxRate) {
     setBase(r.base);
     setQuote(r.quote);
-    setRateStr((r.rate_num / r.rate_den).toFixed(6).replace(/\.?0+$/, ""));
+    // The exact stored value: a terminating decimal when there is one, else
+    // the fraction itself ("1/3") — never a rounded float that would lose
+    // precision when saved back.
+    setRateStr(rateToInput({ num: r.rate_num, den: r.rate_den }));
     window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
   }
 
@@ -133,7 +137,7 @@ export default function FxRates() {
                 </button>
               </div>
               <div className="fx-rate">
-                1 {r.base} = {(r.rate_num / r.rate_den).toFixed(4)}{" "}
+                1 {r.base} = {formatRate({ num: r.rate_num, den: r.rate_den })}{" "}
                 <span className="fx-unit">{r.quote}</span>
               </div>
               <div className="fx-meta">
@@ -151,7 +155,7 @@ export default function FxRates() {
           <Icon name="exchange" size={13} />
           Set a rate
         </div>
-        <div className="row" style={{ alignItems: "flex-end" }}>
+        <div className="row align-bottom">
           <label className="field">
             Currency
             <Select
@@ -174,13 +178,12 @@ export default function FxRates() {
           </label>
           <label className="field">
             1 {base} equals
-            <div className="row" style={{ flexWrap: "nowrap" }}>
+            <div className="row nowrap">
               <input
-                placeholder="10.90"
-                inputMode="decimal"
+                className="rate-input"
+                placeholder="10.90 or 1/3"
                 value={rateStr}
                 onChange={(e) => setRateStr(e.target.value)}
-                style={{ width: 140 }}
               />
               <span className="muted">{quote}</span>
             </div>
@@ -194,41 +197,38 @@ export default function FxRates() {
             {busy ? "Saving…" : "Set rate"}
           </ConfirmButton>
         </div>
-        <label
-          className="row small"
-          style={{ marginTop: "0.7rem", cursor: "pointer", color: "var(--text-2)" }}
-        >
+        <label className="check-row small">
           <input
             type="checkbox"
             checked={alsoInverse}
             onChange={(e) => setAlsoInverse(e.target.checked)}
-            style={{ width: "auto" }}
           />
           Also set the reverse rate ({quote} → {base}) as the exact inverse — both written in
           one transaction
         </label>
         {frac && base !== quote && (
-          <div className="muted small" style={{ marginTop: "0.55rem" }}>
-            Will store: 1 {base} = {(frac.num / frac.den).toFixed(6)} {quote} (
-            {frac.num.toLocaleString()} ⁄ {frac.den.toLocaleString()})
+          <div className="muted small mt-055">
+            Will store the exact fraction {frac.num.toLocaleString()} ⁄{" "}
+            {frac.den.toLocaleString()} (1 {base} = {formatRate(frac, 6)} {quote})
             {alsoInverse && (
               <>
                 {" "}
-                and 1 {quote} = {(frac.den / frac.num).toFixed(6)} {base} (
-                {frac.den.toLocaleString()} ⁄ {frac.num.toLocaleString()})
+                and its inverse {frac.den.toLocaleString()} ⁄ {frac.num.toLocaleString()} (1{" "}
+                {quote} = {formatRate({ num: frac.den, den: frac.num }, 6)} {base})
               </>
             )}
             {current && (
               <>
                 {" "}
-                · currently {(current.rate_num / current.rate_den).toFixed(4)}
+                · currently {formatRate({ num: current.rate_num, den: current.rate_den })}
               </>
             )}
           </div>
         )}
         {rateStr && !frac && (
-          <div className="bad small" style={{ marginTop: "0.55rem" }}>
-            Enter a positive decimal, e.g. 10.90 (up to 8 decimal places).
+          <div className="bad small mt-055">
+            Enter a positive decimal, e.g. 10.90 (up to 8 decimal places), or an exact fraction
+            such as 1/3.
           </div>
         )}
       </form>
