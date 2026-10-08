@@ -437,7 +437,7 @@ pub async fn register_device(
     .fetch_one(&mut *tx)
     .await
     .map_err(db_err)?;
-    tx.commit().await.map_err(db_err)?;
+    storage::commit_durable(tx).await.map_err(db_err)?;
     let device = device_row(&row)?;
     registration("registered");
     tracing::info!(%user_id, device_id = %device.id, "device registered");

@@ -84,8 +84,29 @@ pub enum ApiError {
     Storage(#[from] StorageError),
 }
 
-fn is_transient_sqlstate(code: &str) -> bool {
-    matches!(code, "55P03" | "57014" | "40001" | "40P01")
+// Database failures after which the client should retry with the same Idempotency-Key (503
+// retry_later; a COMMIT cut off this way has an unknown outcome, which is what the retry
+// settles): the pool timed out, closed or crashed; the connection broke or never came up
+// (failover, restart — HAProxy with no primary answers the SSL probe with 0x00, a Protocol
+// error); the server shed the statement (lock or statement timeout, serialization failure,
+// deadlock), is shutting down or restarting (57P01-57P03), is a read-only standby (25006), or
+// reported a connection exception (class 08).
+fn is_transient(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed
+        | sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::Protocol(_) => true,
+        sqlx::Error::Database(db) => db.code().is_some_and(|c| {
+            matches!(
+                c.as_ref(),
+                "55P03" | "57014" | "40001" | "40P01" | "57P01" | "57P02" | "57P03" | "25006"
+            ) || c.starts_with("08")
+        }),
+        _ => false,
+    }
 }
 
 impl ApiError {
@@ -145,12 +166,7 @@ impl ApiError {
             ApiError::Storage(StorageError::Rejected { .. }) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "rejected")
             }
-            ApiError::Storage(StorageError::Database(sqlx::Error::PoolTimedOut)) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "retry_later")
-            }
-            ApiError::Storage(StorageError::Database(sqlx::Error::Database(db)))
-                if db.code().is_some_and(|c| is_transient_sqlstate(&c)) =>
-            {
+            ApiError::Storage(StorageError::Database(e)) if is_transient(e) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "retry_later")
             }
             ApiError::Storage(StorageError::Database(_))
@@ -193,3 +209,84 @@ impl IntoResponse for ApiError {
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use sqlx::error::{DatabaseError, ErrorKind};
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct Sqlstate(&'static str);
+
+    impl std::fmt::Display for Sqlstate {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SQLSTATE {}", self.0)
+        }
+    }
+
+    impl std::error::Error for Sqlstate {}
+
+    impl DatabaseError for Sqlstate {
+        fn message(&self) -> &str {
+            "test"
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.0))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> ErrorKind {
+            ErrorKind::Other
+        }
+    }
+
+    fn parts_of(e: sqlx::Error) -> (StatusCode, &'static str) {
+        ApiError::Storage(StorageError::Database(e)).parts()
+    }
+
+    fn sqlstate(code: &'static str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(Sqlstate(code)))
+    }
+
+    // A failover (connection lost, HAProxy without a primary, a standby or a restarting
+    // server answering) or a shed statement must tell the client to retry with the same key,
+    // never "internal error"; a real fault stays 500.
+    #[test]
+    fn failover_and_shed_statements_are_retry_later() {
+        let retry = (StatusCode::SERVICE_UNAVAILABLE, "retry_later");
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        for e in [
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::WorkerCrashed,
+            sqlx::Error::Io(reset),
+            sqlx::Error::Tls("handshake failed".into()),
+            sqlx::Error::Protocol("unexpected response from SSLRequest: 0x00".into()),
+        ] {
+            let name = format!("{e:?}");
+            assert_eq!(parts_of(e), retry, "{name}");
+        }
+        for code in [
+            "55P03", "57014", "40001", "40P01", "57P01", "57P02", "57P03", "25006", "08000",
+            "08003", "08006", "08P01",
+        ] {
+            assert_eq!(parts_of(sqlstate(code)), retry, "SQLSTATE {code}");
+        }
+
+        let fault = (StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+        for code in ["23505", "22003", "42501", "P0001", "XX000"] {
+            assert_eq!(parts_of(sqlstate(code)), fault, "SQLSTATE {code}");
+        }
+        assert_eq!(parts_of(sqlx::Error::RowNotFound), fault);
+    }
+}

@@ -82,7 +82,9 @@ pub async fn block_user(
         serde_json::json!({ "reason": req.reason }),
     )
     .await?;
-    tx.commit().await.map_err(StorageError::from)?;
+    storage::commit_durable(tx)
+        .await
+        .map_err(StorageError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -110,7 +112,9 @@ pub async fn unblock_user(
         serde_json::json!({}),
     )
     .await?;
-    tx.commit().await.map_err(StorageError::from)?;
+    storage::commit_durable(tx)
+        .await
+        .map_err(StorageError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -163,7 +167,9 @@ pub async fn set_user_status(
         serde_json::json!({ "status": req.status }),
     )
     .await?;
-    tx.commit().await.map_err(StorageError::from)?;
+    storage::commit_durable(tx)
+        .await
+        .map_err(StorageError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -237,7 +243,9 @@ pub async fn set_fx_rate(
         }),
     )
     .await?;
-    tx.commit().await.map_err(StorageError::from)?;
+    storage::commit_durable(tx)
+        .await
+        .map_err(StorageError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
