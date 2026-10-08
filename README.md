@@ -136,7 +136,7 @@ GitHub to execute.
 and starts the hardened Compose stack — Caddy (TLS, `/admin`, `/ready` health
 checks), the two binaries, Postgres, Redis, NATS JetStream, backup sidecars,
 optional monitoring (Loki/Prometheus/Alertmanager/Grafana) and optional WAL
-archiving. Secrets are files, config typos refuse to boot, every service is
+archiving or a 3-member Patroni cluster. Secrets are files, config typos refuse to boot, every service is
 health-checked, capability-dropped and log-rotated.
 
 Since the hardening pass:
@@ -153,6 +153,15 @@ Since the hardening pass:
 - **Encrypted backups** (age or GPG, optional off-box copy via rclone), a
   pre-deploy dump before every rollout, freshness alerts, and a restore drill
   that verifies the signed checkpoint chain — exercised in CI on every push.
+- **Postgres HA (optional overlay `deploy/ha/`)**: three Patroni members with
+  quorum-synchronous replication behind HAProxy and etcd; a leader crash,
+  freeze or switchover loses no acknowledged transaction and recovers on its
+  own (~20 s, ~4 s planned), proven under load by `scripts/ha-failover-drill.sh`
+  in CI (`.github/workflows/ha.yml`).
+- **Tamper-evidence beyond the key holder (optional overlays)**: checkpoint
+  hashes anchored with RFC 3161 TSAs and OpenTimestamps
+  (`docker-compose.anchor.yml`), and the signing key in Vault transit or an HSM
+  (`docker-compose.vault.yml`, `WORKER_SIGNER=pkcs11`).
 - **Existing installs** upgrade once with `deploy/upgrade-hardening.sh`
   (idempotent; moves secrets into files, creates the roles, transfers
   ownership), then `deploy/deploy.sh`.

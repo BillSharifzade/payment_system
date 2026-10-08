@@ -56,7 +56,8 @@ proves the whole model on a scratch database (CI job `db-roles`).
 
 ## Prerequisites (on the server)
 
-- Docker Engine ≥ 20.10 + Compose plugin v2.23 or newer (`docker compose version`)
+- Docker Engine ≥ 20.10 + Compose plugin v2.23 or newer (`docker compose version`;
+  v2.24.4+ for the Vault and HA overlays, which use `!override`)
 - Ports 80/443 open; a DNS record pointing at the server for public HTTPS
 - ~4 GB RAM; the images are built here (cargo-chef caches the dependency
   layer, so a source-only rebuild takes a minute or two after the first build).
@@ -368,6 +369,181 @@ the configuration template is `pgbackrest/pgbackrest.conf.example`. With the
 monitoring overlay, `WalArchiveFailing`/`WalArchiveStale` page on archiving
 errors.
 
+With the HA overlay (below) archiving is built in; do not combine the two.
+
+## Postgres HA (Patroni overlay)
+
+`ha/docker-compose.ha.yml` replaces the single `postgres` service with a
+3-member Patroni cluster (Postgres 16, quorum-synchronous replication,
+automatic failover) coordinated by 3 etcd members, behind HAProxy:
+
+| Service | Image | Role |
+|---|---|---|
+| `postgres` | haproxy 3.2 (pinned digest) | **the database endpoint, same name as before**: `:5432` routes to the member whose Patroni answers `GET /primary` 200 (read-write), `:5433` to replicas less than 16 MB behind; cuts every session through a member the moment it stops leading; `:8404` health/metrics/stats |
+| `pg-1`..`pg-3` | `payment-patroni` (built: the same postgres:16.15 digest + Patroni 4.1.5 from hash-pinned pip requirements + pgBackRest) | Patroni-managed Postgres; uid 999, read-only root, all capabilities dropped |
+| `etcd-1`..`etcd-3` | etcd 3.6 (pinned digest) | Patroni's leader election and cluster state; client authentication on (user `patroni` may touch only `/service/`; the healthcheck logs in as `health`, a role-less user whose password is public on purpose) |
+| `etcd-auth` | `payment-patroni` | one-shot: turns etcd authentication on (idempotent) |
+
+Because `postgres` keeps its name, nothing else changes: `DATABASE_URL` /
+`MIGRATION_DATABASE_URL`, the dump sidecar and postgres-exporter all reach the
+current leader. HAProxy is a plain TCP proxy, so the workers' advisory-lock
+leader election works exactly as on a direct connection. The members and etcd
+live on the internal `ha` network: from `backend` only HAProxy's port is
+reachable.
+
+**The zero-data-loss setting** (`ha/patroni.yml`, applied cluster-wide at
+bootstrap; change later with `patronictl edit-config`):
+`synchronous_mode: quorum`, `synchronous_node_count: 1`,
+`synchronous_mode_strict: true`. A COMMIT returns only once the leader **and**
+at least one of the two standbys have flushed it (`synchronous_standby_names =
+ANY 1 (pg-2, pg-3)`), and whichever standby answers first counts, so losing or
+freezing one standby never stalls writes. Patroni promotes only a standby
+proven to hold every acknowledged commit. Strict mode means that with **both**
+standbys gone, commits wait instead of silently becoming single-copy: losing
+two of three members stops writes (reads continue) until one returns — the
+price of "never acknowledged unless on two machines". Leader TTL 20 s, loop 5 s,
+retry 5 s: a dead or frozen leader is replaced in ~20 s.
+
+**One box is not HA.** The overlay runs all three members on one Docker host —
+right for staging, CI and the failover drill. In production put each member
+(`pg-N` + `etcd-N`) on its own machine, and HAProxy twice behind a keepalived
+VIP (DESIGN.md §12.4); on bare metal enable Patroni's watchdog
+(`watchdog.mode: required` + softdog).
+
+### Enable it
+
+```bash
+# deploy/.env
+COMPOSE_FILE=docker-compose.prod.yml:ha/docker-compose.ha.yml
+#   (+ :docker-compose.monitoring.yml:ha/docker-compose.ha-monitoring.yml)
+ha/init-secrets.sh                                   # pg_replication_password, patroni_api_password,
+                                                     # etcd_root_password, etcd_patroni_password
+cp ha/pgbackrest.conf.example secrets/pgbackrest.conf && $EDITOR secrets/pgbackrest.conf
+./deploy.sh
+```
+
+Requires Compose v2.24.4+ (`!override`). Do not combine with
+`docker-compose.wal-archive.yml`: archiving is built in.
+
+New secrets: `pg_replication_password` (role `replicator`),
+`patroni_api_password` (Patroni REST user `patroni`: switchover, restart,
+config), `etcd_root_password` (etcd emergencies only), `etcd_patroni_password`,
+and `pgbackrest.conf` (required; escrow its cipher passphrase).
+
+### Moving to the HA cluster (existing single-node install)
+
+The cluster starts empty; the ledger is moved with a dump, during a short write
+freeze. `deploy.sh` refuses the HA overlay while the old `pgdata` volume exists
+until `secrets/.ha-v1` says this was done:
+
+```bash
+docker compose stop caddy payment-server payment-workers           # write freeze
+docker compose run --rm --no-deps -T --entrypoint /usr/local/bin/db-backup.sh postgres-backup --label pre-ha
+docker compose run --rm --no-deps -T --entrypoint sh postgres-backup -c 'cat /backups/db/pre-deploy/*-pre-ha.sql.gz.age' > pre-ha.sql.gz.age
+docker compose stop postgres
+# switch COMPOSE_FILE in .env as above, ha/init-secrets.sh, secrets/pgbackrest.conf, then:
+docker compose up -d --wait postgres                               # HAProxy + members + etcd (empty cluster)
+age -d -i ~/payment-backup.key pre-ha.sql.gz.age | gunzip \
+  | docker compose exec -T "$(ha/ha-leader.sh)" psql -X -v ON_ERROR_STOP=1 -U payment_owner -d payment
+touch secrets/.ha-v1 && ./deploy.sh && ./restore-drill.sh
+```
+
+Keep the `pgdata` volume until the restore drill has passed on the new stack.
+
+### Operate
+
+```bash
+docker compose exec pg-1 patronictl list                     # members, role, lag, timeline
+docker compose exec pg-1 patronictl switchover --leader pg-1 --candidate pg-2   # planned
+docker compose exec "$(ha/ha-leader.sh)" psql -U payment -d payment             # superuser, on the leader
+```
+
+(`ha/ha-leader.sh` prints the leading member's service name; use it wherever
+this README says `docker compose exec postgres psql`, e.g. "First admin".)
+
+A crashed or frozen leader is replaced automatically; when it comes back
+Patroni rewinds it (`pg_rewind`) or, if that is impossible, re-clones it, and it
+rejoins as a replica — anything only it had was never acknowledged. Members
+keep a replication slot for a lost peer for 30 minutes, at most 4 GB of WAL
+(`max_slot_wal_keep_size`).
+
+**Backups.** The dump sidecar follows the leader through HAProxy, unchanged.
+WAL is archived continuously by pgBackRest from whichever member leads
+(`archive_mode=on`; the promoted member continues on its new timeline). A
+leader that dies before shipping its last completed segment would leave a hole
+that PITR from an older base backup cannot cross, so every promotion starts a
+pgBackRest backup on the new timeline (`ha-on-role-change`). Base backups run on
+the leader from the host's crontab:
+
+```cron
+0 3 * * 0   cd ~/payment_system/deploy && docker compose exec -T "$(ha/ha-leader.sh)" pgbackrest --stanza=payment --type=full backup
+0 3 * * 1-6 cd ~/payment_system/deploy && docker compose exec -T "$(ha/ha-leader.sh)" pgbackrest --stanza=payment --type=diff backup
+```
+
+**Monitoring** (`ha/docker-compose.ha-monitoring.yml`, with the monitoring
+overlay): Prometheus scrapes every member's Patroni `/metrics`, etcd and
+HAProxy, and alerts on: no leader for 1 min, two leaders, leader changed
+(informational), **no quorum standby (writes blocked)**, only one standby left,
+replication lag > 16 MB, member down, Patroni paused / pending restart, etcd
+unreachable / leaderless / member down, HAProxy without a primary or down, and
+missing HA metrics.
+
+### Failover drill
+
+`scripts/ha-failover-drill.sh` proves the above under load through the real
+server and workers: crash (SIGKILL), planned switchover and freeze (SIGSTOP) of
+the leader; zero acknowledged transfers lost on every member, conservation,
+balances = entries, `verify-chain` intact, workers re-elected and sealing, the
+old leader back as a replica, no split brain, WAL archiving from the new
+leader, and a final point-in-time recovery from the archive alone holding every
+acknowledged transfer. CI runs it with Docker Compose (`.github/workflows/ha.yml`);
+`--mode local` runs the same configuration as plain processes
+(`scripts/ha-local.sh`). Run it after every change to `deploy/ha/` or the
+database access code, and as a game-day on staging.
+
+## External anchoring of checkpoints (optional overlay)
+
+The workers sign every checkpoint, but whoever holds the signing key could
+re-sign rewritten history. `docker-compose.anchor.yml` closes that: the worker
+leader timestamps the newest verified checkpoint hash every
+`ANCHOR_INTERVAL_SECS` with RFC 3161 timestamp authorities and/or
+OpenTimestamps (Bitcoin), and stores the proofs in the append-only
+`checkpoint_anchors` table. Each checkpoint hash commits to all earlier ones,
+so anything anchored can no longer be rewritten undetected (DESIGN.md §6.5).
+
+1. `COMPOSE_FILE=docker-compose.prod.yml:docker-compose.anchor.yml` (keep your
+   other overlays).
+2. `deploy/anchor/tsa-certs.pem`: the PEM roots/intermediates of every TSA you
+   use. Keep retired TSAs' roots in it, or their old tokens stop verifying.
+3. `app.env`: `ANCHOR_RFC3161_URLS` and/or `ANCHOR_OTS_CALENDARS` (more than
+   one witness), optionally `ANCHOR_INTERVAL_SECS` (default 3600).
+4. `./deploy.sh`. `payment-workers verify-chain` and the restore drill then
+   report `anchored_through_seq` and the anchor age; the monitoring overlay
+   alerts on anchor lag, failures, a regressed anchor seq (rows deleted) and an
+   unavailable signer.
+
+The workers need outbound HTTPS for this (the overlay puts them on `egress`).
+To restrict it, use an allowlisting proxy via `HTTPS_PROXY` instead (keep
+`NO_PROXY=vault` with the Vault overlay). An auditor completes an OpenTimestamps
+proof against Bitcoin with `ots verify` (or `bitcoin-cli getblockheader`); RFC
+3161 tokens verify with `openssl ts -verify`.
+
+## Checkpoint signing key in Vault or an HSM (optional overlay)
+
+`docker-compose.vault.yml` moves the checkpoint signing key out of the workers'
+memory into HashiCorp Vault's transit engine (a non-exportable ed25519 key; the
+workers authenticate with a sign-only AppRole). The first-run steps are at the
+top of that file. For an HSM, set `WORKER_SIGNER=pkcs11` with `PKCS11_MODULE`,
+`PKCS11_TOKEN_LABEL`, `PKCS11_KEY_LABEL` and `PKCS11_PIN_FILE`.
+
+**Rotating from the local key:** run `vault/bootstrap.sh`, append the printed
+public key to `secrets/worker_trusted_public_keys` **first** (keep the old key:
+it signed the history), deploy with the overlay, then change the old entry to
+`<old hex>@<last seq it signed>` so it can never sign a new checkpoint, shred
+`secrets/worker_signing_key` and revoke the Vault root token. With the overlay
+(or `WORKER_SIGNER=vault|pkcs11`) `deploy.sh` no longer generates or trusts a
+local key. Back up Vault itself with `vault operator raft snapshot save`.
+
 ## Admin console and the admin allowlist
 
 Caddy serves the console at `https://<SITE_ADDRESS>/admin/` from the
@@ -469,14 +645,16 @@ network-security-config and drop the cleartext exception.
 
 This layout maps 1:1 onto the DESIGN.md §12 target:
 
-1. **Postgres HA first**: a 3-node Patroni + etcd cluster; point
-   `secrets/database_url` / `migration_database_url` at its VIP (session mode —
-   the workers' leader election uses advisory locks). *Nothing in the app changes.*
+1. **Postgres HA first** — available: `ha/docker-compose.ha.yml` (see "Postgres
+   HA"). On real hardware move each `pg-N` + `etcd-N` to its own machine and run
+   HAProxy twice behind a keepalived VIP; keep plain TCP/session routing (the
+   workers' leader election uses advisory locks). *Nothing in the app changes.*
 2. **App tier to k3s/k8s**: the same image + `app.env` become a Deployment (API,
    N replicas) + a worker Deployment (leader-elected, so 2 replicas give a hot
    standby); Caddy → an Ingress with the same admin allowlist. The
    `healthcheck` subcommands become the liveness/readiness probes.
-3. **Secrets to Vault**, GitOps via Argo CD.
-4. **Scale writes** only if needed: swap `PostgresLedger` for
-   `TigerBeetleLedger` behind the existing `LedgerStore` trait. One box does
-   ~3 000 fee-bearing transfers/s today.
+3. **Secrets to Vault** (the checkpoint signing key already can be: `docker-compose.vault.yml`), GitOps via Argo CD.
+4. **Scale writes** only if needed: `crates/ledger-tigerbeetle` (the hybrid
+   TigerBeetle backend, DESIGN.md §15) relieves hot accounts — it needs no
+   balance-row locks — but stays bounded by its per-transfer Postgres step; see
+   its measurements before switching.
