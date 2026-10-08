@@ -15,10 +15,10 @@ import tj.payment.core.ApiOutcome
 import tj.payment.core.CheckDto
 import tj.payment.core.Currency
 import tj.payment.core.ErrorCode
+import tj.payment.core.IntentKey
 import tj.payment.core.Money
 import tj.payment.core.WalletDto
 import tj.payment.wallet.data.WalletRepository
-import tj.payment.wallet.ui.OFFLINE_MESSAGE
 import tj.payment.wallet.ui.userMessage
 
 data class RequestUiState(
@@ -47,7 +47,16 @@ class RequestViewModel(private val repo: WalletRepository) : ViewModel() {
     private val _state = MutableStateFlow(RequestUiState())
     val state: StateFlow<RequestUiState> = _state.asStateFlow()
 
-    private var pendingKey: String? = null
+    /**
+     * One key per check intent (wallet, amount, currency, description): kept
+     * across an unknown outcome so a retry can't open two checks; replaced when
+     * any input changes (the old key would be answered 409
+     * `idempotency_conflict` forever) and dropped after a definitive answer.
+     */
+    private val checkKey = IntentKey<CheckIntent> { UUID.randomUUID().toString() }
+
+    private data class CheckIntent(val wallet: String, val amountMinor: Long, val currency: String, val description: String?)
+
     private var watcher: Job? = null
 
     init {
@@ -83,19 +92,19 @@ class RequestViewModel(private val repo: WalletRepository) : ViewModel() {
         val amount = s.amount ?: return
         if (!s.canCreate) return
         _state.update { it.copy(creating = true, error = null) }
-        // Kept across a failed attempt so a retry can't open two checks.
-        val key = pendingKey ?: UUID.randomUUID().toString().also { pendingKey = it }
+        val description = s.description.trim().ifEmpty { null }
+        val key = checkKey.keyFor(CheckIntent(wallet.id, amount.minorUnits, wallet.currency, description))
         viewModelScope.launch {
             val outcome = repo.createCheck(
                 account = wallet.id,
                 amountMinor = amount.minorUnits,
                 currency = wallet.currency,
-                description = s.description.trim().ifEmpty { null },
+                description = description,
                 idempotencyKey = key,
             )
+            checkKey.onOutcome(outcome)
             when (outcome) {
                 is ApiOutcome.Ok -> {
-                    pendingKey = null
                     _state.update { it.copy(creating = false, check = outcome.value) }
                     watch(outcome.value)
                 }
@@ -108,7 +117,7 @@ class RequestViewModel(private val repo: WalletRepository) : ViewModel() {
                         },
                     )
                 }
-                is ApiOutcome.Offline -> _state.update { it.copy(creating = false, error = OFFLINE_MESSAGE) }
+                is ApiOutcome.Offline -> _state.update { it.copy(creating = false, error = outcome.userMessage()) }
             }
         }
     }
@@ -149,7 +158,7 @@ class RequestViewModel(private val repo: WalletRepository) : ViewModel() {
                     // Already paid/expired: the watcher's next tick shows the truth.
                     _state.update { it.copy(cancelling = false) }
                 }
-                is ApiOutcome.Offline -> _state.update { it.copy(cancelling = false, error = OFFLINE_MESSAGE) }
+                is ApiOutcome.Offline -> _state.update { it.copy(cancelling = false, error = outcome.userMessage()) }
             }
         }
     }
@@ -157,6 +166,7 @@ class RequestViewModel(private val repo: WalletRepository) : ViewModel() {
     /** Back to the amount form for the next customer. */
     fun newRequest() {
         watcher?.cancel()
+        checkKey.reset()
         _state.update { it.copy(check = null, amountText = "", description = "", error = null, secondsLeft = 0) }
     }
 

@@ -15,9 +15,9 @@ import tj.payment.core.ErrorCode
 import tj.payment.core.Money
 import tj.payment.core.SubmitResult
 import tj.payment.core.WalletDto
-import tj.payment.core.transferFeeMinor
+import tj.payment.core.transferFeePreviewMinor
 import tj.payment.wallet.data.WalletRepository
-import tj.payment.wallet.ui.OFFLINE_MESSAGE
+import tj.payment.wallet.ui.NOT_STARTED_MESSAGE
 import tj.payment.wallet.ui.userMessage
 
 enum class PayStep { SCAN, PREVIEW, RESULT }
@@ -52,8 +52,9 @@ data class PayCheckUiState(
     val insufficient: Boolean
         get() = check?.let { c -> fromWallet?.let { c.amountMinor > it.balanceMinor } } == true
 
+    /** Display-only (paid by the merchant); TJS only, exactly like the backend. */
     val feeMinor: Long?
-        get() = feeBps?.let { bps -> check?.let { transferFeeMinor(it.amountMinor, bps) } }
+        get() = check?.let { transferFeePreviewMinor(it.amountMinor, it.currency, feeBps) }
 
     val merchantLabel: String
         get() = check?.merchantName ?: "Unverified merchant"
@@ -143,7 +144,7 @@ class PayCheckViewModel(private val repo: WalletRepository) : ViewModel() {
                         },
                     )
                 }
-                is ApiOutcome.Offline -> _state.update { it.copy(lookingUp = false, scanError = OFFLINE_MESSAGE) }
+                is ApiOutcome.Offline -> _state.update { it.copy(lookingUp = false, scanError = outcome.userMessage()) }
             }
         }
     }
@@ -153,12 +154,12 @@ class PayCheckViewModel(private val repo: WalletRepository) : ViewModel() {
         _state.update { it.copy(step = PayStep.SCAN, check = null, outcome = null, gateMessage = null) }
     }
 
-    fun onGateRefused(message: String) {
-        _state.update { it.copy(gateMessage = message) }
-    }
-
-    /** The device confirmed it's the owner: persist the key and submit. */
-    fun payConfirmed() {
+    /**
+     * Pay the previewed check. The submitter asks the device owner to approve
+     * (fingerprint/face or screen lock, bound to a Keystore key), then persists
+     * the key and submits.
+     */
+    fun pay() {
         val s = _state.value
         val check = s.check ?: return
         val from = s.fromWallet ?: return
@@ -191,13 +192,31 @@ class PayCheckViewModel(private val repo: WalletRepository) : ViewModel() {
 
     private fun settle(result: SubmitResult?) {
         val outcome = when (result) {
-            null -> PayOutcome.Rejected("Finish your earlier unconfirmed payment first (open Send).")
+            null -> PayOutcome.Rejected("Nothing to submit.")
             is SubmitResult.Posted -> PayOutcome.Success(result.alreadyPosted)
             is SubmitResult.Rejected -> PayOutcome.Rejected(rejectionCopy(result.code), result.code)
             is SubmitResult.Unsettled -> PayOutcome.Unsettled(result.offline)
-            SubmitResult.NotStarted -> PayOutcome.Rejected(
-                "Couldn't save this payment on your device, so nothing was sent. Please try again.",
-            )
+            SubmitResult.NotStarted -> PayOutcome.Rejected(NOT_STARTED_MESSAGE)
+            // Not approved on the device: nothing stored, nothing sent; back to
+            // the preview (a dismissed prompt needs no message).
+            is SubmitResult.NotAuthorized -> {
+                _state.update { it.copy(submitting = false, gateMessage = result.denial?.userMessage()) }
+                return
+            }
+            // An earlier payment of this user is unsettled: it must be finished
+            // first (same key) — show it, exactly like opening this screen does.
+            is SubmitResult.Blocked -> {
+                _state.update {
+                    it.copy(
+                        submitting = false,
+                        step = PayStep.RESULT,
+                        outcome = PayOutcome.Unsettled(offline = false),
+                        confirmedAmount = Money.ofMinor(result.pending.amountMinor, Currency.of(result.pending.currency)),
+                        confirmedLabel = result.pending.recipientLabel,
+                    )
+                }
+                return
+            }
         }
         _state.update { it.copy(submitting = false, step = PayStep.RESULT, outcome = outcome) }
     }

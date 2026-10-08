@@ -36,6 +36,7 @@ import tj.payment.core.Money
 import tj.payment.wallet.ui.ErrorRetry
 import tj.payment.wallet.ui.GlyphSwap
 import tj.payment.wallet.ui.KeyValueRow
+import tj.payment.wallet.ui.PendingPaymentCard
 import tj.payment.wallet.ui.PrimaryButton
 import tj.payment.wallet.ui.ScreenHeader
 import tj.payment.wallet.ui.appFieldColors
@@ -49,6 +50,7 @@ fun FxScreen(
     onBack: () -> Unit,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val pending by viewModel.pending.state.collectAsStateWithLifecycle()
 
     Column(
         modifier = Modifier
@@ -58,6 +60,18 @@ fun FxScreen(
             .padding(horizontal = 20.dp),
     ) {
         ScreenHeader(title = "Exchange", onBack = onBack)
+
+        // An unsettled payment of this user (e.g. a conversion whose answer was
+        // lost, even in an earlier app run) must be finished or discarded first.
+        PendingPaymentCard(
+            state = pending,
+            onFinish = viewModel.pending::finish,
+            onRequestDiscard = viewModel.pending::requestDiscard,
+            onConfirmDiscard = viewModel.pending::confirmDiscard,
+            onCancelDiscard = viewModel.pending::cancelDiscard,
+            onDismissNotice = viewModel.pending::dismissNotice,
+            modifier = Modifier.padding(bottom = 16.dp),
+        )
 
         when {
             state.loading -> Box(
@@ -99,7 +113,7 @@ fun FxScreen(
                 WalletLine(
                     label = "From",
                     currency = state.from?.currency ?: "—",
-                    balance = state.from?.money()?.formatAmount(),
+                    balance = state.from?.displayAmount(),
                 )
                 Box(
                     modifier = Modifier
@@ -113,7 +127,7 @@ fun FxScreen(
                 WalletLine(
                     label = "To",
                     currency = state.to?.currency ?: "—",
-                    balance = state.to?.money()?.formatAmount(),
+                    balance = state.to?.displayAmount(),
                 )
 
                 Spacer(Modifier.height(20.dp))
@@ -171,6 +185,15 @@ fun FxScreen(
                     )
                 }
 
+                state.exchanged?.let { debited ->
+                    Spacer(Modifier.height(14.dp))
+                    Text(
+                        "Exchanged ${debited.format()}",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = PositiveGreen,
+                    )
+                }
+
                 state.result?.let { r ->
                     Spacer(Modifier.height(14.dp))
                     Column(
@@ -198,7 +221,8 @@ fun FxScreen(
                 PrimaryButton(
                     text = "Exchange",
                     onClick = viewModel::convert,
-                    enabled = state.canConvert,
+                    // Confirmed with the fingerprint / screen lock by the submitter.
+                    enabled = state.canConvert && pending.pending == null && pending.busy == null,
                     loading = state.converting,
                     modifier = Modifier.fillMaxWidth(),
                 )

@@ -41,6 +41,13 @@ data class WalletDto(
     val display: String,
 ) {
     fun money(): Money = Money.ofMinor(balanceMinor, Currency.of(currency))
+
+    /**
+     * The balance as text: our own exact formatting for a currency this build
+     * knows, else the server's [display] string (fail closed — never a guessed
+     * exponent).
+     */
+    fun displayAmount(): String = if (Currency.of(currency).isKnown) money().formatAmount() else display
 }
 
 /** Response of GET /v1/users/resolve — the "check number" / QR-scan lookup. */
@@ -236,3 +243,40 @@ data class CheckDto(
 data class PayCheckRequest(
     val account: String? = null,
 )
+
+// --- Transaction status (hardening contract §1/§2) ---
+
+/** One leg of a transaction on an account the caller owns. */
+@Serializable
+data class TransactionEntryDto(
+    @SerialName("account_id") val accountId: String,
+    /** "debit" | "credit". */
+    val direction: String,
+    @SerialName("amount_minor") val amountMinor: Long,
+    val currency: String,
+)
+
+/**
+ * GET /v1/transactions/{id} and POST /v1/transactions/{id}/void. The id is the
+ * idempotency key the client sent (the backend uses the key as the transaction
+ * id). [status] is "posted" (money moved; [entries] lists only the caller's own
+ * legs) or "voided" (the caller voided the key: it can never post). A 404 means
+ * neither — unknown id, or none of its accounts is the caller's.
+ */
+@Serializable
+data class TransactionStatusDto(
+    @SerialName("transaction_id") val transactionId: String,
+    val status: String,
+    @SerialName("created_at") val createdAt: String? = null,
+    /** Same values as the statement's `kind`; posted only. */
+    val kind: String? = null,
+    val entries: List<TransactionEntryDto> = emptyList(),
+) {
+    val isPosted: Boolean get() = status == STATUS_POSTED
+    val isVoided: Boolean get() = status == STATUS_VOIDED
+
+    companion object {
+        const val STATUS_POSTED = "posted"
+        const val STATUS_VOIDED = "voided"
+    }
+}

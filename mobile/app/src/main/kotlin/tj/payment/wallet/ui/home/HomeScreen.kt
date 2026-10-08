@@ -46,6 +46,7 @@ import tj.payment.wallet.ui.GlyphList
 import tj.payment.wallet.ui.GlyphQr
 import tj.payment.wallet.ui.GlyphScan
 import tj.payment.wallet.ui.GlyphSwap
+import tj.payment.wallet.ui.PendingPaymentCard
 import tj.payment.wallet.ui.TransactionRow
 import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.Rust
@@ -63,6 +64,7 @@ fun HomeScreen(
     onRequest: () -> Unit,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val pending by viewModel.pending.state.collectAsStateWithLifecycle()
 
     // Fresh balances whenever Home comes (back) on screen — first entry, return
     // from Send/KYC/FX, return from the background — rate-limited in the VM.
@@ -105,6 +107,22 @@ fun HomeScreen(
                         "removed. If you were in the middle of a payment, check History to see " +
                         "whether it went through before sending it again.",
                     onDismiss = viewModel::dismissUnreadableRecordNotice,
+                )
+                Spacer(Modifier.height(16.dp))
+            }
+        }
+
+        // This user's unsettled payment (and the outcome of resolving one) —
+        // surfaced at startup, not only when Send opens.
+        if (pending.pending != null || pending.notice != null) {
+            item(key = "pending-payment") {
+                PendingPaymentCard(
+                    state = pending,
+                    onFinish = viewModel.pending::finish,
+                    onRequestDiscard = viewModel.pending::requestDiscard,
+                    onConfirmDiscard = viewModel.pending::confirmDiscard,
+                    onCancelDiscard = viewModel.pending::cancelDiscard,
+                    onDismissNotice = viewModel.pending::dismissNotice,
                 )
                 Spacer(Modifier.height(16.dp))
             }
@@ -304,7 +322,7 @@ private fun WalletCard(wallet: WalletDto, primary: Boolean) {
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    text = wallet.money().formatAmount(),
+                    text = wallet.displayAmount(),
                     fontSize = 30.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurface,

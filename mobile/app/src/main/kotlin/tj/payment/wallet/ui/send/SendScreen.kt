@@ -51,6 +51,7 @@ import tj.payment.wallet.ui.KeyValueRow
 import tj.payment.wallet.ui.PrimaryButton
 import tj.payment.wallet.ui.ScreenHeader
 import tj.payment.wallet.ui.appFieldColors
+import tj.payment.wallet.ui.describe
 import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.PositiveGreen
 import tj.payment.wallet.ui.theme.Rust
@@ -65,7 +66,8 @@ fun SendScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
 
     // Discard is the one action that can hide a payment's fate from the user:
-    // it is confirmed explicitly, and even then the statement is checked first.
+    // it is confirmed explicitly, and even then the key is voided server-side
+    // first (after which it can never post).
     if (state.confirmDiscard) {
         AlertDialog(
             onDismissRequest = viewModel::cancelDiscard,
@@ -75,8 +77,9 @@ fun SendScreen(
             title = { Text("Discard this payment?") },
             text = {
                 Text(
-                    "We'll first check your history: if it already went through, it will be " +
-                        "shown as sent instead. If not, the record is removed and you can start over.",
+                    "We'll cancel it with our server first. If it already went through, it will be " +
+                        "shown as sent instead. Otherwise it is cancelled for good — it can never go " +
+                        "through later — and you can start over.",
                 )
             },
             confirmButton = {
@@ -152,8 +155,7 @@ private fun RecipientStep(viewModel: SendViewModel) {
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "${Money.ofMinor(pending.amountMinor, Currency.of(pending.currency)).format()} " +
-                            "to ${pending.recipientLabel} didn't finish. " +
+                        "${pending.describe()} didn't finish. " +
                             "It may or may not have gone through — finish it before sending anything new.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -437,11 +439,16 @@ private fun ConfirmStep(viewModel: SendViewModel) {
         }
         Spacer(Modifier.height(12.dp))
         Text(
-            "Once sent, a payment can't be pulled back. Make sure the recipient is right.",
+            "Once sent, a payment can't be pulled back. Make sure the recipient is right. " +
+                "You'll confirm with your fingerprint or screen lock.",
             style = MaterialTheme.typography.bodyMedium,
             fontSize = 12.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        state.authError?.let {
+            Spacer(Modifier.height(8.dp))
+            Text(it, color = NegativeRed, style = MaterialTheme.typography.bodyMedium)
+        }
         Spacer(Modifier.height(20.dp))
         PrimaryButton(
             text = "Send ${amount?.format() ?: ""}",

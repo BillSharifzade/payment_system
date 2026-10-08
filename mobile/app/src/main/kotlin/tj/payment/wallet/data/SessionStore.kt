@@ -22,7 +22,13 @@ interface SessionStore {
     /** The long-lived rotating token, persisted encrypted. */
     fun refreshToken(): String?
 
-    /** Persist the rotating half of a session (login and every rotation). */
+    /**
+     * Persist the rotating half of a session (login and every rotation),
+     * **synchronously**: when this returns, the new refresh token is on disk
+     * (or the write failed) — never merely queued. The server has already
+     * invalidated the previous token, so an asynchronous write that is lost to
+     * a process kill would sign the user out. Blocking: call off the main thread.
+     */
     fun persistTokens(userId: String, refreshToken: String)
 
     /** Wipe everything — logout, or a refresh answered "dead" (revoked family). */

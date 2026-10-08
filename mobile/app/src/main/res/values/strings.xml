@@ -1,3 +1,11 @@
 <resources>
     <string name="app_name">Payment</string>
+
+    <!-- Device approval of a money move (Keystore-bound biometric / screen-lock prompt). -->
+    <string name="auth_prompt_title">Confirm payment</string>
+    <!-- %1$s = amount with currency, %2$s = recipient (phone, verified name or merchant). -->
+    <string name="auth_prompt_pay">%1$s to %2$s</string>
+    <!-- %1$s = amount with currency, %2$s = target currency code. -->
+    <string name="auth_prompt_fx">Exchange %1$s to %2$s</string>
+    <string name="action_cancel">Cancel</string>
 </resources>

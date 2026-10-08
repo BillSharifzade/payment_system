@@ -26,21 +26,17 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
-import kotlinx.coroutines.launch
 import tj.payment.core.Currency
 import tj.payment.core.ErrorCode
 import tj.payment.core.Money
@@ -156,8 +152,6 @@ private fun PreviewStep(viewModel: PayCheckViewModel) {
     val amount = check.money()
     val fee = state.feeMinor ?: 0L
     val currency = Currency.of(check.currency)
-    val activity = LocalContext.current as? FragmentActivity
-    val scope = rememberCoroutineScope()
 
     Column(Modifier.verticalScroll(rememberScrollState())) {
         Spacer(Modifier.height(8.dp))
@@ -212,7 +206,7 @@ private fun PreviewStep(viewModel: PayCheckViewModel) {
             )
         } else {
             Text(
-                "Confirm with your fingerprint. Once paid, a payment can't be pulled back.",
+                "You'll confirm with your fingerprint or screen lock. Once paid, a payment can't be pulled back.",
                 style = MaterialTheme.typography.bodyMedium,
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -223,23 +217,12 @@ private fun PreviewStep(viewModel: PayCheckViewModel) {
             Text(it, color = NegativeRed, style = MaterialTheme.typography.bodyMedium)
         }
         Spacer(Modifier.height(20.dp))
+        // The device approval (fingerprint/face or screen lock, bound to a
+        // Keystore key) is asked by the payment submitter itself — no screen
+        // can start a payment without it.
         PrimaryButton(
-            text = "Pay ${amount.format()} with fingerprint",
-            onClick = {
-                val host = activity
-                if (host == null) {
-                    viewModel.onGateRefused("This screen can't show the fingerprint prompt.")
-                    return@PrimaryButton
-                }
-                scope.launch {
-                    when (val gate = BiometricGate.confirm(host, "Pay ${amount.format()}", "to ${state.merchantLabel}")) {
-                        GateResult.Confirmed -> viewModel.payConfirmed()
-                        GateResult.Cancelled -> Unit
-                        is GateResult.Unavailable -> viewModel.onGateRefused(gate.reason)
-                        is GateResult.Failed -> viewModel.onGateRefused("Couldn't confirm: ${gate.reason}")
-                    }
-                }
-            },
+            text = "Pay ${amount.format()}",
+            onClick = viewModel::pay,
             enabled = state.canPay,
             loading = state.submitting,
             modifier = Modifier.fillMaxWidth(),

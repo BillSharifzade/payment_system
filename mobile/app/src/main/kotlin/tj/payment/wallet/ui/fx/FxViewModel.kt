@@ -2,7 +2,6 @@ package tj.payment.wallet.ui.fx
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import java.util.UUID
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -13,9 +12,12 @@ import tj.payment.core.Currency
 import tj.payment.core.FxRateDto
 import tj.payment.core.FxResponse
 import tj.payment.core.Money
+import tj.payment.core.PaymentKind
+import tj.payment.core.PendingPaymentResolver
+import tj.payment.core.SubmitResult
 import tj.payment.core.WalletDto
 import tj.payment.wallet.data.WalletRepository
-import tj.payment.wallet.ui.OFFLINE_MESSAGE
+import tj.payment.wallet.ui.NOT_STARTED_MESSAGE
 import tj.payment.wallet.ui.userMessage
 
 data class FxUiState(
@@ -25,16 +27,19 @@ data class FxUiState(
     val fromId: String? = null,
     val toId: String? = null,
     val amountText: String = "",
-    /** A conversion is in flight, or its unknown outcome is being checked. */
+    /** A conversion is being approved or is in flight. */
     val converting: Boolean = false,
     val openingWallet: Boolean = false,
+    /** The exact legs of a conversion that just went through. */
     val result: FxResponse? = null,
+    /** A conversion confirmed as posted without its legs (resolved by a status check). */
+    val exchanged: Money? = null,
     val error: String? = null,
     val actionError: String? = null,
     /**
-     * The last attempt did not get a definitive answer (offline / 5xx). The
-     * balances shown have been re-fetched; tapping Exchange again resends the
-     * SAME request (same idempotency key), so it cannot convert twice.
+     * The last attempt got no definitive answer (offline / 5xx). The conversion
+     * is saved on the device with its key; the pending card below offers
+     * "Finish" (same key — it can't convert twice) or "Discard" (voids the key).
      */
     val outcomeUnknown: Boolean = false,
 ) {
@@ -62,36 +67,28 @@ data class FxUiState(
             rate != null && (quoteMinor ?: 0) > 0
 }
 
+/**
+ * FX moves money between the user's own wallets — through the same
+ * [tj.payment.core.PaymentSubmitter] as every money move: device approval, the
+ * key persisted before the request, same-key retry across process death, void
+ * before discard. (It used to keep its key in memory only, so a process kill or
+ * re-entering the screen after an unknown outcome could convert twice.)
+ */
 class FxViewModel(private val repo: WalletRepository) : ViewModel() {
 
     private val _state = MutableStateFlow(FxUiState())
     val state: StateFlow<FxUiState> = _state.asStateFlow()
 
-    /**
-     * One idempotency key per (from, to, amount) attempt, kept until the server
-     * gives a definitive answer. An Offline / 5xx / unreadable outcome keeps it,
-     * so the next tap on Exchange replays the SAME request and the backend
-     * converts at most once. A definitive outcome (posted or refused) drops it;
-     * a different (from, to, amount) is a different intent and mints a new one.
-     *
-     * Residual (documented, accepted): unlike a transfer, this key lives only in
-     * the ViewModel — it is not persisted, so it does not survive process death
-     * mid-request. FX moves money between the user's OWN wallets, so the worst
-     * case of a lost key is a second conversion the user can see on Home and
-     * reverse, not money gone to someone else. Transfers to other people take the
-     * persisted PaymentSubmitter path instead. The forced balance refresh after an
-     * unknown outcome is the user's cue to look before tapping again.
-     */
-    private var attempt: FxAttempt? = null
-
-    private data class FxAttempt(val fromId: String, val toId: String, val amountMinor: Long, val key: String)
+    /** This user's unsettled payment (an FX from a killed process, or a transfer), with Finish / Discard. */
+    val pending = PendingPaymentResolver(repo.submitter, viewModelScope, onResolved = { refreshBalancesOnly() })
 
     init {
         refresh()
+        pending.load()
     }
 
     fun refresh() {
-        _state.value = _state.value.copy(loading = true, error = null, result = null)
+        _state.value = _state.value.copy(loading = true, error = null, result = null, exchanged = null)
         viewModelScope.launch {
             val walletsDeferred = async { repo.wallets() }
             val ratesDeferred = async { repo.fxRates() }
@@ -104,7 +101,7 @@ class FxViewModel(private val repo: WalletRepository) : ViewModel() {
                 }
                 is ApiOutcome.Offline -> {
                     ratesDeferred.await()
-                    _state.value = _state.value.copy(loading = false, error = OFFLINE_MESSAGE)
+                    _state.value = _state.value.copy(loading = false, error = o.userMessage())
                     return@launch
                 }
             }
@@ -137,18 +134,32 @@ class FxViewModel(private val repo: WalletRepository) : ViewModel() {
                 is ApiOutcome.Failed -> _state.value =
                     _state.value.copy(openingWallet = false, actionError = o.userMessage())
                 is ApiOutcome.Offline -> _state.value =
-                    _state.value.copy(openingWallet = false, actionError = OFFLINE_MESSAGE)
+                    _state.value.copy(openingWallet = false, actionError = o.userMessage())
             }
         }
     }
 
     fun onAmountChange(value: String) {
-        _state.value = _state.value.copy(amountText = value, actionError = null, result = null, outcomeUnknown = false)
+        _state.value = _state.value.copy(
+            amountText = value,
+            actionError = null,
+            result = null,
+            exchanged = null,
+            outcomeUnknown = false,
+        )
     }
 
     fun swap() {
         val s = _state.value
-        _state.value = s.copy(fromId = s.toId, toId = s.fromId, amountText = "", result = null, actionError = null, outcomeUnknown = false)
+        _state.value = s.copy(
+            fromId = s.toId,
+            toId = s.fromId,
+            amountText = "",
+            result = null,
+            exchanged = null,
+            actionError = null,
+            outcomeUnknown = false,
+        )
     }
 
     fun convert() {
@@ -158,41 +169,51 @@ class FxViewModel(private val repo: WalletRepository) : ViewModel() {
         val amount = s.amount ?: return
         if (!s.canConvert) return
 
-        // Reuse the key of an unsettled attempt for the SAME intent; otherwise mint.
-        val current = attempt
-            ?.takeIf { it.fromId == from.id && it.toId == to.id && it.amountMinor == amount.minorUnits }
-            ?: FxAttempt(from.id, to.id, amount.minorUnits, UUID.randomUUID().toString()).also { attempt = it }
-
-        _state.value = s.copy(converting = true, actionError = null, result = null, outcomeUnknown = false)
+        _state.value = s.copy(converting = true, actionError = null, result = null, exchanged = null, outcomeUnknown = false)
         viewModelScope.launch {
-            when (val o = repo.convert(from.id, to.id, amount.minorUnits, idempotencyKey = current.key)) {
-                is ApiOutcome.Ok -> {
-                    attempt = null
+            val result = repo.submitter.submitNew(
+                fromAccount = from.id,
+                toAccount = to.id,
+                amountMinor = amount.minorUnits,
+                currency = from.currency,
+                recipientLabel = to.currency,
+                kind = PaymentKind.FX,
+            )
+            when (result) {
+                is SubmitResult.Posted -> {
                     _state.value = _state.value.copy(
                         converting = false,
-                        result = o.value,
+                        result = result.fx,
+                        exchanged = if (result.fx == null) amount else null,
                         amountText = "",
                     )
                     refreshBalancesOnly()
                 }
-                is ApiOutcome.Failed -> if (o.undetermined) {
-                    // 5xx / retry_later / timeout / 429 / unreadable 2xx: the
-                    // server may have converted. Keep the key.
-                    settleUnknown()
-                } else {
-                    // A definitive refusal: this exact request will never post.
-                    attempt = null
-                    _state.value = _state.value.copy(converting = false, actionError = o.userMessage())
+                // A definitive refusal: this exact request will never post.
+                is SubmitResult.Rejected -> _state.value =
+                    _state.value.copy(converting = false, actionError = result.code.userMessage())
+                // The server may have converted. The key is persisted; the
+                // pending card offers the same-key retry or a void.
+                is SubmitResult.Unsettled -> settleUnknown()
+                SubmitResult.NotStarted -> _state.value =
+                    _state.value.copy(converting = false, actionError = NOT_STARTED_MESSAGE)
+                // Not approved on the device: nothing stored, nothing sent.
+                is SubmitResult.NotAuthorized -> _state.value =
+                    _state.value.copy(converting = false, actionError = result.denial?.userMessage())
+                is SubmitResult.Blocked -> {
+                    _state.value = _state.value.copy(
+                        converting = false,
+                        actionError = "Finish or discard your unconfirmed payment first.",
+                    )
+                    pending.load(check = false)
                 }
-                is ApiOutcome.Offline -> settleUnknown()
             }
         }
     }
 
     /**
-     * Unknown outcome: keep the key, and force a balance fetch BEFORE Exchange
-     * is re-enabled so the user judges the next tap against real numbers, not
-     * the pre-attempt ones.
+     * Unknown outcome: force a balance fetch so the user judges against real
+     * numbers, and surface the saved conversion in the pending card.
      */
     private suspend fun settleUnknown() {
         val refreshed = repo.refreshWallets()
@@ -201,16 +222,10 @@ class FxViewModel(private val repo: WalletRepository) : ViewModel() {
             converting = false,
             wallets = wallets,
             outcomeUnknown = true,
-            actionError = if (refreshed is ApiOutcome.Ok) {
-                "We couldn't confirm whether the exchange went through. Your balances were " +
-                    "just refreshed — check them above. Tapping Exchange again resends the same " +
-                    "request, so it can't convert twice."
-            } else {
-                "We couldn't confirm whether the exchange went through, and couldn't refresh " +
-                    "your balances either. Check them on Home before trying again — retrying " +
-                    "resends the same request, so it can't convert twice."
-            },
+            actionError = "We couldn't confirm whether the exchange went through. It's saved on this " +
+                "phone: finish it below — it can't convert twice — or discard it.",
         )
+        pending.load(check = false)
     }
 
     private fun refreshBalancesOnly() {
