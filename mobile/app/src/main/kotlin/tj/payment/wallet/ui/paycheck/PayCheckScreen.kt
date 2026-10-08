@@ -47,6 +47,8 @@ import tj.payment.wallet.ui.appFieldColors
 import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.PositiveGreen
 import tj.payment.wallet.ui.theme.Rust
+import androidx.compose.ui.res.stringResource
+import tj.payment.wallet.R
 
 @Composable
 fun PayCheckScreen(
@@ -64,9 +66,9 @@ fun PayCheckScreen(
     ) {
         ScreenHeader(
             title = when (state.step) {
-                PayStep.SCAN -> "Pay by QR"
-                PayStep.PREVIEW -> "Confirm payment"
-                PayStep.RESULT -> "Payment"
+                PayStep.SCAN -> stringResource(R.string.pay_title)
+                PayStep.PREVIEW -> stringResource(R.string.auth_prompt_title)
+                PayStep.RESULT -> stringResource(R.string.payment_title)
             },
             onBack = {
                 when (state.step) {
@@ -90,22 +92,23 @@ private fun ScanStep(viewModel: PayCheckViewModel) {
     val scanner = rememberLauncherForActivityResult(ScanContract()) { result ->
         result.contents?.let(viewModel::onScanned)
     }
+    val scanPrompt = stringResource(R.string.pay_scan_prompt)
 
     Column(Modifier.verticalScroll(rememberScrollState())) {
         Spacer(Modifier.height(16.dp))
         Text(
-            "Point the camera at the merchant's QR code, or enter the check code shown on their screen.",
+            stringResource(R.string.pay_scan_body),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(Modifier.height(20.dp))
         PrimaryButton(
-            text = "Scan QR code",
+            text = stringResource(R.string.pay_scan_action),
             onClick = {
                 scanner.launch(
                     ScanOptions().apply {
                         setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                        setPrompt("Scan the merchant's payment code")
+                        setPrompt(scanPrompt)
                         setBeepEnabled(false)
                         setOrientationLocked(false)
                     },
@@ -115,7 +118,7 @@ private fun ScanStep(viewModel: PayCheckViewModel) {
         )
         Spacer(Modifier.height(28.dp))
         Text(
-            "Or enter the code",
+            stringResource(R.string.pay_or_enter_code),
             style = MaterialTheme.typography.titleMedium,
             color = MaterialTheme.colorScheme.onSurface,
         )
@@ -123,7 +126,7 @@ private fun ScanStep(viewModel: PayCheckViewModel) {
         OutlinedTextField(
             value = state.codeText,
             onValueChange = viewModel::onCodeChange,
-            label = { Text("Check code") },
+            label = { Text(stringResource(R.string.pay_check_code)) },
             singleLine = true,
             isError = state.scanError != null,
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
@@ -136,7 +139,7 @@ private fun ScanStep(viewModel: PayCheckViewModel) {
         }
         Spacer(Modifier.height(12.dp))
         PrimaryButton(
-            text = "Look up",
+            text = stringResource(R.string.pay_look_up),
             onClick = viewModel::lookUp,
             enabled = state.canLookUp,
             loading = state.lookingUp,
@@ -169,22 +172,22 @@ private fun PreviewStep(viewModel: PayCheckViewModel) {
                     color = MaterialTheme.colorScheme.onSurface,
                 )
                 Spacer(Modifier.height(12.dp))
-                KeyValueRow("To", state.merchantLabel)
+                KeyValueRow(stringResource(R.string.label_to), state.merchantLabel)
                 if (check.merchantName == null) {
                     Text(
-                        "This merchant has no verified name — pay only if you trust the code you scanned.",
+                        stringResource(R.string.pay_unverified_warning),
                         style = MaterialTheme.typography.bodyMedium,
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                check.description?.let { KeyValueRow("For", it) }
+                check.description?.let { KeyValueRow(stringResource(R.string.pay_for), it) }
                 if (fee > 0) {
-                    KeyValueRow("Fee (paid by merchant)", Money.ofMinor(fee, currency).format())
+                    KeyValueRow(stringResource(R.string.pay_fee_merchant), Money.ofMinor(fee, currency).format())
                 }
                 state.fromWallet?.let { w ->
                     KeyValueRow(
-                        "From your wallet",
+                        stringResource(R.string.pay_from_wallet),
                         w.money().format(),
                         valueColor = if (state.insufficient) NegativeRed else PositiveGreen,
                     )
@@ -194,19 +197,19 @@ private fun PreviewStep(viewModel: PayCheckViewModel) {
         Spacer(Modifier.height(12.dp))
         if (state.insufficient) {
             Text(
-                "Not enough balance for this payment.",
+                stringResource(R.string.pay_insufficient),
                 color = NegativeRed,
                 style = MaterialTheme.typography.bodyMedium,
             )
         } else if (state.fromWallet == null) {
             Text(
-                "You have no ${check.currency} wallet to pay from.",
+                stringResource(R.string.pay_no_wallet, check.currency),
                 color = NegativeRed,
                 style = MaterialTheme.typography.bodyMedium,
             )
         } else {
             Text(
-                "You'll confirm with your fingerprint or screen lock. Once paid, a payment can't be pulled back.",
+                stringResource(R.string.pay_irreversible),
                 style = MaterialTheme.typography.bodyMedium,
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -221,7 +224,7 @@ private fun PreviewStep(viewModel: PayCheckViewModel) {
         // Keystore key) is asked by the payment submitter itself — no screen
         // can start a payment without it.
         PrimaryButton(
-            text = "Pay ${amount.format()}",
+            text = stringResource(R.string.pay_action, amount.format()),
             onClick = viewModel::pay,
             enabled = state.canPay,
             loading = state.submitting,
@@ -245,7 +248,7 @@ private fun ResultStep(viewModel: PayCheckViewModel, onClose: () -> Unit, onVeri
                 CircularProgressIndicator(color = Rust)
                 Spacer(Modifier.height(16.dp))
                 Text(
-                    "Finishing your payment…",
+                    stringResource(R.string.payment_finishing),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -254,34 +257,37 @@ private fun ResultStep(viewModel: PayCheckViewModel, onClose: () -> Unit, onVeri
             is PayOutcome.Success -> {
                 ResultGlyph(success = true)
                 Spacer(Modifier.height(20.dp))
-                Text("Paid", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onBackground)
+                Text(stringResource(R.string.pay_result_paid), style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onBackground)
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "${state.confirmedAmount?.format() ?: ""} to ${state.confirmedLabel}" +
-                        if (outcome.alreadyPosted) " (was already paid)" else "",
+                    stringResource(
+                        if (outcome.alreadyPosted) R.string.pay_result_detail_already else R.string.send_result_detail,
+                        state.confirmedAmount?.format() ?: "",
+                        state.confirmedLabel,
+                    ),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(Modifier.height(32.dp))
-                PrimaryButton("Done", onClick = onClose, modifier = Modifier.fillMaxWidth())
+                PrimaryButton(stringResource(R.string.action_done), onClick = onClose, modifier = Modifier.fillMaxWidth())
             }
 
             is PayOutcome.Rejected -> {
                 ResultGlyph(success = false)
                 Spacer(Modifier.height(20.dp))
-                Text("Not paid", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onBackground)
+                Text(stringResource(R.string.pay_result_not_paid), style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onBackground)
                 Spacer(Modifier.height(6.dp))
                 Text(outcome.message, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.height(32.dp))
                 if (outcome.code == ErrorCode.KYC_REQUIRED) {
-                    PrimaryButton("Verify now", onClick = onVerifyIdentity, modifier = Modifier.fillMaxWidth())
+                    PrimaryButton(stringResource(R.string.action_verify_now), onClick = onVerifyIdentity, modifier = Modifier.fillMaxWidth())
                     TextButton(onClick = viewModel::backToScan) {
-                        Text("Back", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(stringResource(R.string.action_back), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 } else {
-                    PrimaryButton("Scan another code", onClick = viewModel::backToScan, modifier = Modifier.fillMaxWidth())
+                    PrimaryButton(stringResource(R.string.pay_scan_another), onClick = viewModel::backToScan, modifier = Modifier.fillMaxWidth())
                     TextButton(onClick = onClose) {
-                        Text("Close", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(stringResource(R.string.action_close), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }
@@ -289,18 +295,17 @@ private fun ResultStep(viewModel: PayCheckViewModel, onClose: () -> Unit, onVeri
             is PayOutcome.Unsettled -> {
                 ResultGlyph(success = false, warning = true)
                 Spacer(Modifier.height(20.dp))
-                Text("Not confirmed yet", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onBackground)
+                Text(stringResource(R.string.payment_not_confirmed), style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onBackground)
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    (if (outcome.offline) "You appear to be offline. " else "The server didn't answer. ") +
-                        "Your payment may still go through — retrying is always safe, you can never be charged twice.",
+                    stringResource(if (outcome.offline) R.string.payment_unsettled_offline else R.string.payment_unsettled_no_answer),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(Modifier.height(32.dp))
-                PrimaryButton("Try again", onClick = viewModel::retry, loading = state.submitting, modifier = Modifier.fillMaxWidth())
+                PrimaryButton(stringResource(R.string.action_try_again), onClick = viewModel::retry, loading = state.submitting, modifier = Modifier.fillMaxWidth())
                 TextButton(onClick = onClose) {
-                    Text("Later", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(stringResource(R.string.action_later), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }

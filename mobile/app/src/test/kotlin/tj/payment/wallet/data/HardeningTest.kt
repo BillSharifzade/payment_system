@@ -30,6 +30,8 @@ import tj.payment.core.LocalStorageException
 import tj.payment.core.PaymentKind
 import tj.payment.core.SecureKeyValue
 import tj.payment.core.SubmitResult
+import tj.payment.wallet.ui.OFFLINE_MESSAGE
+import tj.payment.wallet.ui.STORAGE_MESSAGE
 import tj.payment.wallet.ui.userMessage
 
 /**
@@ -305,7 +307,8 @@ class HardeningTest {
         out as ApiOutcome.Offline
         assertTrue(out.cause is LocalStorageException)
         assertTrue(out.localStorageFault)
-        assertTrue(out.userMessage().contains("secure storage"))
+        assertEquals("storage copy, not the offline copy", STORAGE_MESSAGE, out.userMessage())
+        assertFalse(OFFLINE_MESSAGE == STORAGE_MESSAGE)
         assertEquals("nothing was sent", 0, requests.size)
 
         val restore = api.refreshSession()

@@ -19,6 +19,8 @@ import tj.payment.core.transferFeePreviewMinor
 import tj.payment.wallet.data.WalletRepository
 import tj.payment.wallet.ui.NOT_STARTED_MESSAGE
 import tj.payment.wallet.ui.userMessage
+import tj.payment.wallet.R
+import tj.payment.wallet.ui.Copy
 
 enum class PayStep { SCAN, PREVIEW, RESULT }
 
@@ -57,7 +59,7 @@ data class PayCheckUiState(
         get() = check?.let { transferFeePreviewMinor(it.amountMinor, it.currency, feeBps) }
 
     val merchantLabel: String
-        get() = check?.merchantName ?: "Unverified merchant"
+        get() = check?.merchantName ?: Copy.text(R.string.pay_unverified_merchant)
 
     val canPay: Boolean get() = check?.isOpen == true && fromWallet != null && !insufficient && !submitting
 }
@@ -109,7 +111,7 @@ class PayCheckViewModel(private val repo: WalletRepository) : ViewModel() {
     fun onScanned(raw: String) {
         val id = CheckCode.parse(raw)
         if (id == null) {
-            _state.update { it.copy(scanError = "That QR code isn't a payment check.") }
+            _state.update { it.copy(scanError = Copy.text(R.string.pay_error_not_a_check)) }
             return
         }
         _state.update { it.copy(codeText = id, scanError = null) }
@@ -139,7 +141,7 @@ class PayCheckViewModel(private val repo: WalletRepository) : ViewModel() {
                     it.copy(
                         lookingUp = false,
                         scanError = when (outcome.code) {
-                            ErrorCode.NOT_FOUND -> "No open check with that code. It may have been paid, cancelled or expired."
+                            ErrorCode.NOT_FOUND -> Copy.text(R.string.pay_error_no_open_check)
                             else -> outcome.userMessage()
                         },
                     )
@@ -192,7 +194,7 @@ class PayCheckViewModel(private val repo: WalletRepository) : ViewModel() {
 
     private fun settle(result: SubmitResult?) {
         val outcome = when (result) {
-            null -> PayOutcome.Rejected("Nothing to submit.")
+            null -> PayOutcome.Rejected(Copy.text(R.string.payment_nothing_to_submit))
             is SubmitResult.Posted -> PayOutcome.Success(result.alreadyPosted)
             is SubmitResult.Rejected -> PayOutcome.Rejected(rejectionCopy(result.code), result.code)
             is SubmitResult.Unsettled -> PayOutcome.Unsettled(result.offline)
@@ -222,9 +224,9 @@ class PayCheckViewModel(private val repo: WalletRepository) : ViewModel() {
     }
 
     private fun rejectionCopy(code: ErrorCode): String = when (code) {
-        ErrorCode.CONFLICT -> "This check is no longer open — it was already paid, cancelled or expired."
-        ErrorCode.NOT_FOUND -> "This check no longer exists."
-        ErrorCode.BAD_REQUEST -> "This check can't be paid from this wallet."
+        ErrorCode.CONFLICT -> Copy.text(R.string.pay_error_check_closed)
+        ErrorCode.NOT_FOUND -> Copy.text(R.string.pay_error_check_gone)
+        ErrorCode.BAD_REQUEST -> Copy.text(R.string.pay_error_wrong_wallet)
         else -> code.userMessage()
     }
 }

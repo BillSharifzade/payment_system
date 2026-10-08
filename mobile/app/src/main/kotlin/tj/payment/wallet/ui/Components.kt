@@ -41,6 +41,8 @@ import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.PositiveGreen
 import tj.payment.wallet.ui.theme.Rust
 import tj.payment.wallet.ui.theme.RustBright
+import androidx.compose.ui.res.stringResource
+import tj.payment.wallet.R
 
 /**
  * Full-width primary action button with a subtle press-scale — the tactile
@@ -366,7 +368,7 @@ fun ErrorRetry(message: String, onRetry: () -> Unit) {
     Column {
         Text(message, color = NegativeRed, style = MaterialTheme.typography.bodyMedium)
         Spacer(Modifier.height(4.dp))
-        TextButton(onClick = onRetry) { Text("Retry", color = Rust) }
+        TextButton(onClick = onRetry) { Text(stringResource(R.string.action_retry), color = Rust) }
     }
 }
 

@@ -28,6 +28,8 @@ import androidx.compose.ui.unit.dp
 import androidx.fragment.app.FragmentActivity
 import kotlinx.coroutines.launch
 import tj.payment.wallet.security.DeviceAuthorizer
+import androidx.compose.ui.res.stringResource
+import tj.payment.wallet.R
 
 /**
  * The app lock: an opaque screen over everything (balances included) until the
@@ -47,10 +49,11 @@ fun LockScreen(
     var prompting by remember { mutableStateOf(false) }
 
     val text = DeviceAuthorizer.PromptText(
-        title = "Unlock your wallet",
-        subtitle = "Confirm it's you",
-        cancel = "Cancel",
+        title = stringResource(R.string.lock_prompt_title),
+        subtitle = stringResource(R.string.lock_prompt_subtitle),
+        cancel = stringResource(R.string.action_cancel),
     )
+    val failedMessage = stringResource(R.string.lock_failed)
 
     fun tryUnlock() {
         val host = activity ?: return
@@ -61,7 +64,7 @@ fun LockScreen(
             when (authorizer.unlock(host, text)) {
                 DeviceAuthorizer.UnlockResult.UNLOCKED, DeviceAuthorizer.UnlockResult.NO_DEVICE_LOCK -> onUnlocked()
                 DeviceAuthorizer.UnlockResult.CANCELLED -> Unit
-                DeviceAuthorizer.UnlockResult.FAILED -> message = "Couldn't confirm it's you. Try again."
+                DeviceAuthorizer.UnlockResult.FAILED -> message = failedMessage
             }
             prompting = false
         }
@@ -86,13 +89,13 @@ fun LockScreen(
             BrandMark()
             Spacer(Modifier.height(24.dp))
             Text(
-                "Wallet locked",
+                stringResource(R.string.lock_title),
                 style = MaterialTheme.typography.headlineMedium,
                 color = MaterialTheme.colorScheme.onBackground,
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                "Unlock with your fingerprint or screen lock.",
+                stringResource(R.string.lock_body),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
@@ -103,13 +106,13 @@ fun LockScreen(
             }
             Spacer(Modifier.height(28.dp))
             PrimaryButton(
-                text = "Unlock",
+                text = stringResource(R.string.lock_action),
                 onClick = { tryUnlock() },
                 loading = prompting,
                 modifier = Modifier.fillMaxWidth(),
             )
             TextButton(onClick = onSignOut) {
-                Text("Sign out", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(stringResource(R.string.action_sign_out), color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }

@@ -3,58 +3,61 @@ package tj.payment.wallet.ui
 import tj.payment.core.ApiOutcome
 import tj.payment.core.AuthDenial
 import tj.payment.core.ErrorCode
+import tj.payment.wallet.R
 
 /**
- * Turns a machine error code into human copy. English for now; these become the
- * keys for Tajik/Russian string resources in the localization pass. Server
- * `message` strings are never shown — only mapped codes.
+ * Turns a machine error code into human copy, from string resources (English
+ * default, Russian in values-ru). Server `message` strings are never shown —
+ * only mapped codes.
  *
  * Exhaustive on purpose (no `else`): adding a code to [ErrorCode] does not
  * compile until it has copy here.
  */
-fun ErrorCode.userMessage(): String = when (this) {
-    ErrorCode.INSUFFICIENT_FUNDS -> "Not enough balance for this transfer."
-    ErrorCode.LIMIT_EXCEEDED -> "This exceeds your current limit."
-    ErrorCode.KYC_REQUIRED -> "Verify your identity to continue."
-    ErrorCode.ACCOUNT_BLOCKED -> "This account is blocked. Contact support."
-    ErrorCode.RECIPIENT_UNAVAILABLE -> "The recipient's account can't receive money right now."
-    ErrorCode.CURRENCY_MISMATCH -> "The wallets use different currencies."
-    ErrorCode.UNKNOWN_CURRENCY -> "This currency isn't supported."
-    ErrorCode.UNKNOWN_ACCOUNT -> "That wallet doesn't exist."
-    ErrorCode.RATE_LIMITED -> "Too many attempts. Please wait a moment."
-    ErrorCode.RETRY_LATER -> "The service is busy right now. Please try again in a moment."
-    ErrorCode.TIMEOUT -> "The service took too long to answer. Please try again in a moment."
-    ErrorCode.UNAUTHORIZED -> "Your session expired. Please sign in again."
-    ErrorCode.FORBIDDEN -> "You don't have access to this."
-    ErrorCode.DUAL_CONTROL_REQUIRED -> "A second person has to approve this."
-    ErrorCode.NOT_FOUND -> "Not found."
-    ErrorCode.CONFLICT -> "That request conflicts with another. Try again."
-    ErrorCode.IDEMPOTENCY_CONFLICT -> "That request conflicts with an earlier one. Start again."
+fun ErrorCode.userMessage(): String = Copy.text(messageRes())
+
+private fun ErrorCode.messageRes(): Int = when (this) {
+    ErrorCode.INSUFFICIENT_FUNDS -> R.string.error_insufficient_funds
+    ErrorCode.LIMIT_EXCEEDED -> R.string.error_limit_exceeded
+    ErrorCode.KYC_REQUIRED -> R.string.error_kyc_required
+    ErrorCode.ACCOUNT_BLOCKED -> R.string.error_account_blocked
+    ErrorCode.RECIPIENT_UNAVAILABLE -> R.string.error_recipient_unavailable
+    ErrorCode.CURRENCY_MISMATCH -> R.string.error_currency_mismatch
+    ErrorCode.UNKNOWN_CURRENCY -> R.string.error_unknown_currency
+    ErrorCode.UNKNOWN_ACCOUNT -> R.string.error_unknown_account
+    ErrorCode.RATE_LIMITED -> R.string.error_rate_limited
+    ErrorCode.RETRY_LATER -> R.string.error_retry_later
+    ErrorCode.TIMEOUT -> R.string.error_timeout
+    ErrorCode.UNAUTHORIZED -> R.string.error_unauthorized
+    ErrorCode.FORBIDDEN -> R.string.error_forbidden
+    ErrorCode.DUAL_CONTROL_REQUIRED -> R.string.error_dual_control_required
+    ErrorCode.NOT_FOUND -> R.string.error_not_found
+    ErrorCode.CONFLICT -> R.string.error_conflict
+    ErrorCode.IDEMPOTENCY_CONFLICT -> R.string.error_idempotency_conflict
     // Only ever shown when it could not be resolved; the payment logic turns
     // this code into a status lookup, never a refusal.
-    ErrorCode.DUPLICATE_TRANSACTION -> "This payment was already processed. Check your history."
-    ErrorCode.VOIDED -> "This payment was cancelled, so nothing was sent."
-    ErrorCode.REJECTED -> "The payment was declined."
-    ErrorCode.INVALID_AMOUNT, ErrorCode.AMOUNT_TOO_LARGE -> "That amount isn't valid."
-    ErrorCode.INVALID_TRANSACTION -> "This payment can't be made as entered."
-    ErrorCode.BAD_REQUEST -> "Something about that request was invalid."
-    ErrorCode.NO_MATCH -> "The fingerprint didn't match."
-    ErrorCode.AMBIGUOUS_MATCH -> "The fingerprint matched more than one person. Use another finger."
-    ErrorCode.PROBE_REPLAYED -> "That fingerprint scan was already used. Scan again."
-    ErrorCode.CHECK_LOCKED -> "Too many failed attempts. This payment request was cancelled."
-    ErrorCode.TERMINAL_UNAUTHORIZED -> "This payment terminal isn't authorised."
-    ErrorCode.INTERNAL_ERROR -> "Something went wrong on our side. Please try again."
-    ErrorCode.UNKNOWN -> "Something went wrong. Please try again."
+    ErrorCode.DUPLICATE_TRANSACTION -> R.string.error_duplicate_transaction
+    ErrorCode.VOIDED -> R.string.error_voided
+    ErrorCode.REJECTED -> R.string.error_rejected
+    ErrorCode.INVALID_AMOUNT, ErrorCode.AMOUNT_TOO_LARGE -> R.string.error_invalid_amount
+    ErrorCode.INVALID_TRANSACTION -> R.string.error_invalid_transaction
+    ErrorCode.BAD_REQUEST -> R.string.error_bad_request
+    ErrorCode.NO_MATCH -> R.string.error_no_match
+    ErrorCode.AMBIGUOUS_MATCH -> R.string.error_ambiguous_match
+    ErrorCode.PROBE_REPLAYED -> R.string.error_probe_replayed
+    ErrorCode.CHECK_LOCKED -> R.string.error_check_locked
+    ErrorCode.TERMINAL_UNAUTHORIZED -> R.string.error_terminal_unauthorized
+    ErrorCode.INTERNAL_ERROR -> R.string.error_internal
+    ErrorCode.UNKNOWN -> R.string.error_unknown
 }
 
 /**
  * Code-mapped copy. For a server-side failure (5xx) the server's correlation id
- * is appended as "Ref: …" so support can find the exact request in the logs.
+ * is appended ("Ref: …") so support can find the exact request in the logs.
  */
 fun ApiOutcome.Failed.userMessage(): String {
     val base = code.userMessage()
     val ref = requestId?.takeIf { httpStatus >= 500 && it.isNotBlank() } ?: return base
-    return "$base Ref: $ref"
+    return Copy.text(R.string.error_with_ref, base, ref)
 }
 
 /** Offline copy that tells a device-storage fault apart from a network one. */
@@ -62,21 +65,20 @@ fun ApiOutcome.Offline.userMessage(): String =
     if (localStorageFault) STORAGE_MESSAGE else OFFLINE_MESSAGE
 
 /** Why a money move was not authorized on this device. */
-fun AuthDenial.userMessage(): String = when (this) {
-    AuthDenial.NOT_ENROLLED ->
-        "Set up a fingerprint or a screen lock (PIN, pattern or password) in your phone's settings to move money."
-    AuthDenial.UNAVAILABLE -> "This phone can't confirm it's you right now, so the payment wasn't sent."
-    AuthDenial.SECURITY_UPDATE_REQUIRED -> "Your phone needs a security update before it can confirm payments."
-    AuthDenial.LOCKED_OUT -> "Too many attempts. Unlock your phone with its PIN, pattern or password, then try again."
-    AuthDenial.NO_SCREEN -> "Couldn't show the confirmation. Open the app and try again."
-    AuthDenial.FAILED -> "Couldn't confirm it's you, so the payment wasn't sent. Try again."
-}
+fun AuthDenial.userMessage(): String = Copy.text(
+    when (this) {
+        AuthDenial.NOT_ENROLLED -> R.string.auth_denied_not_enrolled
+        AuthDenial.UNAVAILABLE -> R.string.auth_denied_unavailable
+        AuthDenial.SECURITY_UPDATE_REQUIRED -> R.string.auth_denied_security_update
+        AuthDenial.LOCKED_OUT -> R.string.auth_denied_locked_out
+        AuthDenial.NO_SCREEN -> R.string.auth_denied_no_screen
+        AuthDenial.FAILED -> R.string.auth_denied_failed
+    },
+)
 
-const val OFFLINE_MESSAGE = "No connection. Check your network and try again."
+val OFFLINE_MESSAGE: String get() = Copy.text(R.string.error_offline)
 
-const val STORAGE_MESSAGE =
-    "Your phone's secure storage isn't available right now, so nothing was sent. Restart the app and try again."
+val STORAGE_MESSAGE: String get() = Copy.text(R.string.error_storage)
 
 /** For a payment the device could not store before sending. */
-const val NOT_STARTED_MESSAGE =
-    "Couldn't save this payment securely on your device, so nothing was sent. Please try again."
+val NOT_STARTED_MESSAGE: String get() = Copy.text(R.string.error_not_started)

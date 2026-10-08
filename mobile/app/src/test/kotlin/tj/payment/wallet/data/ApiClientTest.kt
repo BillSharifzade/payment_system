@@ -382,11 +382,13 @@ class ApiClientTest {
 
         assertEquals(ErrorCode.INTERNAL_ERROR, result.code)
         assertEquals("rq-42", result.requestId)
-        assertTrue(result.userMessage(), result.userMessage().endsWith("Ref: rq-42"))
+        // Language-independent: the copy comes from string resources; the
+        // request id must be part of it for a 5xx.
+        assertTrue(result.userMessage(), result.userMessage().contains("rq-42"))
 
         serve(refresh = { error(500, "internal_error") }) { error(422, "insufficient_funds", requestId = "rq-43") }
         val refusal = api.wallets() as ApiOutcome.Failed
-        assertFalse("no Ref for a 4xx", refusal.userMessage().contains("Ref:"))
+        assertFalse("no Ref for a 4xx", refusal.userMessage().contains("rq-43"))
     }
 
     // --- Proactive rotation at ~80% of expires_in ---

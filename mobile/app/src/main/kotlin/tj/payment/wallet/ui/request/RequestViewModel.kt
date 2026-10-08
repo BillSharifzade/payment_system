@@ -20,6 +20,8 @@ import tj.payment.core.Money
 import tj.payment.core.WalletDto
 import tj.payment.wallet.data.WalletRepository
 import tj.payment.wallet.ui.userMessage
+import tj.payment.wallet.R
+import tj.payment.wallet.ui.Copy
 
 data class RequestUiState(
     val wallet: WalletDto? = null,
@@ -112,7 +114,7 @@ class RequestViewModel(private val repo: WalletRepository) : ViewModel() {
                     it.copy(
                         creating = false,
                         error = when (outcome.code) {
-                            ErrorCode.KYC_REQUIRED -> "Verify your identity before requesting payments."
+                            ErrorCode.KYC_REQUIRED -> Copy.text(R.string.request_error_kyc)
                             else -> outcome.userMessage()
                         },
                     )

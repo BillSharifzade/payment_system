@@ -19,6 +19,8 @@ import tj.payment.core.WalletDto
 import tj.payment.wallet.data.WalletRepository
 import tj.payment.wallet.ui.NOT_STARTED_MESSAGE
 import tj.payment.wallet.ui.userMessage
+import tj.payment.wallet.R
+import tj.payment.wallet.ui.Copy
 
 data class FxUiState(
     val loading: Boolean = true,
@@ -203,7 +205,7 @@ class FxViewModel(private val repo: WalletRepository) : ViewModel() {
                 is SubmitResult.Blocked -> {
                     _state.value = _state.value.copy(
                         converting = false,
-                        actionError = "Finish or discard your unconfirmed payment first.",
+                        actionError = Copy.text(R.string.fx_blocked),
                     )
                     pending.load(check = false)
                 }
@@ -222,8 +224,7 @@ class FxViewModel(private val repo: WalletRepository) : ViewModel() {
             converting = false,
             wallets = wallets,
             outcomeUnknown = true,
-            actionError = "We couldn't confirm whether the exchange went through. It's saved on this " +
-                "phone: finish it below — it can't convert twice — or discard it.",
+            actionError = Copy.text(R.string.fx_unknown_outcome),
         )
         pending.load(check = false)
     }

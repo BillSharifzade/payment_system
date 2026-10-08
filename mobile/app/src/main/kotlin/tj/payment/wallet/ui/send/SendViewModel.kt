@@ -22,6 +22,8 @@ import tj.payment.core.transferFeePreviewMinor
 import tj.payment.wallet.data.WalletRepository
 import tj.payment.wallet.ui.NOT_STARTED_MESSAGE
 import tj.payment.wallet.ui.userMessage
+import tj.payment.wallet.R
+import tj.payment.wallet.ui.Copy
 
 enum class SendStep { RECIPIENT, AMOUNT, CONFIRM, RESULT }
 
@@ -144,7 +146,7 @@ class SendViewModel(
                     it.copy(
                         resolving = false,
                         recipientError = if (outcome.code == ErrorCode.NOT_FOUND) {
-                            "No wallet with that number."
+                            Copy.text(R.string.send_error_no_wallet)
                         } else {
                             outcome.userMessage()
                         },
@@ -292,9 +294,9 @@ class SendViewModel(
                     it.copy(
                         discarding = false,
                         pendingError = if (result.offline) {
-                            "Can't cancel it while offline — it's kept until we can. Connect and try again."
+                            Copy.text(R.string.pending_notice_discard_failed_offline)
                         } else {
-                            "Couldn't cancel it with the server just now — it's kept. Try again in a moment."
+                            Copy.text(R.string.pending_notice_discard_failed)
                         },
                     )
                 }
@@ -304,7 +306,7 @@ class SendViewModel(
 
     private fun settle(result: SubmitResult?) {
         val outcome = when (result) {
-            null -> SendOutcome.Rejected("Nothing to submit.")
+            null -> SendOutcome.Rejected(Copy.text(R.string.payment_nothing_to_submit))
             is SubmitResult.Posted -> SendOutcome.Success(result.alreadyPosted)
             is SubmitResult.Rejected -> SendOutcome.Rejected(result.code.userMessage(), result.code)
             is SubmitResult.Unsettled -> SendOutcome.Unsettled(result.offline)

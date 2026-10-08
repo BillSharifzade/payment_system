@@ -43,6 +43,8 @@ import tj.payment.wallet.ui.appFieldColors
 import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.PositiveGreen
 import tj.payment.wallet.ui.theme.Rust
+import androidx.compose.ui.res.stringResource
+import tj.payment.wallet.R
 
 @Composable
 fun FxScreen(
@@ -59,7 +61,7 @@ fun FxScreen(
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp),
     ) {
-        ScreenHeader(title = "Exchange", onBack = onBack)
+        ScreenHeader(title = stringResource(R.string.fx_title), onBack = onBack)
 
         // An unsettled payment of this user (e.g. a conversion whose answer was
         // lost, even in an earlier app run) must be finished or discarded first.
@@ -85,13 +87,13 @@ fun FxScreen(
 
             state.needsSecondWallet -> Column {
                 Text(
-                    "You need a second currency",
+                    stringResource(R.string.fx_need_second_title),
                     style = MaterialTheme.typography.titleLarge,
                     color = MaterialTheme.colorScheme.onBackground,
                 )
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "Exchanging moves money between your own wallets — open a US dollar wallet to start.",
+                    stringResource(R.string.fx_need_second_body),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -101,7 +103,7 @@ fun FxScreen(
                 }
                 Spacer(Modifier.height(20.dp))
                 PrimaryButton(
-                    text = "Open a USD wallet",
+                    text = stringResource(R.string.fx_open_usd),
                     onClick = viewModel::openUsdWallet,
                     loading = state.openingWallet,
                     modifier = Modifier.fillMaxWidth(),
@@ -111,7 +113,7 @@ fun FxScreen(
             else -> {
                 // From / swap / to.
                 WalletLine(
-                    label = "From",
+                    label = stringResource(R.string.fx_from),
                     currency = state.from?.currency ?: "—",
                     balance = state.from?.displayAmount(),
                 )
@@ -125,7 +127,7 @@ fun FxScreen(
                     contentAlignment = Alignment.Center,
                 ) { GlyphSwap() }
                 WalletLine(
-                    label = "To",
+                    label = stringResource(R.string.label_to),
                     currency = state.to?.currency ?: "—",
                     balance = state.to?.displayAmount(),
                 )
@@ -134,7 +136,7 @@ fun FxScreen(
                 OutlinedTextField(
                     value = state.amountText,
                     onValueChange = viewModel::onAmountChange,
-                    label = { Text("Amount in ${state.from?.currency ?: ""}") },
+                    label = { Text(stringResource(R.string.fx_amount_in, state.from?.currency ?: "")) },
                     singleLine = true,
                     isError = state.insufficient,
                     shape = RoundedCornerShape(14.dp),
@@ -147,13 +149,13 @@ fun FxScreen(
                 val rate = state.rate
                 when {
                     state.insufficient -> Text(
-                        "Not enough balance.",
+                        stringResource(R.string.fx_insufficient),
                         color = NegativeRed,
                         style = MaterialTheme.typography.bodyMedium,
                     )
 
                     rate == null -> Text(
-                        "No exchange rate is set for this direction right now.",
+                        stringResource(R.string.fx_no_rate),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         style = MaterialTheme.typography.bodyMedium,
                     )
@@ -163,10 +165,10 @@ fun FxScreen(
                             rate.convert(100) ?: 0,
                             Currency.of(rate.quote),
                         )
-                        KeyValueRow("Rate", "1 ${rate.base} = ${one.formatAmount()} ${rate.quote}")
+                        KeyValueRow(stringResource(R.string.fx_rate), "1 ${rate.base} = ${one.formatAmount()} ${rate.quote}")
                         state.quoteMinor?.let { q ->
                             KeyValueRow(
-                                "You get exactly",
+                                stringResource(R.string.fx_you_get),
                                 Money.ofMinor(q, Currency.of(rate.quote)).format(),
                                 valueColor = PositiveGreen,
                             )
@@ -188,7 +190,7 @@ fun FxScreen(
                 state.exchanged?.let { debited ->
                     Spacer(Modifier.height(14.dp))
                     Text(
-                        "Exchanged ${debited.format()}",
+                        stringResource(R.string.fx_exchanged_amount, debited.format()),
                         style = MaterialTheme.typography.titleMedium,
                         color = PositiveGreen,
                     )
@@ -203,7 +205,7 @@ fun FxScreen(
                             .padding(14.dp),
                     ) {
                         Text(
-                            "Exchanged",
+                            stringResource(R.string.fx_exchanged),
                             style = MaterialTheme.typography.titleMedium,
                             color = PositiveGreen,
                         )
@@ -219,7 +221,7 @@ fun FxScreen(
 
                 Spacer(Modifier.height(24.dp))
                 PrimaryButton(
-                    text = "Exchange",
+                    text = stringResource(R.string.fx_action),
                     onClick = viewModel::convert,
                     // Confirmed with the fingerprint / screen lock by the submitter.
                     enabled = state.canConvert && pending.pending == null && pending.busy == null,

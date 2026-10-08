@@ -38,6 +38,8 @@ import tj.payment.wallet.ui.BrandMark
 import tj.payment.wallet.ui.PrimaryButton
 import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.Rust
+import androidx.compose.ui.res.stringResource
+import tj.payment.wallet.R
 
 @Composable
 fun LoginScreen(
@@ -74,17 +76,13 @@ fun LoginScreen(
                 Spacer(Modifier.height(24.dp))
 
                 Text(
-                    text = if (isRegister) "Create your wallet" else "Welcome back",
+                    text = stringResource(if (isRegister) R.string.login_title_register else R.string.login_title_sign_in),
                     style = MaterialTheme.typography.headlineMedium,
                     color = MaterialTheme.colorScheme.onBackground,
                 )
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    text = if (isRegister) {
-                        "Register with your phone number."
-                    } else {
-                        "Sign in to continue."
-                    },
+                    text = stringResource(if (isRegister) R.string.login_subtitle_register else R.string.login_subtitle_sign_in),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -94,7 +92,7 @@ fun LoginScreen(
                 OutlinedTextField(
                     value = state.phone,
                     onValueChange = viewModel::onPhoneChange,
-                    label = { Text("Phone number") },
+                    label = { Text(stringResource(R.string.login_phone)) },
                     singleLine = true,
                     shape = RoundedCornerShape(14.dp),
                     colors = fieldColors(),
@@ -110,7 +108,7 @@ fun LoginScreen(
                 OutlinedTextField(
                     value = state.password,
                     onValueChange = viewModel::onPasswordChange,
-                    label = { Text("Password") },
+                    label = { Text(stringResource(R.string.login_password)) },
                     singleLine = true,
                     shape = RoundedCornerShape(14.dp),
                     colors = fieldColors(),
@@ -138,7 +136,7 @@ fun LoginScreen(
                 Spacer(Modifier.height(24.dp))
 
                 PrimaryButton(
-                    text = if (isRegister) "Create wallet" else "Sign in",
+                    text = stringResource(if (isRegister) R.string.login_action_register else R.string.login_action_sign_in),
                     onClick = viewModel::submit,
                     enabled = state.canSubmit,
                     loading = state.submitting,
@@ -153,7 +151,7 @@ fun LoginScreen(
                     modifier = Modifier.align(Alignment.CenterHorizontally),
                 ) {
                     Text(
-                        if (isRegister) "Have an account? Sign in" else "New here? Create a wallet",
+                        stringResource(if (isRegister) R.string.login_toggle_to_sign_in else R.string.login_toggle_to_register),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }

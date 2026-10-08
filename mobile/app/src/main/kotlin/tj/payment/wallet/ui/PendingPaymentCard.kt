@@ -26,13 +26,15 @@ import tj.payment.core.PendingPaymentResolver.Notice
 import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.PositiveGreen
 import tj.payment.wallet.ui.theme.Rust
+import androidx.compose.ui.res.stringResource
+import tj.payment.wallet.R
 
-/** "50,00 TJS to +992…" / "Exchange of 50,00 TJS to USD" — what the user confirmed. */
+/** "50,00 TJS to +992…" / "Exchange of 50,00 TJS to USD" (localized) — what the user confirmed. */
 fun PendingPayment.describe(): String {
     val amount = Money.ofMinor(amountMinor, Currency.of(currency)).format()
     return when (kind) {
-        PaymentKind.FX -> "Exchange of $amount to $recipientLabel"
-        PaymentKind.TRANSFER, PaymentKind.CHECK -> "$amount to $recipientLabel"
+        PaymentKind.FX -> Copy.text(R.string.pending_describe_fx, amount, recipientLabel)
+        PaymentKind.TRANSFER, PaymentKind.CHECK -> Copy.text(R.string.pending_describe_pay, amount, recipientLabel)
     }
 }
 
@@ -57,18 +59,14 @@ fun PendingPaymentCard(
             containerColor = MaterialTheme.colorScheme.surface,
             titleContentColor = MaterialTheme.colorScheme.onSurface,
             textContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-            title = { Text("Discard this payment?") },
+            title = { Text(stringResource(R.string.pending_discard_title)) },
             text = {
-                Text(
-                    "We'll cancel it with our server first. If it already went through, it will be " +
-                        "shown as sent instead. Otherwise it is cancelled for good — it can never go " +
-                        "through later.",
-                )
+                Text(stringResource(R.string.pending_discard_body))
             },
-            confirmButton = { TextButton(onClick = onConfirmDiscard) { Text("Discard", color = NegativeRed) } },
+            confirmButton = { TextButton(onClick = onConfirmDiscard) { Text(stringResource(R.string.action_discard), color = NegativeRed) } },
             dismissButton = {
                 TextButton(onClick = onCancelDiscard) {
-                    Text("Keep it", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(stringResource(R.string.action_keep_it), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             },
         )
@@ -90,14 +88,13 @@ fun PendingPaymentCard(
             ) {
                 Column(Modifier.padding(16.dp)) {
                     Text(
-                        "Unfinished payment",
+                        stringResource(R.string.pending_title),
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.onSurface,
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "${pending.describe()} didn't finish. It may or may not have gone through — " +
-                            "finishing it is always safe, you can never be charged twice.",
+                        stringResource(R.string.pending_body, pending.describe()),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -105,7 +102,9 @@ fun PendingPaymentCard(
                     val busy = state.busy
                     Row {
                         PrimaryButton(
-                            text = if (busy == PendingPaymentResolver.Busy.CHECKING) "Checking…" else "Finish it",
+                            text = stringResource(
+                                if (busy == PendingPaymentResolver.Busy.CHECKING) R.string.pending_checking else R.string.pending_finish,
+                            ),
                             onClick = onFinish,
                             enabled = busy == null,
                             loading = busy == PendingPaymentResolver.Busy.RETRYING,
@@ -117,7 +116,9 @@ fun PendingPaymentCard(
                             modifier = Modifier.align(Alignment.CenterVertically),
                         ) {
                             Text(
-                                if (busy == PendingPaymentResolver.Busy.DISCARDING) "Cancelling…" else "Discard",
+                                stringResource(
+                                    if (busy == PendingPaymentResolver.Busy.DISCARDING) R.string.pending_cancelling else R.string.action_discard,
+                                ),
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
@@ -131,15 +132,17 @@ fun PendingPaymentCard(
 @Composable
 private fun NoticeLine(notice: Notice, onDismiss: () -> Unit) {
     val (text, color) = when (notice) {
-        is Notice.Sent -> "${notice.payment.describe()} went through." to PositiveGreen
-        is Notice.Cancelled -> "${notice.payment.describe()} was cancelled. Nothing was sent." to MaterialTheme.colorScheme.onSurface
-        is Notice.Refused -> "${notice.payment.describe()} wasn't sent: ${notice.code.userMessage()}" to NegativeRed
-        is Notice.NoAnswer ->
-            (if (notice.offline) "Still offline — " else "Still no answer from the server — ") +
-                "the payment is kept. Try again in a moment." to Rust
-        is Notice.DiscardFailed ->
-            (if (notice.offline) "Can't cancel it while offline" else "Couldn't cancel it just now") +
-                " — it's kept until we can. Try again in a moment." to Rust
+        is Notice.Sent -> stringResource(R.string.pending_notice_sent, notice.payment.describe()) to PositiveGreen
+        is Notice.Cancelled ->
+            stringResource(R.string.pending_notice_cancelled, notice.payment.describe()) to MaterialTheme.colorScheme.onSurface
+        is Notice.Refused ->
+            stringResource(R.string.pending_notice_refused, notice.payment.describe(), notice.code.userMessage()) to NegativeRed
+        is Notice.NoAnswer -> stringResource(
+            if (notice.offline) R.string.pending_notice_no_answer_offline else R.string.pending_notice_no_answer,
+        ) to Rust
+        is Notice.DiscardFailed -> stringResource(
+            if (notice.offline) R.string.pending_notice_discard_failed_offline else R.string.pending_notice_discard_failed,
+        ) to Rust
         Notice.StorageProblem -> STORAGE_MESSAGE to NegativeRed
     }
     Card(
@@ -150,7 +153,7 @@ private fun NoticeLine(notice: Notice, onDismiss: () -> Unit) {
     ) {
         Row(Modifier.padding(start = 16.dp, top = 8.dp, bottom = 8.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(text, color = color, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
-            TextButton(onClick = onDismiss) { Text("OK", color = Rust) }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_ok), color = Rust) }
         }
     }
 }

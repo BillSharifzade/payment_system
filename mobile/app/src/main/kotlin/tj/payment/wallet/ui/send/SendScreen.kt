@@ -55,6 +55,8 @@ import tj.payment.wallet.ui.describe
 import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.PositiveGreen
 import tj.payment.wallet.ui.theme.Rust
+import androidx.compose.ui.res.stringResource
+import tj.payment.wallet.R
 
 @Composable
 fun SendScreen(
@@ -74,20 +76,16 @@ fun SendScreen(
             containerColor = MaterialTheme.colorScheme.surface,
             titleContentColor = MaterialTheme.colorScheme.onSurface,
             textContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-            title = { Text("Discard this payment?") },
+            title = { Text(stringResource(R.string.pending_discard_title)) },
             text = {
-                Text(
-                    "We'll cancel it with our server first. If it already went through, it will be " +
-                        "shown as sent instead. Otherwise it is cancelled for good — it can never go " +
-                        "through later — and you can start over.",
-                )
+                Text(stringResource(R.string.pending_discard_body))
             },
             confirmButton = {
-                TextButton(onClick = viewModel::confirmDiscard) { Text("Discard", color = NegativeRed) }
+                TextButton(onClick = viewModel::confirmDiscard) { Text(stringResource(R.string.action_discard), color = NegativeRed) }
             },
             dismissButton = {
                 TextButton(onClick = viewModel::cancelDiscard) {
-                    Text("Keep it", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(stringResource(R.string.action_keep_it), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             },
         )
@@ -101,10 +99,10 @@ fun SendScreen(
     ) {
         ScreenHeader(
             title = when (state.step) {
-                SendStep.RECIPIENT -> "Send money"
-                SendStep.AMOUNT -> "Amount"
-                SendStep.CONFIRM -> "Confirm"
-                SendStep.RESULT -> "Payment"
+                SendStep.RECIPIENT -> stringResource(R.string.send_title)
+                SendStep.AMOUNT -> stringResource(R.string.send_title_amount)
+                SendStep.CONFIRM -> stringResource(R.string.send_title_confirm)
+                SendStep.RESULT -> stringResource(R.string.payment_title)
             },
             onBack = {
                 when (state.step) {
@@ -149,14 +147,13 @@ private fun RecipientStep(viewModel: SendViewModel) {
             ) {
                 Column(Modifier.padding(16.dp)) {
                     Text(
-                        "Unfinished payment",
+                        stringResource(R.string.pending_title),
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.onSurface,
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "${pending.describe()} didn't finish. " +
-                            "It may or may not have gone through — finish it before sending anything new.",
+                        stringResource(R.string.send_pending_body, pending.describe()),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -167,7 +164,7 @@ private fun RecipientStep(viewModel: SendViewModel) {
                     Spacer(Modifier.height(10.dp))
                     Row {
                         PrimaryButton(
-                            text = "Finish it",
+                            text = stringResource(R.string.pending_finish),
                             onClick = viewModel::resumePending,
                             enabled = !state.discarding,
                             modifier = Modifier.weight(1f),
@@ -178,7 +175,7 @@ private fun RecipientStep(viewModel: SendViewModel) {
                             modifier = Modifier.align(Alignment.CenterVertically),
                         ) {
                             Text(
-                                if (state.discarding) "Checking…" else "Discard",
+                                stringResource(if (state.discarding) R.string.pending_cancelling else R.string.action_discard),
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
@@ -189,7 +186,7 @@ private fun RecipientStep(viewModel: SendViewModel) {
         }
 
         Text(
-            "Who are you sending to?",
+            stringResource(R.string.send_who),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -197,7 +194,7 @@ private fun RecipientStep(viewModel: SendViewModel) {
         OutlinedTextField(
             value = state.phone,
             onValueChange = viewModel::onPhoneChange,
-            label = { Text("Recipient's phone number") },
+            label = { Text(stringResource(R.string.send_recipient_phone)) },
             singleLine = true,
             enabled = state.pendingResume == null,
             shape = RoundedCornerShape(14.dp),
@@ -214,7 +211,7 @@ private fun RecipientStep(viewModel: SendViewModel) {
         }
         Spacer(Modifier.height(20.dp))
         PrimaryButton(
-            text = "Check number",
+            text = stringResource(R.string.send_check_number),
             onClick = viewModel::checkRecipient,
             enabled = state.canCheckPhone && state.pendingResume == null,
             loading = state.resolving,
@@ -260,17 +257,22 @@ private fun AmountStep(viewModel: SendViewModel) {
         }
         Spacer(Modifier.height(8.dp))
         val hint = when {
-            state.insufficient -> "Not enough balance — you have " +
-                (state.fromWallet?.money()?.formatAmount() ?: "0") + " $currency"
+            state.insufficient -> stringResource(
+                R.string.send_hint_insufficient,
+                (state.fromWallet?.money()?.formatAmount() ?: "0") + " $currency",
+            )
             else -> {
                 val fee = state.feeMinor
                 val amount = state.amount
                 if (fee != null && amount != null && fee > 0) {
                     val gets = Money.ofMinor(amount.minorUnits - fee, amount.currency)
-                    "Fee ${Money.ofMinor(fee, amount.currency).formatAmount()} · " +
-                        "they receive ${gets.formatAmount()} $currency"
+                    stringResource(
+                        R.string.send_hint_fee,
+                        Money.ofMinor(fee, amount.currency).formatAmount(),
+                        gets.formatAmount() + " $currency",
+                    )
                 } else {
-                    "Balance: ${state.fromWallet?.money()?.formatAmount() ?: "…"} $currency"
+                    stringResource(R.string.send_hint_balance, (state.fromWallet?.money()?.formatAmount() ?: "…") + " $currency")
                 }
             }
         }
@@ -293,7 +295,7 @@ private fun AmountStep(viewModel: SendViewModel) {
         )
         Spacer(Modifier.height(16.dp))
         PrimaryButton(
-            text = "Continue",
+            text = stringResource(R.string.action_continue),
             onClick = viewModel::toConfirm,
             enabled = state.canContinueAmount,
             modifier = Modifier.fillMaxWidth(),
@@ -319,7 +321,7 @@ private fun RecipientChip(label: String, verified: Boolean) {
                 maxLines = 1,
             )
             Text(
-                if (verified) "Verified name" else "Name not verified",
+                stringResource(if (verified) R.string.send_name_verified else R.string.send_name_not_verified),
                 style = MaterialTheme.typography.bodyMedium,
                 fontSize = 12.sp,
                 color = if (verified) PositiveGreen else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -416,21 +418,21 @@ private fun ConfirmStep(viewModel: SendViewModel) {
             elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
         ) {
             Column(Modifier.padding(20.dp)) {
-                KeyValueRow("To", state.recipientLabel)
+                KeyValueRow(stringResource(R.string.label_to), state.recipientLabel)
                 if (state.recipient?.nameVerified != true) {
                     Text(
-                        "This account has no verified name — double-check the number.",
+                        stringResource(R.string.send_unverified_warning),
                         style = MaterialTheme.typography.bodyMedium,
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 Spacer(Modifier.height(8.dp))
-                KeyValueRow("You send", amount?.format() ?: "—")
+                KeyValueRow(stringResource(R.string.send_you_send), amount?.format() ?: "—")
                 if (fee > 0 && amount != null) {
-                    KeyValueRow("Fee", Money.ofMinor(fee, currency).format())
+                    KeyValueRow(stringResource(R.string.label_fee), Money.ofMinor(fee, currency).format())
                     KeyValueRow(
-                        "They receive",
+                        stringResource(R.string.send_they_receive),
                         Money.ofMinor(amount.minorUnits - fee, currency).format(),
                         valueColor = PositiveGreen,
                     )
@@ -439,8 +441,7 @@ private fun ConfirmStep(viewModel: SendViewModel) {
         }
         Spacer(Modifier.height(12.dp))
         Text(
-            "Once sent, a payment can't be pulled back. Make sure the recipient is right. " +
-                "You'll confirm with your fingerprint or screen lock.",
+            stringResource(R.string.send_irreversible),
             style = MaterialTheme.typography.bodyMedium,
             fontSize = 12.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -451,7 +452,7 @@ private fun ConfirmStep(viewModel: SendViewModel) {
         }
         Spacer(Modifier.height(20.dp))
         PrimaryButton(
-            text = "Send ${amount?.format() ?: ""}",
+            text = stringResource(R.string.send_action, amount?.format() ?: ""),
             onClick = viewModel::confirmAndSend,
             loading = state.submitting,
             modifier = Modifier.fillMaxWidth(),
@@ -477,7 +478,7 @@ private fun ResultStep(viewModel: SendViewModel, onClose: () -> Unit, onVerifyId
                 androidx.compose.material3.CircularProgressIndicator(color = Rust)
                 Spacer(Modifier.height(16.dp))
                 Text(
-                    "Finishing your payment…",
+                    stringResource(R.string.payment_finishing),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -487,26 +488,29 @@ private fun ResultStep(viewModel: SendViewModel, onClose: () -> Unit, onVerifyId
                 ResultGlyph(success = true)
                 Spacer(Modifier.height(20.dp))
                 Text(
-                    "Sent",
+                    stringResource(R.string.send_result_sent),
                     style = MaterialTheme.typography.headlineMedium,
                     color = MaterialTheme.colorScheme.onBackground,
                 )
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "${state.confirmedAmount?.format() ?: ""} to ${state.confirmedLabel}" +
-                        if (outcome.alreadyPosted) " (was already sent)" else "",
+                    stringResource(
+                        if (outcome.alreadyPosted) R.string.send_result_detail_already else R.string.send_result_detail,
+                        state.confirmedAmount?.format() ?: "",
+                        state.confirmedLabel,
+                    ),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(Modifier.height(32.dp))
-                PrimaryButton("Done", onClick = onClose, modifier = Modifier.fillMaxWidth())
+                PrimaryButton(stringResource(R.string.action_done), onClick = onClose, modifier = Modifier.fillMaxWidth())
             }
 
             is SendOutcome.Rejected -> {
                 ResultGlyph(success = false)
                 Spacer(Modifier.height(20.dp))
                 Text(
-                    "Not sent",
+                    stringResource(R.string.send_result_not_sent),
                     style = MaterialTheme.typography.headlineMedium,
                     color = MaterialTheme.colorScheme.onBackground,
                 )
@@ -521,16 +525,16 @@ private fun ResultStep(viewModel: SendViewModel, onClose: () -> Unit, onVerifyId
                     // The fix is one screen away: take the user there instead of
                     // leaving them to find the banner on Home.
                     PrimaryButton(
-                        "Verify now",
+                        stringResource(R.string.action_verify_now),
                         onClick = onVerifyIdentity,
                         modifier = Modifier.fillMaxWidth(),
                     )
                     TextButton(onClick = { viewModel.backTo(SendStep.AMOUNT) }) {
-                        Text("Back", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(stringResource(R.string.action_back), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 } else {
                     PrimaryButton(
-                        "Back",
+                        stringResource(R.string.action_back),
                         onClick = { viewModel.backTo(SendStep.AMOUNT) },
                         modifier = Modifier.fillMaxWidth(),
                     )
@@ -541,27 +545,25 @@ private fun ResultStep(viewModel: SendViewModel, onClose: () -> Unit, onVerifyId
                 ResultGlyph(success = false, warning = true)
                 Spacer(Modifier.height(20.dp))
                 Text(
-                    "Not confirmed yet",
+                    stringResource(R.string.payment_not_confirmed),
                     style = MaterialTheme.typography.headlineMedium,
                     color = MaterialTheme.colorScheme.onBackground,
                 )
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    (if (outcome.offline) "You appear to be offline. " else "The server didn't answer. ") +
-                        "Your payment may still go through — retrying is always safe, " +
-                        "you can never be charged twice.",
+                    stringResource(if (outcome.offline) R.string.payment_unsettled_offline else R.string.payment_unsettled_no_answer),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(Modifier.height(32.dp))
                 PrimaryButton(
-                    "Try again",
+                    stringResource(R.string.action_try_again),
                     onClick = viewModel::retry,
                     loading = state.submitting,
                     modifier = Modifier.fillMaxWidth(),
                 )
                 TextButton(onClick = onClose) {
-                    Text("Later", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(stringResource(R.string.action_later), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
