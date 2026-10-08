@@ -1,0 +1,159 @@
+# TigerBeetle ledger backend (crates/ledger-tigerbeetle, DESIGN.md §15 Phase 2).
+#
+# 1. The workspace crate's Postgres suites against the in-process cluster model
+#    (the non-Postgres tests already run in ci.yml's `cargo test --workspace`).
+# 2. The live crate (crates/ledger-tigerbeetle/live, outside the workspace: its
+#    native client needs Zig and libclang) against a real single-replica cluster:
+#    model/cluster fidelity, the differentials, crash recovery, races, cut-over.
+# 3. A short benchmark smoke run, its table in the job summary.
+#
+# The TigerBeetle release and Zig are pinned by version and SHA-256; actions by
+# commit SHA, the Postgres service by digest, as in ci.yml.
+name: TigerBeetle
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/ledger-tigerbeetle/**
+      - crates/ledger/**
+      - crates/money/**
+      - crates/storage/**
+      - migrations/**
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/tigerbeetle.yml
+  pull_request:
+    paths:
+      - crates/ledger-tigerbeetle/**
+      - crates/ledger/**
+      - crates/money/**
+      - crates/storage/**
+      - migrations/**
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/tigerbeetle.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tigerbeetle-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Server release; the client embedded by tigerbeetle-unofficial 0.14.28 is
+  # 0.16.78, within this server's release_client_min (0.16.4).
+  TB_VERSION: "0.17.9"
+  TB_SHA256: af71f2c0057e3b409bf79940fa94894b738187b0d4f1e711097bca15df5d8cd4
+  # Zig builds tb_client; the release TigerBeetle 0.16.78 itself pins.
+  ZIG_VERSION: "0.14.1"
+  ZIG_SHA256: 24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
+
+jobs:
+  tigerbeetle:
+    name: TigerBeetle — model, live cluster, benchmark smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+        env:
+          POSTGRES_USER: payment
+          POSTGRES_PASSWORD: payment_dev_pw
+          POSTGRES_DB: payment
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U payment -d payment"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: postgres://payment:payment_dev_pw@localhost:5432/payment
+      TB_ADDRESS: "127.0.0.1:3000"
+      TB_CLUSTER_ID: "0"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      LIVE: crates/ledger-tigerbeetle/live/Cargo.toml
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust (rust-toolchain.toml pins 1.98)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09
+        with:
+          toolchain: "1.98"
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            . -> target
+            crates/ledger-tigerbeetle/live -> ../../../target
+
+      - name: TigerBeetle ${{ env.TB_VERSION }} — download, verify, start one replica
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/tigerbeetle"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/tb.zip" \
+            "https://github.com/tigerbeetle/tigerbeetle/releases/download/$TB_VERSION/tigerbeetle-x86_64-linux.zip"
+          echo "$TB_SHA256  $dir/tb.zip" | sha256sum -c -
+          unzip -q "$dir/tb.zip" -d "$dir"
+          rm "$dir/tb.zip"
+          "$dir/tigerbeetle" version
+          "$dir/tigerbeetle" format --cluster="$TB_CLUSTER_ID" --replica=0 --replica-count=1 \
+            --development "$dir/0_0.tigerbeetle"
+          nohup "$dir/tigerbeetle" start --addresses="$TB_ADDRESS" --development \
+            "$dir/0_0.tigerbeetle" > "$dir/replica.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            if (echo > "/dev/tcp/${TB_ADDRESS%:*}/${TB_ADDRESS#*:}") 2>/dev/null; then
+              echo "replica listening on $TB_ADDRESS"
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$dir/replica.log"
+          exit 1
+
+      - name: Zig ${{ env.ZIG_VERSION }} (builds TigerBeetle's native client)
+        run: |
+          set -euo pipefail
+          archive="zig-x86_64-linux-$ZIG_VERSION"
+          curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" "https://ziglang.org/download/$ZIG_VERSION/$archive.tar.xz"
+          echo "$ZIG_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          rm "$RUNNER_TEMP/zig.tar.xz"
+          echo "ZIG_PATH=$RUNNER_TEMP/$archive/zig" >> "$GITHUB_ENV"
+
+      - name: Live crate — format and clippy (warnings = errors)
+        run: |
+          cargo fmt --manifest-path "$LIVE" -- --check
+          cargo clippy --manifest-path "$LIVE" --locked --all-targets -- -D warnings
+
+      - name: Postgres suites against the cluster model
+        run: cargo test -p ledger-tigerbeetle -- --ignored
+
+      - name: Suites against the live cluster
+        run: cargo test --manifest-path "$LIVE" --locked -- --ignored --test-threads=1
+
+      - name: Benchmark smoke run
+        run: |
+          set -euo pipefail
+          cargo run --manifest-path "$LIVE" --locked --release --bin tb-bench -- \
+            --concurrency 1,8,32 --seconds 3 --rounds 1 --wallets 300 | tee bench.md
+          {
+            echo "### TigerBeetle posting benchmark (smoke: shared CI runner, one round)"
+            echo
+            cat bench.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Replica log
+        if: failure()
+        run: cat "$RUNNER_TEMP/tigerbeetle/replica.log"

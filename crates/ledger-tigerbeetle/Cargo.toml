@@ -1,0 +1,27 @@
+[package]
+name = "ledger-tigerbeetle"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "TigerBeetle ledger backend (DESIGN.md §15, Phase 2): balances and the no-overdraft rule live in TigerBeetle; guards, idempotency, the outbox and the journal mirror stay in Postgres, joined by a reserve → commit → post protocol with crash recovery."
+
+[features]
+# The shared test suites (src/testkit.rs). The live crate (./live) runs them against a real cluster.
+testkit = []
+
+[dependencies]
+ledger = { workspace = true }
+money = { workspace = true }
+storage = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
