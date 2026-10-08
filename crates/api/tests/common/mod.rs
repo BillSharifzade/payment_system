@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use api::{
-    build_router, AmlConfig, AppState, AuthConfig, BiometricConfig, DepositConfig, FeeConfig,
-    RateLimitState,
+    build_router, AmlConfig, AppState, AuthConfig, BiometricConfig, DepositConfig, DeviceConfig,
+    FeeConfig, RateLimitState,
 };
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -31,6 +31,8 @@ pub struct TestConfig {
     pub auth: AuthConfig,
     pub deposits: DepositConfig,
     pub biometric: BiometricConfig,
+    pub devices: DeviceConfig,
+    pub login_limit: RateLimitState,
 }
 
 // The dev test state: single-admin deposits (dual control has dedicated tests) and 1:N
@@ -51,6 +53,8 @@ impl Default for TestConfig {
                 identify: true,
                 ..BiometricConfig::dev()
             },
+            devices: DeviceConfig::dev(),
+            login_limit: RateLimitState::new(10_000, std::time::Duration::from_secs(60)),
         }
     }
 }
@@ -60,12 +64,13 @@ pub fn router(pool: PgPool, cfg: TestConfig) -> axum::Router {
         ledger: PostgresLedger::new(pool),
         auth: cfg.auth,
         rate_limit: cfg.rate_limit,
-        login_limit: RateLimitState::new(10_000, std::time::Duration::from_secs(60)),
+        login_limit: cfg.login_limit,
         resolve_limit: RateLimitState::new(10_000, std::time::Duration::from_secs(60)),
         aml: cfg.aml,
         fees: cfg.fees,
         deposits: cfg.deposits,
         biometric: cfg.biometric,
+        devices: cfg.devices,
         trust_proxy: true,
         document_dir: std::env::temp_dir().join("payment-kyc-docs-test"),
         kyc_upload_daily_max: cfg.kyc_upload_daily_max,

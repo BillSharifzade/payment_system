@@ -83,6 +83,8 @@ class MoneyTest {
             "invalid_amount", "unknown_currency", "amount_too_large", "rejected", "voided",
             "dual_control_required", "recipient_unavailable", "terminal_unauthorized",
             "probe_replayed", "check_locked",
+            // Device binding (POST /v1/devices; signed money moves).
+            "device_signature_required", "device_signature_invalid",
         )
         for (wire in contract) {
             val code = ErrorCode.fromWire(wire)

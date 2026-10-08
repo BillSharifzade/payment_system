@@ -1,5 +1,6 @@
 package tj.payment.core
 
+import java.util.Locale
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -61,34 +62,71 @@ data class PendingPayment(
     @SerialName("user_id") val userId: String = "",
     val kind: PaymentKind = if (checkId != null) PaymentKind.CHECK else PaymentKind.TRANSFER,
     /**
-     * Base64 device signature over [authorizationPayload], made with the
+     * Base64 (DER) device signature over [authorizationPayload], made with the
      * Keystore key that only a successful strong device authentication unlocks.
      * Null only on legacy records. Kept with the record so every retry carries
-     * the original approval (and so server-side verification can be added
-     * without changing the record).
+     * the original approval — the server verifies it (`X-Device-Signature`).
      */
     val authorization: String? = null,
+    /**
+     * The server's id for the registered key that made [authorization]
+     * (`X-Device-Id`, POST /v1/devices). Stored with the signature so a retry
+     * resends the original pair. Null on records from before device binding.
+     */
+    @SerialName("device_id") val deviceId: String? = null,
     @SerialName("created_at_ms") val createdAtMs: Long = 0,
 )
 
+/** The signed-payload tag; the server's `AUTH_PAYLOAD_TAG` (crates/api/src/devices.rs). */
+const val AUTHORIZATION_PAYLOAD_TAG = "tj.payment.authorize.v1"
+
 /**
- * The exact bytes the device owner approves for a payment: every field that
- * decides where money goes and how much, plus the key (so an approval can never
- * be replayed for another payment). Length-prefixed, so no field value can be
- * confused with a separator. Versioned for a future server-side verifier.
+ * The exact bytes the device owner approves for a payment — the canonical
+ * payload the server rebuilds from the request and verifies the signature
+ * against (crates/api/src/devices.rs `PaymentAuth::payload`; the shared test
+ * vectors are in DeviceSignatureVectorsTest and crates/api/tests/devices.rs).
+ *
+ * Nine fields in a fixed order — tag, user id, kind, idempotency key, from
+ * account, to account, amount (decimal), currency, check id (empty for none) —
+ * each as `<UTF-8 byte length>:<value>;`. Length-prefixed, so no field value
+ * can be confused with a separator. Ids are lowercased (the server prints
+ * UUIDs lowercase). Every field that decides where money goes and how much,
+ * plus the key, so an approval can never be replayed for another payment.
+ *
+ * What the server fills in per kind: transfer — the body's accounts, amount
+ * and currency; FX — the body's accounts and amount, currency = the SOURCE
+ * wallet's; check — from = the payer wallet sent as `account`, to = the
+ * check's merchant wallet, the check's amount and currency, and its id.
  */
 fun PendingPayment.authorizationPayload(): ByteArray =
     listOf(
-        "tj.payment.authorize.v1",
-        userId,
-        kind.name.lowercase(),
-        idempotencyKey,
-        fromAccount,
-        toAccount,
+        AUTHORIZATION_PAYLOAD_TAG,
+        userId.lowercase(Locale.ROOT),
+        kind.name.lowercase(Locale.ROOT),
+        idempotencyKey.lowercase(Locale.ROOT),
+        fromAccount.lowercase(Locale.ROOT),
+        toAccount.lowercase(Locale.ROOT),
         amountMinor.toString(),
         currency,
-        checkId.orEmpty(),
-    ).joinToString(separator = "") { "${it.length}:$it;" }.toByteArray(Charsets.UTF_8)
+        checkId.orEmpty().lowercase(Locale.ROOT),
+    ).joinToString(separator = "") { "${it.toByteArray(Charsets.UTF_8).size}:$it;" }.toByteArray(Charsets.UTF_8)
+
+/** The server's device-binding headers (crates/api/src/devices.rs). */
+object DeviceHeaders {
+    const val DEVICE_ID = "X-Device-Id"
+    const val SIGNATURE = "X-Device-Signature"
+}
+
+/**
+ * `X-Device-Id` + `X-Device-Signature` for this payment: always the stored pair,
+ * so a retry carries the original approval. Empty for a legacy record without
+ * one (the server then answers `device_signature_required` when binding is on).
+ */
+fun PendingPayment.deviceHeaders(): Map<String, String> {
+    val device = deviceId ?: return emptyMap()
+    val signature = authorization ?: return emptyMap()
+    return mapOf(DeviceHeaders.DEVICE_ID to device, DeviceHeaders.SIGNATURE to signature)
+}
 
 /**
  * Strong device authentication for a money move. The implementation shows the
@@ -102,8 +140,12 @@ fun interface PaymentAuthorizer {
 }
 
 sealed interface Authorization {
-    /** The device owner approved exactly this payment. */
-    data class Granted(val signature: String) : Authorization
+    /**
+     * The device owner approved exactly this payment. [deviceId] is the server's
+     * id of the registered key that made [signature] (null only in tests and
+     * where the server does not bind devices).
+     */
+    data class Granted(val signature: String, val deviceId: String? = null) : Authorization
 
     /** The user dismissed the prompt. */
     data object Cancelled : Authorization
@@ -130,6 +172,13 @@ enum class AuthDenial {
 
     /** The prompt or the Keystore signing failed. */
     FAILED,
+
+    /**
+     * This phone's signing key is not registered to the user's account (never
+     * registered, replaced after a biometric change, or revoked): the server
+     * would refuse the signature. Re-registering needs the password.
+     */
+    DEVICE_NOT_REGISTERED,
 }
 
 /** Durable storage for at most one in-flight payment **per user**. */
@@ -334,7 +383,7 @@ class PaymentSubmitter(
             createdAtMs = clock(),
         )
         val payment = when (val approval = authorizer.authorize(draft)) {
-            is Authorization.Granted -> draft.copy(authorization = approval.signature)
+            is Authorization.Granted -> draft.copy(authorization = approval.signature, deviceId = approval.deviceId)
             Authorization.Cancelled -> return SubmitResult.NotAuthorized(denial = null)
             is Authorization.Denied -> return SubmitResult.NotAuthorized(approval.reason)
         }

@@ -1,5 +1,6 @@
 package tj.payment.wallet.data
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import tj.payment.core.ApiOutcome
@@ -15,14 +16,32 @@ import tj.payment.core.TokenResponse
 class AuthRepository(
     private val api: ApiClient,
     private val session: SecureSession,
+    /** Runs after a successful password sign-in, with the password (device registration). */
+    private val afterSignIn: suspend (password: String) -> Unit = {},
 ) {
     fun hasPersistedSession(): Boolean = session.hasPersistedSession()
 
     suspend fun login(phone: String, password: String): ApiOutcome<Unit> =
-        adopt(api.login(phone, password), phone)
+        adopt(api.login(phone, password), phone).also { if (it is ApiOutcome.Ok) bindDevice(password) }
 
     suspend fun register(phone: String, password: String): ApiOutcome<Unit> =
-        adopt(api.register(phone, password), phone)
+        adopt(api.register(phone, password), phone).also { if (it is ApiOutcome.Ok) bindDevice(password) }
+
+    /**
+     * The password was just proven: register this phone's payment-signing key
+     * now (idempotent server-side), so money moves need no extra step. Best
+     * effort — it never fails the sign-in; the first payment asks for the
+     * password again if it did not happen.
+     */
+    private suspend fun bindDevice(password: String) {
+        try {
+            afterSignIn(password)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // See above: retried from the payment flow.
+        }
+    }
 
     /**
      * Re-establish a session at launch in ONE request: `POST /v1/auth/refresh`

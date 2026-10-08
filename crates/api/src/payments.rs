@@ -12,6 +12,7 @@ use storage::{HookError, IdempotencyRecord, PostHook, PostOptions, StorageError}
 use uuid::Uuid;
 
 use crate::common::{default_currency, idempotency_key};
+use crate::devices::{self, DeviceKey, DeviceProof, MoneyMove, PaymentAuth};
 use crate::session::AuthUser;
 use crate::{ApiError, ApiResult, AppState, Limits};
 
@@ -96,6 +97,7 @@ pub(crate) struct MoneyContext {
     pub(crate) pair_rate: Option<(i64, i64)>,
     pub(crate) tjs_rate: Option<(i64, i64)>,
     pub(crate) key: KeyState,
+    pub(crate) device: Option<DeviceKey>,
 }
 
 // What the database already knows about an Idempotency-Key: the stored response of a post
@@ -194,12 +196,14 @@ fn account_row(row: &sqlx::postgres::PgRow, prefix: &str) -> ApiResult<Option<Ac
     }))
 }
 
+// One round trip for everything a money move decides on, including the caller's device the
+// request names (`device`, None when no signature is presented or binding is off).
 pub(crate) async fn money_context(
     conn: &mut PgConnection,
     user_id: Uuid,
-    from: Uuid,
-    to: Uuid,
+    (from, to): (Uuid, Uuid),
     key: Uuid,
+    device: Option<Uuid>,
 ) -> ApiResult<MoneyContext> {
     let row = sqlx::query(&format!(
         "SELECT u.kyc_level, u.status,
@@ -211,7 +215,7 @@ pub(crate) async fn money_context(
                 (bt.user_id IS NOT NULL) AS recipient_blocked, tu.status AS recipient_status,
                 rp.rate_num AS pair_num, rp.rate_den AS pair_den,
                 rt.rate_num AS tjs_num, rt.rate_den AS tjs_den,
-                {KEY_STATE_COLUMNS}
+                {KEY_STATE_COLUMNS}, {device_columns}
          FROM users u
          LEFT JOIN blocked_users bu ON bu.user_id = u.id
          LEFT JOIN accounts f ON f.id = $2
@@ -224,12 +228,15 @@ pub(crate) async fn money_context(
          LEFT JOIN fx_rates rt ON rt.base_currency = f.currency AND rt.quote_currency = 'TJS'
          LEFT JOIN idempotency_keys ik ON ik.key = $4
          LEFT JOIN voided_transactions vt ON vt.id = $4
-         WHERE u.id = $1"
+         LEFT JOIN devices dv ON dv.id = $5 AND dv.user_id = u.id AND dv.revoked_at IS NULL
+         WHERE u.id = $1",
+        device_columns = devices::device_columns()
     ))
     .bind(user_id)
     .bind(from)
     .bind(to)
     .bind(key)
+    .bind(device)
     .fetch_optional(&mut *conn)
     .await
     .map_err(StorageError::from)?
@@ -256,6 +263,7 @@ pub(crate) async fn money_context(
         pair_rate: get_rate("pair_num", "pair_den")?,
         tjs_rate: get_rate("tjs_num", "tjs_den")?,
         key: KeyState::from_row(&row)?,
+        device: DeviceKey::from_row(&row)?,
     })
 }
 
@@ -563,6 +571,7 @@ pub async fn create_transfer(
         ));
     }
     let key = idempotency_key(&headers)?;
+    let proof = DeviceProof::from_headers(&headers);
     let fingerprint = format!(
         "transfer:{user_id}:{}:{}:{}:{}",
         req.from_account, req.to_account, req.amount_minor, req.currency
@@ -574,12 +583,36 @@ pub async fn create_transfer(
         .acquire()
         .await
         .map_err(StorageError::from)?;
-    let ctx = money_context(&mut conn, user_id, req.from_account, req.to_account, key).await?;
+    let ctx = money_context(
+        &mut conn,
+        user_id,
+        (req.from_account, req.to_account),
+        key,
+        proof.lookup(state.devices.binding),
+    )
+    .await?;
 
     let from = owned(&ctx.from, user_id)?;
     if let Some(found) = ctx.replay::<PostResponse>(&fingerprint)? {
         return Ok(found);
     }
+    devices::verify(
+        &mut conn,
+        state.devices.binding,
+        &proof,
+        ctx.device.as_ref(),
+        &PaymentAuth {
+            kind: MoneyMove::Transfer,
+            user_id,
+            idempotency_key: key,
+            from_account: Some(req.from_account),
+            to_account: req.to_account,
+            amount_minor: req.amount_minor,
+            currency: &req.currency,
+            check_id: None,
+        },
+    )
+    .await?;
     ctx.require_active()?;
     ctx.require_kyc(KYC_LEVEL_FOR_TRANSFER)?;
 
@@ -683,6 +716,7 @@ pub async fn create_fx(
     Json(req): Json<FxRequest>,
 ) -> ApiResult<(StatusCode, Json<FxResponse>)> {
     let key = idempotency_key(&headers)?;
+    let proof = DeviceProof::from_headers(&headers);
     if req.amount_minor <= 0 {
         return Err(ApiError::BadRequest(
             "amount_minor must be positive".to_string(),
@@ -695,7 +729,14 @@ pub async fn create_fx(
         .acquire()
         .await
         .map_err(StorageError::from)?;
-    let ctx = money_context(&mut conn, user_id, req.from_account, req.to_account, key).await?;
+    let ctx = money_context(
+        &mut conn,
+        user_id,
+        (req.from_account, req.to_account),
+        key,
+        proof.lookup(state.devices.binding),
+    )
+    .await?;
 
     let from = owned(&ctx.from, user_id)?;
     let to = owned(&ctx.to, user_id)?;
@@ -712,6 +753,23 @@ pub async fn create_fx(
     if let Some(found) = ctx.replay::<FxResponse>(&fingerprint)? {
         return Ok(found);
     }
+    devices::verify(
+        &mut conn,
+        state.devices.binding,
+        &proof,
+        ctx.device.as_ref(),
+        &PaymentAuth {
+            kind: MoneyMove::Fx,
+            user_id,
+            idempotency_key: key,
+            from_account: Some(req.from_account),
+            to_account: req.to_account,
+            amount_minor: req.amount_minor,
+            currency: from_cur.code(),
+            check_id: None,
+        },
+    )
+    .await?;
     ctx.require_active()?;
     ctx.require_kyc(KYC_LEVEL_FOR_TRANSFER)?;
 

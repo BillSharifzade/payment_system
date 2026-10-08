@@ -50,3 +50,5 @@ biometric = { path = "crates/biometric" }
 aes-gcm = "0.10"
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Device binding: verifies the app's Android Keystore ECDSA P-256 signatures (SPKI DER keys).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }

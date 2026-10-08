@@ -21,6 +21,7 @@ storage = { workspace = true }
 auth = { workspace = true }
 biometric = { workspace = true }
 base64 = { workspace = true }
+p256 = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true }
@@ -36,5 +37,6 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 
 [dev-dependencies]
+rand_core = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

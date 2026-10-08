@@ -52,3 +52,84 @@ pub fn env_flag(key: &str) -> bool {
         })
         .unwrap_or(false)
 }
+
+/// How money-moving requests are bound to a registered device (`DEVICE_BINDING`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceBinding {
+    /// Every transfer, FX and app check payment must carry a valid device signature.
+    Required,
+    /// Signatures are verified when present (a bad one is refused); unsigned requests pass.
+    Optional,
+    /// Device headers are ignored.
+    Off,
+}
+
+impl DeviceBinding {
+    pub fn name(&self) -> &'static str {
+        match self {
+            DeviceBinding::Required => "required",
+            DeviceBinding::Optional => "optional",
+            DeviceBinding::Off => "off",
+        }
+    }
+}
+
+impl FromStr for DeviceBinding {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "required" => Ok(DeviceBinding::Required),
+            "optional" => Ok(DeviceBinding::Optional),
+            "off" => Ok(DeviceBinding::Off),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceConfig {
+    pub binding: DeviceBinding,
+    /// Active (non-revoked) devices one user may have at once (`DEVICE_MAX_ACTIVE`).
+    pub max_active: i64,
+}
+
+impl DeviceConfig {
+    pub const DEFAULT_MAX_ACTIVE: i64 = 3;
+
+    /// Dev defaults: signatures are verified when sent, not demanded.
+    pub fn dev() -> Self {
+        Self {
+            binding: DeviceBinding::Optional,
+            max_active: Self::DEFAULT_MAX_ACTIVE,
+        }
+    }
+
+    // `required` unless APP_ENV=dev; anything weaker is refused outside dev, and an
+    // unrecognised value never falls back to a default.
+    pub fn from_env(is_prod: bool) -> Result<Self, String> {
+        let binding = match std::env::var("DEVICE_BINDING") {
+            Err(std::env::VarError::NotPresent) if is_prod => DeviceBinding::Required,
+            Err(std::env::VarError::NotPresent) => DeviceBinding::Optional,
+            Err(e) => return Err(format!("DEVICE_BINDING: {e}")),
+            Ok(raw) => raw
+                .trim()
+                .parse()
+                .map_err(|_| format!("DEVICE_BINDING={raw:?} must be required, optional or off"))?,
+        };
+        if is_prod && binding != DeviceBinding::Required {
+            return Err(format!(
+                "DEVICE_BINDING={} is only allowed when APP_ENV=dev",
+                binding.name()
+            ));
+        }
+        let max_active: i64 = env_or("DEVICE_MAX_ACTIVE", Self::DEFAULT_MAX_ACTIVE)?;
+        if !(1..=100).contains(&max_active) {
+            return Err("DEVICE_MAX_ACTIVE must be between 1 and 100".to_string());
+        }
+        Ok(Self {
+            binding,
+            max_active,
+        })
+    }
+}

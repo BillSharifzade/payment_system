@@ -1,6 +1,7 @@
 package tj.payment.wallet
 
 import android.content.Context
+import android.os.Build
 import android.os.SystemClock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -11,6 +12,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import tj.payment.core.AppLockPolicy
 import tj.payment.core.Currency
+import tj.payment.core.DeviceEnrollment
 import tj.payment.core.Money
 import tj.payment.core.PaymentKind
 import tj.payment.wallet.data.ApiClient
@@ -55,7 +57,11 @@ class AppContainer(context: Context) {
 
     /** Strong device authentication for every money move; MainActivity is its prompt host. */
     val authorizer: DeviceAuthorizer by lazy {
-        DeviceAuthorizer(appContext) { payment ->
+        DeviceAuthorizer(
+            appContext,
+            deviceIdFor = { user, publicKey -> deviceEnrollment.deviceIdFor(user, publicKey) },
+            onUnregistered = { deviceEnrollment.requestRegistration() },
+        ) { payment ->
             val amount = Money.ofMinor(payment.amountMinor, Currency.of(payment.currency)).format()
             val res = appContext.resources
             DeviceAuthorizer.PromptText(
@@ -85,15 +91,43 @@ class AppContainer(context: Context) {
         )
     }
 
-    val authRepository: AuthRepository by lazy { AuthRepository(api, session) }
+    /**
+     * Device binding: this phone's payment-signing key, registered to the
+     * account with the password (at sign-in, or from the app-wide prompt).
+     */
+    val deviceEnrollment: DeviceEnrollment by lazy {
+        DeviceEnrollment(
+            store = session,
+            currentUser = { session.userId() },
+            publicKey = { authorizer.currentPublicKey() },
+            label = ::deviceLabel,
+            registerKey = { api.registerDevice(it) },
+            listDevices = { api.devices() },
+            revokeDevice = { api.revokeDevice(it) },
+        )
+    }
+
+    val authRepository: AuthRepository by lazy {
+        AuthRepository(api, session, afterSignIn = { password -> deviceEnrollment.register(password) })
+    }
     val walletRepository: WalletRepository by lazy {
         WalletRepository(
             api = api,
             pendingStore = pendingStore,
             currentUser = { session.userId() },
             authorizer = authorizer,
+            onDeviceRejected = { userId -> deviceEnrollment.onDeviceRejected(userId) },
         )
     }
+
+    /** What the user sees in their device list ("Google Pixel 8"). */
+    private fun deviceLabel(): String =
+        listOf(Build.MANUFACTURER, Build.MODEL)
+            .filter { !it.isNullOrBlank() }
+            .joinToString(" ")
+            .trim()
+            .take(64)
+            .ifBlank { "Android" }
 
     /**
      * Open both Keystore-backed stores off the main thread. First touch costs a

@@ -3,6 +3,7 @@ pub mod biometric;
 mod common;
 pub mod config;
 mod deposits;
+pub mod devices;
 mod error;
 mod kyc;
 pub mod middleware;
@@ -14,6 +15,7 @@ mod terminals;
 mod transactions;
 
 pub use biometric::{BiometricConfig, MatcherBackend};
+pub use config::{DeviceBinding, DeviceConfig};
 pub use error::{ApiError, ApiResult};
 pub use ratelimit::RateLimitState;
 pub use session::{warm_password_hasher, AdminUser, AuthUser};
@@ -193,6 +195,7 @@ pub struct AppState {
     pub fees: FeeConfig,
     pub deposits: DepositConfig,
     pub biometric: BiometricConfig,
+    pub devices: DeviceConfig,
     pub trust_proxy: bool,
     pub document_dir: std::path::PathBuf,
     pub kyc_upload_daily_max: i64,
@@ -290,6 +293,11 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/admin/terminals/{id}/revoke",
             post(terminals::revoke_terminal),
         )
+        .route(
+            "/v1/devices",
+            post(devices::register_device).get(devices::list_devices),
+        )
+        .route("/v1/devices/{id}/revoke", post(devices::revoke_device))
         .route("/v1/transfers", post(payments::create_transfer))
         .route("/v1/fx", post(payments::create_fx))
         .route("/v1/transactions/{id}", get(transactions::get_transaction))

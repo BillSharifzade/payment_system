@@ -4,6 +4,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import android.content.Context
+import kotlinx.serialization.SerializationException
+import kotlinx.serialization.json.Json
+import tj.payment.core.DeviceRegistration
+import tj.payment.core.DeviceRegistrationStore
 import tj.payment.core.LocalStorageException
 
 /**
@@ -21,8 +25,13 @@ import tj.payment.core.LocalStorageException
  *
  * Reads that hit a Keystore/crypto fault throw [LocalStorageException], which
  * ApiClient maps to a typed outcome — never mistaken for "no session".
+ *
+ * It also holds the signed-in user's device registration (the server id of
+ * this phone's payment-signing key). [clear] drops it with the session; the
+ * next password sign-in registers the same key again (the server answers with
+ * the same device id while it is active).
  */
-class SecureSession(context: Context) : SessionStore {
+class SecureSession(context: Context) : SessionStore, DeviceRegistrationStore {
 
     private val store = SecureStore(
         context,
@@ -103,6 +112,31 @@ class SecureSession(context: Context) : SessionStore {
         secureIo { prefs.edit().putString(KEY_PHONE, phone).commit() }
     }
 
+    /** This user's device registration, if this phone holds one. @throws LocalStorageException on a fault. */
+    override fun registration(userId: String): DeviceRegistration? {
+        val raw = secureIo { prefs.getString(KEY_DEVICE, null) } ?: return null
+        val stored = try {
+            registrationJson.decodeFromString(DeviceRegistration.serializer(), raw)
+        } catch (_: SerializationException) {
+            null
+        } catch (_: IllegalArgumentException) {
+            null
+        }
+        return stored?.takeIf { it.userId == userId }
+    }
+
+    /** Synchronous; blocking — off the main thread. @throws LocalStorageException on a fault. */
+    override fun saveRegistration(registration: DeviceRegistration) {
+        val raw = registrationJson.encodeToString(DeviceRegistration.serializer(), registration)
+        val written = secureIo { prefs.edit().putString(KEY_DEVICE, raw).commit() }
+        if (!written) throw LocalStorageException("device registration not persisted")
+    }
+
+    /** @throws LocalStorageException on a fault. */
+    override fun clearRegistration(userId: String) {
+        if (registration(userId) != null) secureIo { prefs.edit().remove(KEY_DEVICE).commit() }
+    }
+
     /**
      * Wipe the session. The in-memory token and the signed-out signal never
      * depend on the disk write: even if the Keystore faults here, this process
@@ -123,6 +157,9 @@ class SecureSession(context: Context) : SessionStore {
         const val KEY_REFRESH = "refresh_token"
         const val KEY_USER = "user_id"
         const val KEY_PHONE = "phone"
+        const val KEY_DEVICE = "device_registration"
+
+        val registrationJson = Json { ignoreUnknownKeys = true }
 
         /** Rotate at 80% of the lifetime — well clear of clock skew and a slow request. */
         const val STALE_AT_PERCENT = 80

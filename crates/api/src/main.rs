@@ -4,7 +4,7 @@ use std::time::Duration;
 use api::config::{env_flag, env_or, env_or_file};
 use api::{
     build_router, run_migrations, warm_password_hasher, AmlConfig, AppState, AuthConfig,
-    BiometricConfig, DepositConfig, FeeConfig, RateLimitState,
+    BiometricConfig, DepositConfig, DeviceConfig, FeeConfig, RateLimitState,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use storage::PostgresLedger;
@@ -78,6 +78,18 @@ async fn main() -> Result<(), BoxError> {
         dual_control = deposits.dual_control,
         max_minor = deposits.max_minor,
         "deposits configured"
+    );
+    let devices = DeviceConfig::from_env(is_prod)?;
+    if devices.binding != api::DeviceBinding::Required {
+        tracing::warn!(
+            binding = devices.binding.name(),
+            "DEVICE_BINDING is not required — a bearer token alone can move money (dev only)"
+        );
+    }
+    tracing::info!(
+        binding = devices.binding.name(),
+        max_active = devices.max_active,
+        "device binding configured"
     );
     let request_timeout = Duration::from_secs(env_or("REQUEST_TIMEOUT_SECS", 10u64)?);
     api::middleware::configure_request_timeout(request_timeout);
@@ -192,6 +204,7 @@ async fn main() -> Result<(), BoxError> {
         fees,
         deposits,
         biometric,
+        devices,
         trust_proxy,
     });
 

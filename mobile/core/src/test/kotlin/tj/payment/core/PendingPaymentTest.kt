@@ -48,7 +48,7 @@ class PendingPaymentTest {
     fun `check id, owner, kind and approval round-trip through JSON`() {
         val p = PendingPayment(
             "k1", "from", "to", 200, "TJS", "Nan Bakery", checkId = "c1",
-            userId = "u1", authorization = "c2ln", createdAtMs = 5,
+            userId = "u1", authorization = "c2ln", deviceId = "d1", createdAtMs = 5,
         )
         assertEquals(PaymentKind.CHECK, p.kind)
         val encoded = json.encodeToString(PendingPayment.serializer(), p)
@@ -64,6 +64,7 @@ class PendingPaymentTest {
         assertEquals("", decoded.userId)
         assertEquals(PaymentKind.TRANSFER, decoded.kind)
         assertNull(decoded.authorization)
+        assertNull(decoded.deviceId)
 
         val legacyCheck = legacy.dropLast(1) + ""","check_id":"c9"}"""
         assertEquals(PaymentKind.CHECK, json.decodeFromString(PendingPayment.serializer(), legacyCheck).kind)
@@ -85,8 +86,12 @@ class PendingPaymentTest {
         )) {
             assertFalse("payload must change for $changed", payload.contentEquals(changed.authorizationPayload()))
         }
-        // Display-only fields and the signature itself are not part of what is signed.
-        assertTrue(payload.contentEquals(base.copy(recipientLabel = "renamed", authorization = null, createdAtMs = 9).authorizationPayload()))
+        // Display-only fields, the signature and the device id are not part of what is signed.
+        assertTrue(
+            payload.contentEquals(
+                base.copy(recipientLabel = "renamed", authorization = null, deviceId = "d9", createdAtMs = 9).authorizationPayload(),
+            ),
+        )
         // Length-prefixed: shifting characters between fields cannot collide.
         assertFalse(
             base.copy(fromAccount = "ab", toAccount = "c").authorizationPayload()

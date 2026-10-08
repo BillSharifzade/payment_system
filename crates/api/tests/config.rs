@@ -2,7 +2,7 @@
 // test binary and serialise on a lock.
 
 use api::config::env_bool;
-use api::{BiometricConfig, DepositConfig, MatcherBackend};
+use api::{BiometricConfig, DepositConfig, DeviceBinding, DeviceConfig, MatcherBackend};
 
 static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -144,4 +144,55 @@ fn env_bool_accepts_only_unambiguous_values() {
         env_bool("API_TEST_FLAG", false)
     });
     assert!(bad.is_err());
+}
+
+#[test]
+fn device_binding_is_required_outside_dev_and_parses_strictly() {
+    let prod = with_env(
+        &[("DEVICE_BINDING", None), ("DEVICE_MAX_ACTIVE", None)],
+        || DeviceConfig::from_env(true),
+    )
+    .unwrap();
+    assert_eq!(prod.binding, DeviceBinding::Required);
+    assert_eq!(prod.max_active, 3);
+    let dev = with_env(&[("DEVICE_BINDING", None)], || {
+        DeviceConfig::from_env(false)
+    })
+    .unwrap();
+    assert_eq!(dev.binding, DeviceBinding::Optional);
+    for weak in ["optional", "off"] {
+        let err = with_env(&[("DEVICE_BINDING", Some(weak))], || {
+            DeviceConfig::from_env(true).err()
+        });
+        assert!(
+            err.is_some(),
+            "DEVICE_BINDING={weak} must be refused in prod"
+        );
+    }
+    let off = with_env(&[("DEVICE_BINDING", Some(" off "))], || {
+        DeviceConfig::from_env(false)
+    })
+    .unwrap();
+    assert_eq!(off.binding, DeviceBinding::Off);
+    let required = with_env(&[("DEVICE_BINDING", Some("required"))], || {
+        DeviceConfig::from_env(false)
+    })
+    .unwrap();
+    assert_eq!(required.binding, DeviceBinding::Required);
+    for (k, v) in [
+        ("DEVICE_BINDING", "requried"),
+        ("DEVICE_BINDING", ""),
+        ("DEVICE_BINDING", "true"),
+        ("DEVICE_MAX_ACTIVE", "0"),
+        ("DEVICE_MAX_ACTIVE", "three"),
+        ("DEVICE_MAX_ACTIVE", "1000"),
+    ] {
+        let res = with_env(&[(k, Some(v))], || DeviceConfig::from_env(false));
+        assert!(res.is_err(), "{k}={v} must refuse to boot");
+    }
+    let five = with_env(&[("DEVICE_MAX_ACTIVE", Some("5"))], || {
+        DeviceConfig::from_env(true)
+    })
+    .unwrap();
+    assert_eq!(five.max_active, 5);
 }

@@ -29,6 +29,8 @@
     <string name="error_probe_replayed">Этот скан отпечатка уже использован. Отсканируйте снова.</string>
     <string name="error_check_locked">Слишком много неудачных попыток. Запрос на оплату отменён.</string>
     <string name="error_terminal_unauthorized">Этот платёжный терминал не авторизован.</string>
+    <string name="error_device_signature_required">Этот телефон ещё не настроен для платежей, поэтому ничего не отправлено. Подтвердите пароль, чтобы настроить его.</string>
+    <string name="error_device_signature_invalid">Этот телефон больше не привязан к вашему счёту для платежей, поэтому ничего не отправлено. Подтвердите пароль, чтобы привязать его снова.</string>
     <string name="error_internal">Что-то пошло не так на нашей стороне. Попробуйте ещё раз.</string>
     <string name="error_unknown">Что-то пошло не так. Попробуйте ещё раз.</string>
     <string name="error_with_ref">%1$s Код обращения: %2$s</string>
@@ -41,6 +43,7 @@
     <string name="auth_denied_locked_out">Слишком много попыток. Разблокируйте телефон PIN-кодом, графическим ключом или паролем и попробуйте снова.</string>
     <string name="auth_denied_no_screen">Не удалось показать подтверждение. Откройте приложение и попробуйте снова.</string>
     <string name="auth_denied_failed">Не удалось подтвердить, что это вы, поэтому платёж не отправлен. Попробуйте ещё раз.</string>
+    <string name="auth_denied_device_not_registered">Подтвердите пароль, чтобы настроить платежи на этом телефоне, и попробуйте снова. Ничего не отправлено.</string>
     <string name="auth_prompt_title">Подтвердите платёж</string>
     <string name="auth_prompt_pay">%1$s, получатель: %2$s</string>
     <string name="auth_prompt_fx">Обмен %1$s на %2$s</string>
@@ -233,4 +236,11 @@
     <string name="pay_error_wrong_wallet">Этот счёт нельзя оплатить с этого кошелька.</string>
     <string name="request_error_kyc">Подтвердите личность, прежде чем запрашивать платежи.</string>
     <string name="send_error_no_wallet">Кошелька с таким номером нет.</string>
+    <string name="device_register_title">Настройка платежей на этом телефоне</string>
+    <string name="device_register_body">Введите пароль, чтобы привязать этот телефон к вашему счёту. Затем платежи подтверждаются отпечатком пальца или блокировкой экрана этого телефона.</string>
+    <string name="device_register_confirm">Привязать телефон</string>
+    <string name="device_register_replace">Заменить самый старый телефон</string>
+    <string name="device_register_later">Не сейчас</string>
+    <string name="device_wrong_password">Неверный пароль.</string>
+    <string name="device_limit_reached">К вашему счёту уже привязано максимальное число телефонов. Заменить этим телефоном тот, что использовался давнее всего?</string>
 </resources>

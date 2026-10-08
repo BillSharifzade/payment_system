@@ -17,6 +17,16 @@ enum class ErrorCode(val wire: String) {
     CHECK_LOCKED("check_locked"),
     CONFLICT("conflict"),
     CURRENCY_MISMATCH("currency_mismatch"),
+    /**
+     * 403: device binding is required and the money move carried no device
+     * signature (X-Device-Id / X-Device-Signature). Nothing moved.
+     */
+    DEVICE_SIGNATURE_REQUIRED("device_signature_required"),
+    /**
+     * 403: the device signature does not match the request, or the device is
+     * unknown/revoked — re-register this phone (password). Nothing moved.
+     */
+    DEVICE_SIGNATURE_INVALID("device_signature_invalid"),
     /** Admin: a second person must approve (403). */
     DUAL_CONTROL_REQUIRED("dual_control_required"),
     DUPLICATE_TRANSACTION("duplicate_transaction"),

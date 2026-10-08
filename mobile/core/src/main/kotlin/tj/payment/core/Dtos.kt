@@ -280,3 +280,38 @@ data class TransactionStatusDto(
         const val STATUS_VOIDED = "voided"
     }
 }
+
+/**
+ * POST /v1/devices: bind this phone's signing key to the account. The password
+ * is re-checked (a bearer token alone cannot add a device). 201 = registered,
+ * 200 = this key was already an active device of the user (same id).
+ * 403 `forbidden` = wrong password (or the account is not active),
+ * 403 `account_blocked`, 409 `conflict` = the account has the maximum number
+ * of active devices, 429 = too many password attempts.
+ */
+@Serializable
+data class RegisterDeviceRequest(
+    /** Base64 SubjectPublicKeyInfo DER of the P-256 key. */
+    @SerialName("public_key") val publicKey: String,
+    val label: String,
+    val password: String,
+)
+
+/** A registered device (POST /v1/devices, GET /v1/devices, POST /v1/devices/{id}/revoke). */
+@Serializable
+data class DeviceDto(
+    val id: String,
+    val label: String,
+    /** Base64 SPKI DER, as the server stored it (canonical encoding). */
+    @SerialName("public_key") val publicKey: String,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("last_used_at") val lastUsedAt: String? = null,
+    @SerialName("revoked_at") val revokedAt: String? = null,
+) {
+    val isActive: Boolean get() = revokedAt == null
+}
+
+@Serializable
+data class DeviceListResponse(
+    val items: List<DeviceDto> = emptyList(),
+)

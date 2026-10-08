@@ -36,6 +36,8 @@
     <string name="error_probe_replayed">That fingerprint scan was already used. Scan again.</string>
     <string name="error_check_locked">Too many failed attempts. This payment request was cancelled.</string>
     <string name="error_terminal_unauthorized">This payment terminal isn\'t authorised.</string>
+    <string name="error_device_signature_required">This phone isn\'t set up for payments yet, so nothing was sent. Confirm your password to set it up.</string>
+    <string name="error_device_signature_invalid">This phone is no longer linked to your account for payments, so nothing was sent. Confirm your password to link it again.</string>
     <string name="error_internal">Something went wrong on our side. Please try again.</string>
     <string name="error_unknown">Something went wrong. Please try again.</string>
     <string name="error_with_ref">%1$s Ref: %2$s</string>
@@ -48,6 +50,7 @@
     <string name="auth_denied_locked_out">Too many attempts. Unlock your phone with its PIN, pattern or password, then try again.</string>
     <string name="auth_denied_no_screen">Couldn\'t show the confirmation. Open the app and try again.</string>
     <string name="auth_denied_failed">Couldn\'t confirm it\'s you, so the payment wasn\'t sent. Try again.</string>
+    <string name="auth_denied_device_not_registered">Confirm your password to set up payments on this phone, then try again. Nothing was sent.</string>
     <string name="auth_prompt_title">Confirm payment</string>
     <string name="auth_prompt_pay">%1$s to %2$s</string>
     <string name="auth_prompt_fx">Exchange %1$s to %2$s</string>
@@ -240,4 +243,11 @@
     <string name="pay_error_wrong_wallet">This check can\'t be paid from this wallet.</string>
     <string name="request_error_kyc">Verify your identity before requesting payments.</string>
     <string name="send_error_no_wallet">No wallet with that number.</string>
+    <string name="device_register_title">Set up payments on this phone</string>
+    <string name="device_register_body">Enter your password to link this phone to your account. Payments are then approved with this phone\'s fingerprint or screen lock.</string>
+    <string name="device_register_confirm">Link this phone</string>
+    <string name="device_register_replace">Replace the oldest phone</string>
+    <string name="device_register_later">Not now</string>
+    <string name="device_wrong_password">The password is incorrect.</string>
+    <string name="device_limit_reached">Your account already has the most phones it can link. Replace the one used least recently with this phone?</string>
 </resources>

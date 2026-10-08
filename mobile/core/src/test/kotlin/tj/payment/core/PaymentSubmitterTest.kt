@@ -167,6 +167,41 @@ class PaymentSubmitterTest {
     }
 
     @Test
+    fun `the device that signed is stored with the signature and resent on every attempt`() = runBlocking {
+        val store = FakeStore()
+        val net = Net().apply { execute = { ApiOutcome.Offline(RuntimeException("down")) } }
+        val auth = Auth().apply { answer = { p -> Authorization.Granted("sig:" + p.idempotencyKey, deviceId = "dev-1") } }
+        val s = submitter(store, net, auth)
+        s.send()
+        assertEquals("dev-1", store.of()?.deviceId)
+        net.execute = { posted() }
+        assertTrue(s.retryPending() is SubmitResult.Posted)
+        val expected = mapOf("X-Device-Id" to "dev-1", "X-Device-Signature" to "sig:key-1")
+        assertEquals(listOf(expected, expected), net.executed.map { it.deviceHeaders() })
+    }
+
+    @Test
+    fun `an unregistered device is a refusal before anything is stored or sent`() = runBlocking {
+        val store = FakeStore()
+        val net = Net()
+        val auth = Auth().apply { answer = { Authorization.Denied(AuthDenial.DEVICE_NOT_REGISTERED) } }
+        assertEquals(SubmitResult.NotAuthorized(AuthDenial.DEVICE_NOT_REGISTERED), submitter(store, net, auth).send())
+        assertNull(store.of())
+        assertEquals(0, net.executed.size)
+    }
+
+    @Test
+    fun `a device-signature refusal of a first attempt is definitive`() = runBlocking {
+        for (code in listOf(ErrorCode.DEVICE_SIGNATURE_INVALID, ErrorCode.DEVICE_SIGNATURE_REQUIRED)) {
+            val store = FakeStore()
+            val net = Net().apply { execute = { ApiOutcome.Failed(code, 403, "device", coded = true) } }
+            assertEquals(SubmitResult.Rejected(code, "device"), submitter(store, net).send())
+            assertNull("the server ruled before posting; nothing to keep", store.of())
+            assertEquals(0, net.voids.size)
+        }
+    }
+
+    @Test
     fun `signed out, nothing starts and nobody is prompted`() = runBlocking {
         user = null
         val store = FakeStore()

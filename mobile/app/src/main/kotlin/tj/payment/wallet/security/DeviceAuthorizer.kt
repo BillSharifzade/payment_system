@@ -48,9 +48,15 @@ import tj.payment.core.authorizationPayload
  * spoofing or hooking the prompt UI yields no signature — the Keystore only
  * signs after a real authentication — and the submitter never sends without one.
  *
- * Remaining step (server side, not in this app yet): register the public key
- * per device at enrolment and verify the signature on money-moving requests;
- * until then the binding is enforced on the device only.
+ * The server verifies it (device binding): the key's public half is registered
+ * with the account password ([currentPublicKey] → POST /v1/devices, see
+ * DeviceEnrollment) and every money move carries the registered device id
+ * with the signature. Before prompting, and again after signing, the key of
+ * the mode in use must be the user's registered device ([deviceIdFor]) — the
+ * modes below use different keys, and a key can be replaced (invalidated by a
+ * biometric change) — otherwise nothing is signed or sent:
+ * [AuthDenial.DEVICE_NOT_REGISTERED], and [onUnregistered] asks for the
+ * password to register the current key.
  *
  * Modes, by what the platform supports:
  *  - API 30+: one per-use key, unlockable by BIOMETRIC_STRONG **or**
@@ -67,6 +73,10 @@ import tj.payment.core.authorizationPayload
  */
 class DeviceAuthorizer(
     context: Context,
+    /** The registered device id of (user, base64 SPKI DER public key), or null. */
+    private val deviceIdFor: (userId: String, publicKey: String) -> String?,
+    /** No registered key for this payment: ask for the password (app-wide prompt). */
+    private val onUnregistered: () -> Unit,
     private val paymentPrompt: (PendingPayment) -> PromptText,
 ) : PaymentAuthorizer {
 
@@ -94,9 +104,38 @@ class DeviceAuthorizer(
             is Choice.Use -> chosen.mode
             is Choice.Refuse -> return@withContext Authorization.Denied(chosen.reason)
         }
-        withTimeoutOrNull(PROMPT_TIMEOUT_MS) {
+        // Fail fast, before any prompt, when this mode's key is not the user's device.
+        registeredDevice(payment.userId, mode) ?: return@withContext unregistered()
+        val result = withTimeoutOrNull(PROMPT_TIMEOUT_MS) {
             sign(activity, mode, payment.authorizationPayload(), paymentPrompt(payment))
         } ?: Authorization.Cancelled
+        if (result !is Authorization.Granted) return@withContext result
+        // Authoritative: the key that actually signed (signing may have replaced
+        // an invalidated key) must be the registered one, or the server refuses.
+        val deviceId = registeredDevice(payment.userId, mode) ?: return@withContext unregistered()
+        Authorization.Granted(result.signature, deviceId)
+    }
+
+    /**
+     * This phone's current payment-signing key as base64 SPKI DER (created on
+     * first use), for registration (POST /v1/devices). Null when the phone has
+     * no usable screen lock / strong biometric, so no such key can exist.
+     */
+    suspend fun currentPublicKey(): String? = withContext(Dispatchers.IO) {
+        when (val chosen = chooseMode(appContext)) {
+            is Choice.Use -> publicKeyOf(chosen.mode)
+            is Choice.Refuse -> null
+        }
+    }
+
+    /** Keystore and the encrypted session store: off the main thread. */
+    private suspend fun registeredDevice(userId: String, mode: Mode): String? = withContext(Dispatchers.IO) {
+        publicKeyOf(mode)?.let { deviceIdFor(userId, it) }
+    }
+
+    private fun unregistered(): Authorization {
+        onUnregistered()
+        return Authorization.Denied(AuthDenial.DEVICE_NOT_REGISTERED)
     }
 
     /**
@@ -207,8 +246,8 @@ class DeviceAuthorizer(
     /**
      * A Signature initialized with the mode's key, creating it on first use.
      * A key invalidated by a new biometric enrolment or a removed screen lock
-     * is replaced (no server binding exists yet; once it does, a replaced key
-     * must be re-registered after a password sign-in).
+     * is replaced; the replacement is not registered, which [authorize] notices
+     * after signing (the password prompt then registers it).
      */
     private fun initSignature(mode: Mode): Signature {
         val alias = aliasFor(mode)
@@ -221,6 +260,21 @@ class DeviceAuthorizer(
     }
 
     private fun keyStore(): KeyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+
+    /**
+     * The X.509 SubjectPublicKeyInfo DER (base64) of the mode's key, generating
+     * the key if it does not exist yet. Reading the public half needs no user
+     * authentication. Null when the Keystore refuses (e.g. no secure lock screen).
+     */
+    private fun publicKeyOf(mode: Mode): String? = try {
+        val alias = aliasFor(mode)
+        if (privateKey(alias) == null) generate(alias, mode)
+        keyStore().getCertificate(alias)?.publicKey?.encoded?.let { Base64.encodeToString(it, Base64.NO_WRAP) }
+    } catch (e: GeneralSecurityException) {
+        null
+    } catch (e: ProviderException) {
+        null
+    }
 
     private fun privateKey(alias: String): PrivateKey? = keyStore().getKey(alias, null) as? PrivateKey
 

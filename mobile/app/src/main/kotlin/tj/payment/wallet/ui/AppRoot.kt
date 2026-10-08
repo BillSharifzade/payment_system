@@ -63,6 +63,7 @@ fun AppRoot(container: AppContainer) {
     val nav = rememberNavController()
     val scope = rememberCoroutineScope()
     val locked by container.appLock.locked.collectAsStateWithLifecycle()
+    val deviceRegistrationNeeded by container.deviceEnrollment.registrationNeeded.collectAsStateWithLifecycle()
 
     // Every sign-out — an explicit logout, or a refresh the server refused, from
     // whichever thread noticed — routes to Login from here, once, in an effect.
@@ -73,6 +74,7 @@ fun AppRoot(container: AppContainer) {
         container.session.signedOut.collect { signedOut ->
             if (!signedOut) return@collect
             container.walletRepository.clearCache()
+            container.deviceEnrollment.forget()
             container.appLock.unlock()
             if (nav.currentBackStackEntry?.destination?.route != Routes.LOGIN) {
                 nav.navigate(Routes.LOGIN) {
@@ -86,6 +88,11 @@ fun AppRoot(container: AppContainer) {
 
     Box(Modifier.fillMaxSize()) {
         AppNavHost(container, nav)
+        // Device binding: link this phone's payment key with the password. Raised
+        // by a payment (or a server refusal) only, so only while signed in.
+        if (deviceRegistrationNeeded && !locked) {
+            DeviceRegistrationDialog(container.deviceEnrollment)
+        }
         // The app lock covers everything, balances included, until the device's
         // own authentication succeeds (at launch with a session, and after
         // AppLockPolicy.timeoutMs in the background).

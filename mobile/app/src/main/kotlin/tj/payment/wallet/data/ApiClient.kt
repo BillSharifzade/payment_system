@@ -36,6 +36,8 @@ import tj.payment.core.PayCheckRequest
 import tj.payment.core.ClientConfigResponse
 import tj.payment.core.CreateWalletRequest
 import tj.payment.core.CredentialsRequest
+import tj.payment.core.DeviceDto
+import tj.payment.core.DeviceListResponse
 import tj.payment.core.DocumentResponse
 import tj.payment.core.ErrorCode
 import tj.payment.core.ErrorEnvelope
@@ -47,6 +49,7 @@ import tj.payment.core.KycSubmissionDto
 import tj.payment.core.LocalStorageException
 import tj.payment.core.PostResponse
 import tj.payment.core.RefreshRequest
+import tj.payment.core.RegisterDeviceRequest
 import tj.payment.core.ResolveResponse
 import tj.payment.core.StatementResponse
 import tj.payment.core.SubmitKycRequest
@@ -233,9 +236,18 @@ class ApiClient(
     }
 
     /** Post a transfer. [idempotencyKey] comes from the PaymentSubmitter — the
-     * same key MUST be resent on retries so the server charges at most once. */
-    suspend fun transfer(request: TransferRequest, idempotencyKey: String): ApiOutcome<PostResponse> =
-        call(post("/v1/transfers", TransferRequest.serializer(), request, idempotencyKey = idempotencyKey), PostResponse.serializer())
+     * same key MUST be resent on retries so the server charges at most once.
+     * [deviceHeaders] = the stored `X-Device-Id` + `X-Device-Signature` pair
+     * ([tj.payment.core.deviceHeaders]), resent unchanged on retries too. */
+    suspend fun transfer(
+        request: TransferRequest,
+        idempotencyKey: String,
+        deviceHeaders: Map<String, String> = emptyMap(),
+    ): ApiOutcome<PostResponse> =
+        call(
+            post("/v1/transfers", TransferRequest.serializer(), request, idempotencyKey = idempotencyKey, headers = deviceHeaders),
+            PostResponse.serializer(),
+        )
 
     suspend fun kycStatus(): ApiOutcome<KycStatusResponse> =
         call(get("/v1/kyc"), KycStatusResponse.serializer())
@@ -256,9 +268,16 @@ class ApiClient(
     suspend fun fxRates(): ApiOutcome<List<FxRateDto>> =
         call(get("/v1/fx/rates"), ListSerializer(FxRateDto.serializer()))
 
-    /** Convert between the caller's own wallets. Same idempotency contract as [transfer]. */
-    suspend fun fx(request: FxRequest, idempotencyKey: String): ApiOutcome<FxResponse> =
-        call(post("/v1/fx", FxRequest.serializer(), request, idempotencyKey = idempotencyKey), FxResponse.serializer())
+    /** Convert between the caller's own wallets. Same idempotency and device contract as [transfer]. */
+    suspend fun fx(
+        request: FxRequest,
+        idempotencyKey: String,
+        deviceHeaders: Map<String, String> = emptyMap(),
+    ): ApiOutcome<FxResponse> =
+        call(
+            post("/v1/fx", FxRequest.serializer(), request, idempotencyKey = idempotencyKey, headers = deviceHeaders),
+            FxResponse.serializer(),
+        )
 
     // --- Checks: request money by QR, pay a scanned check ---
 
@@ -278,10 +297,46 @@ class ApiClient(
      * PaymentSubmitter, with a persisted key — same contract as [transfer]; the
      * response carries `transaction_id` + `status` like a transfer does.
      */
-    suspend fun payCheck(checkId: String, request: PayCheckRequest, idempotencyKey: String): ApiOutcome<PostResponse> =
+    suspend fun payCheck(
+        checkId: String,
+        request: PayCheckRequest,
+        idempotencyKey: String,
+        deviceHeaders: Map<String, String> = emptyMap(),
+    ): ApiOutcome<PostResponse> =
         call(
-            post("/v1/checks/${checkId.urlEncode()}/pay", PayCheckRequest.serializer(), request, idempotencyKey = idempotencyKey),
+            post(
+                "/v1/checks/${checkId.urlEncode()}/pay",
+                PayCheckRequest.serializer(),
+                request,
+                idempotencyKey = idempotencyKey,
+                headers = deviceHeaders,
+            ),
             PostResponse.serializer(),
+        )
+
+    // --- Devices: the phone's payment-signing key (device binding) ---
+
+    /**
+     * Register this phone's signing key ([RegisterDeviceRequest.publicKey],
+     * base64 SPKI DER) with the account password. 201 new / 200 already this
+     * user's active device; 403 `forbidden` = wrong password, 409 `conflict` =
+     * device limit reached. Only [tj.payment.core.DeviceEnrollment] calls this.
+     */
+    suspend fun registerDevice(request: RegisterDeviceRequest): ApiOutcome<DeviceDto> =
+        call(post("/v1/devices", RegisterDeviceRequest.serializer(), request), DeviceDto.serializer())
+
+    /** The user's devices, active first. */
+    suspend fun devices(): ApiOutcome<DeviceListResponse> =
+        call(get("/v1/devices"), DeviceListResponse.serializer())
+
+    /** Revoke one of the user's devices (idempotent). */
+    suspend fun revokeDevice(id: String): ApiOutcome<DeviceDto> =
+        call(
+            Request.Builder()
+                .url("$baseUrl/v1/devices/${id.urlEncode()}/revoke")
+                .post(ByteArray(0).toRequestBody(null))
+                .build(),
+            DeviceDto.serializer(),
         )
 
     // --- Transaction status / void (by idempotency key = transaction id) ---
@@ -320,12 +375,14 @@ class ApiClient(
         payload: T,
         authed: Boolean = true,
         idempotencyKey: String? = null,
+        headers: Map<String, String> = emptyMap(),
     ): Request = Request.Builder()
         .url(baseUrl + path)
         .post(json.encodeToString(serializer, payload).toRequestBody(jsonMedia))
         .apply {
             if (!authed) tag(NoAuth::class.java, NoAuth)
             if (idempotencyKey != null) header("Idempotency-Key", idempotencyKey)
+            for ((name, value) in headers) header(name, value)
         }
         .build()
 

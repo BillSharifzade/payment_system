@@ -27,6 +27,7 @@ import tj.payment.core.StatementResponse
 import tj.payment.core.SubmitKycRequest
 import tj.payment.core.TransferRequest
 import tj.payment.core.WalletDto
+import tj.payment.core.deviceHeaders
 import tj.payment.core.map
 
 /**
@@ -41,6 +42,8 @@ import tj.payment.core.map
  *
  * @param currentUser The signed-in user id (pending payments are per user).
  * @param authorizer Strong device authentication, asked before every new money move.
+ * @param onDeviceRejected The server refused the payment's device signature
+ *   (unknown/revoked device): the registration must be renewed with the password.
  */
 class WalletRepository(
     private val api: ApiClient,
@@ -48,6 +51,7 @@ class WalletRepository(
     currentUser: () -> String?,
     authorizer: PaymentAuthorizer,
     private val clock: () -> Long = System::currentTimeMillis,
+    private val onDeviceRejected: suspend (userId: String) -> Unit = {},
 ) {
     val submitter = PaymentSubmitter(
         store = pendingStore,
@@ -55,7 +59,12 @@ class WalletRepository(
         newKey = { UUID.randomUUID().toString() },
         authorizer = authorizer,
         // Any outcome but a refusal may have moved money.
-        execute = { p -> send(p).also { markWalletsStale() } },
+        execute = { p ->
+            send(p).also { outcome ->
+                markWalletsStale()
+                if (outcome is ApiOutcome.Failed && outcome.coded && outcome.code in DEVICE_REFUSALS) onDeviceRejected(p.userId)
+            }
+        },
         lookup = { id -> api.transaction(id) },
         void = { id -> api.voidTransaction(id).also { markWalletsStale() } },
         clock = clock,
@@ -64,22 +73,32 @@ class WalletRepository(
     /** The one place a persisted payment becomes a request; the key is the transaction id for all three. */
     private suspend fun send(p: PendingPayment): ApiOutcome<Settlement> = when (p.kind) {
         PaymentKind.TRANSFER ->
-            api.transfer(TransferRequest(p.fromAccount, p.toAccount, p.amountMinor, p.currency), idempotencyKey = p.idempotencyKey)
-                .map { Settlement(it.transactionId, alreadyPosted = it.status == "already_posted") }
+            api.transfer(
+                TransferRequest(p.fromAccount, p.toAccount, p.amountMinor, p.currency),
+                idempotencyKey = p.idempotencyKey,
+                deviceHeaders = p.deviceHeaders(),
+            ).map { Settlement(it.transactionId, alreadyPosted = it.status == "already_posted") }
         // A scanned check: the server debits p.fromAccount and credits the merchant.
         PaymentKind.CHECK -> {
             val checkId = p.checkId
             if (checkId == null) {
                 ApiOutcome.Failed(ErrorCode.BAD_REQUEST, 0, "check payment without a check id")
             } else {
-                api.payCheck(checkId, PayCheckRequest(account = p.fromAccount), idempotencyKey = p.idempotencyKey)
-                    .map { Settlement(it.transactionId, alreadyPosted = it.status == "already_posted") }
+                api.payCheck(
+                    checkId,
+                    PayCheckRequest(account = p.fromAccount),
+                    idempotencyKey = p.idempotencyKey,
+                    deviceHeaders = p.deviceHeaders(),
+                ).map { Settlement(it.transactionId, alreadyPosted = it.status == "already_posted") }
             }
         }
         // Between the user's own wallets; the answer carries the exact legs.
         PaymentKind.FX ->
-            api.fx(FxRequest(p.fromAccount, p.toAccount, p.amountMinor), idempotencyKey = p.idempotencyKey)
-                .map { Settlement(it.transactionId, alreadyPosted = false, fx = it) }
+            api.fx(
+                FxRequest(p.fromAccount, p.toAccount, p.amountMinor),
+                idempotencyKey = p.idempotencyKey,
+                deviceHeaders = p.deviceHeaders(),
+            ).map { Settlement(it.transactionId, alreadyPosted = false, fx = it) }
     }
 
     private val _wallets = MutableStateFlow<List<WalletDto>?>(null)
@@ -193,6 +212,7 @@ class WalletRepository(
     suspend fun cancelCheck(id: String): ApiOutcome<CheckDto> = api.cancelCheck(id)
 
     private companion object {
+        val DEVICE_REFUSALS = setOf(ErrorCode.DEVICE_SIGNATURE_INVALID, ErrorCode.DEVICE_SIGNATURE_REQUIRED)
         const val WALLETS_FRESH_MS = 60_000L
         const val CONFIG_FRESH_MS = 10 * 60_000L
     }

@@ -46,6 +46,9 @@ private fun ErrorCode.messageRes(): Int = when (this) {
     ErrorCode.PROBE_REPLAYED -> R.string.error_probe_replayed
     ErrorCode.CHECK_LOCKED -> R.string.error_check_locked
     ErrorCode.TERMINAL_UNAUTHORIZED -> R.string.error_terminal_unauthorized
+    // Both also raise the app-wide "confirm your password" prompt (DeviceEnrollment).
+    ErrorCode.DEVICE_SIGNATURE_REQUIRED -> R.string.error_device_signature_required
+    ErrorCode.DEVICE_SIGNATURE_INVALID -> R.string.error_device_signature_invalid
     ErrorCode.INTERNAL_ERROR -> R.string.error_internal
     ErrorCode.UNKNOWN -> R.string.error_unknown
 }
@@ -73,6 +76,7 @@ fun AuthDenial.userMessage(): String = Copy.text(
         AuthDenial.LOCKED_OUT -> R.string.auth_denied_locked_out
         AuthDenial.NO_SCREEN -> R.string.auth_denied_no_screen
         AuthDenial.FAILED -> R.string.auth_denied_failed
+        AuthDenial.DEVICE_NOT_REGISTERED -> R.string.auth_denied_device_not_registered
     },
 )
 

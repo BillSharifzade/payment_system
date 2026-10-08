@@ -28,6 +28,7 @@ import tj.payment.core.ErrorCode
 import tj.payment.core.KeyValuePendingPaymentStore
 import tj.payment.core.LocalStorageException
 import tj.payment.core.PaymentKind
+import tj.payment.core.RegisterDeviceRequest
 import tj.payment.core.SecureKeyValue
 import tj.payment.core.SubmitResult
 import tj.payment.wallet.ui.OFFLINE_MESSAGE
@@ -180,6 +181,83 @@ class HardeningTest {
         currentUser = { user },
         authorizer = { if (approve) Authorization.Granted("sig") else Authorization.Cancelled },
     )
+
+    // --- device binding ---
+
+    private val rejectedDevices = CopyOnWriteArrayList<String>()
+
+    private fun signingRepo() = WalletRepository(
+        api = api,
+        pendingStore = store,
+        currentUser = { user },
+        authorizer = { p -> Authorization.Granted("sig-" + p.idempotencyKey, deviceId = "dev-1") },
+        onDeviceRejected = { userId -> rejectedDevices += userId },
+    )
+
+    @Test
+    fun `every money move carries the stored device id and signature, retries included`() = runBlocking {
+        var transfers = 0
+        serve { req ->
+            val key = req.getHeader("Idempotency-Key")
+            when (req.path) {
+                "/v1/transfers" -> if (transfers++ == 0) {
+                    MockResponse().setResponseCode(503)
+                } else {
+                    json("""{"transaction_id":"$key","status":"posted"}""")
+                }
+                "/v1/fx" -> json(
+                    """{"transaction_id":"$key","debited_minor":1000,"credited_minor":91,""" +
+                        """"from_currency":"TJS","to_currency":"USD"}""",
+                )
+                "/v1/checks/c1/pay" -> json("""{"transaction_id":"$key","status":"posted"}""")
+                else -> error(500, "internal_error")
+            }
+        }
+        val r = signingRepo()
+        assertEquals(SubmitResult.Unsettled(offline = false), r.submitter.submitNew("w1", "w2", 100, "TJS", "+992"))
+        val key = store.load("alice")!!.idempotencyKey
+        assertTrue(r.submitter.retryPending() is SubmitResult.Posted)
+        assertTrue(r.submitter.submitNew("w-tjs", "w-usd", 1_000, "TJS", "USD", kind = PaymentKind.FX) is SubmitResult.Posted)
+        assertTrue(r.submitter.submitNew("w1", "m1", 500, "TJS", "Shop", checkId = "c1") is SubmitResult.Posted)
+        assertEquals(4, requests.size)
+        assertEquals("the retry resends the first attempt's key", key, requests[1].getHeader("Idempotency-Key"))
+        for (req in requests) {
+            assertEquals(req.path, "dev-1", req.getHeader("X-Device-Id"))
+            assertEquals(req.path, "sig-" + req.getHeader("Idempotency-Key"), req.getHeader("X-Device-Signature"))
+        }
+        assertTrue(rejectedDevices.isEmpty())
+    }
+
+    @Test
+    fun `a device-signature refusal asks for the phone to be registered again`() = runBlocking {
+        serve { req -> if (req.path == "/v1/transfers") error(403, "device_signature_invalid") else error(500, "internal_error") }
+        val result = signingRepo().submitter.submitNew("w1", "w2", 100, "TJS", "+992")
+        assertEquals(ErrorCode.DEVICE_SIGNATURE_INVALID, (result as SubmitResult.Rejected).code)
+        assertNull("refused before posting: nothing to keep", store.load("alice"))
+        assertEquals(listOf("alice"), rejectedDevices.toList())
+    }
+
+    @Test
+    fun `device registration sends the key, label and password with the session`() = runBlocking {
+        serve { req ->
+            if (req.path == "/v1/devices") {
+                json(
+                    """{"id":"dev-9","label":"Pixel","public_key":"S1BL","created_at":"2026-10-08T06:00:00.000000Z",""" +
+                        """"last_used_at":null,"revoked_at":null}""",
+                    201,
+                )
+            } else {
+                error(500, "internal_error")
+            }
+        }
+        val out = api.registerDevice(RegisterDeviceRequest("S1BL", "Pixel", "password123")) as ApiOutcome.Ok
+        assertEquals("dev-9", out.value.id)
+        assertTrue(out.value.isActive)
+        val sent = requests.single()
+        val body = sent.body.readUtf8()
+        assertTrue(body, body.contains("\"public_key\":\"S1BL\"") && body.contains("\"password\":\"password123\""))
+        assertEquals("Bearer tok", sent.getHeader("Authorization"))
+    }
 
     @Test
     fun `discarding an unsettled transfer voids its key, never scans the statement`() = runBlocking {

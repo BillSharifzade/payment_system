@@ -63,6 +63,14 @@ pub enum ApiError {
     #[error("too many failed fingerprint attempts; the check was cancelled")]
     CheckLocked,
 
+    #[error(
+        "this request must be signed by a registered device (X-Device-Id, X-Device-Signature)"
+    )]
+    DeviceSignatureRequired,
+
+    #[error("the device signature does not match this request, or the device is not registered and active")]
+    DeviceSignatureInvalid,
+
     #[error("rate limit exceeded")]
     TooManyRequests,
 
@@ -103,6 +111,10 @@ impl ApiError {
             ApiError::TerminalUnauthorized => (StatusCode::UNAUTHORIZED, "terminal_unauthorized"),
             ApiError::ProbeReplayed => (StatusCode::CONFLICT, "probe_replayed"),
             ApiError::CheckLocked => (StatusCode::CONFLICT, "check_locked"),
+            ApiError::DeviceSignatureRequired => {
+                (StatusCode::FORBIDDEN, "device_signature_required")
+            }
+            ApiError::DeviceSignatureInvalid => (StatusCode::FORBIDDEN, "device_signature_invalid"),
             ApiError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
             ApiError::RetryLater => (StatusCode::SERVICE_UNAVAILABLE, "retry_later"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),

@@ -83,7 +83,7 @@ async fn hash_password_async(password: String) -> ApiResult<String> {
         .map_err(|_| ApiError::Internal("password hashing failed".to_string()))
 }
 
-async fn verify_password_async(password: String, hash: String) -> ApiResult<bool> {
+pub(crate) async fn verify_password_async(password: String, hash: String) -> ApiResult<bool> {
     let _permit = argon2_permits()
         .acquire()
         .await

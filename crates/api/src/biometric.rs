@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::common::{default_currency, idempotency_key, normalize_phone};
 use crate::config::{env_bool, env_or, env_or_file};
+use crate::devices::{self, DeviceKey, DeviceProof, MoneyMove, PaymentAuth};
 use crate::payments::{
     aml_check, fee_shard, finish, lock_user, money_context, pre_screen, record, KeyState,
     ScreenCtx, KEY_STATE_COLUMNS, KYC_LEVEL_FOR_TRANSFER,
@@ -716,20 +717,24 @@ struct CheckCtx {
     failed_attempts: i32,
     key: KeyState,
     terminals: Vec<(Uuid, Vec<u8>)>,
+    device: Option<DeviceKey>,
 }
 
+// `device` = (presented device id, payer): the payer's active device, for the app path's
+// signature check, folded into the same round trip.
 async fn load_check(
     conn: &mut PgConnection,
     check_id: Uuid,
     key: Uuid,
     with_terminals: bool,
+    device: Option<(Uuid, Uuid)>,
 ) -> ApiResult<Option<CheckCtx>> {
     let row = db(sqlx::query(&format!(
         "SELECT c.merchant_user_id, c.merchant_account, c.amount_minor, c.currency, c.status,
                 c.failed_attempts, (c.expires_at <= now()) AS lapsed,
                 COALESCE(tm.ids, '{{}}') AS terminal_ids,
                 COALESCE(tm.hashes, '{{}}') AS terminal_hashes,
-                {KEY_STATE_COLUMNS}
+                {KEY_STATE_COLUMNS}, {device_columns}
          FROM checks c
          LEFT JOIN LATERAL (
              SELECT array_agg(id) AS ids, array_agg(key_hash) AS hashes FROM terminals
@@ -737,11 +742,15 @@ async fn load_check(
          ) tm ON TRUE
          LEFT JOIN idempotency_keys ik ON ik.key = $2
          LEFT JOIN voided_transactions vt ON vt.id = $2
-         WHERE c.id = $1"
+         LEFT JOIN devices dv ON dv.id = $4 AND dv.user_id = $5 AND dv.revoked_at IS NULL
+         WHERE c.id = $1",
+        device_columns = devices::device_columns()
     ))
     .bind(check_id)
     .bind(key)
     .bind(with_terminals)
+    .bind(device.map(|(id, _)| id))
+    .bind(device.map(|(_, user)| user))
     .fetch_optional(&mut *conn)
     .await)?;
     let Some(row) = row else {
@@ -760,6 +769,7 @@ async fn load_check(
         failed_attempts: db(row.try_get("failed_attempts"))?,
         key: KeyState::from_row(&row)?,
         terminals: ids.into_iter().zip(hashes).collect(),
+        device: DeviceKey::from_row(&row)?,
     }))
 }
 
@@ -852,7 +862,14 @@ async fn settle_check(
         ));
     }
 
-    let ctx = money_context(&mut *conn, payer_id, payer_account, merchant_account, key).await?;
+    let ctx = money_context(
+        &mut *conn,
+        payer_id,
+        (payer_account, merchant_account),
+        key,
+        None,
+    )
+    .await?;
     ctx.require_active()?;
     ctx.require_kyc(KYC_LEVEL_FOR_TRANSFER)?;
     ctx.require_recipient_active()?;
@@ -1006,18 +1023,38 @@ pub async fn pay_check(
     body: Option<Json<PayCheckRequest>>,
 ) -> ApiResult<(StatusCode, Json<PayCheckResponse>)> {
     let key = idempotency_key(&headers)?;
+    let proof = DeviceProof::from_headers(&headers);
     let req = body.map(|Json(b)| b).unwrap_or_default();
     let fingerprint = format!(
         "check_pay_app:{check_id}:{payer_id}:{}",
         req.account.map(|a| a.to_string()).unwrap_or_default()
     );
     let mut conn = db(state.ledger.pool().acquire().await)?;
-    let check = load_check(&mut conn, check_id, key, false)
+    let device = proof.lookup(state.devices.binding).map(|d| (d, payer_id));
+    let check = load_check(&mut conn, check_id, key, false, device)
         .await?
         .ok_or_else(|| ApiError::NotFound("check not found".to_string()))?;
     if let Some(found) = check.replay(&fingerprint)? {
         return Ok(found);
     }
+    // The payer approves the check as they saw it: its merchant wallet, amount and currency.
+    devices::verify(
+        &mut conn,
+        state.devices.binding,
+        &proof,
+        check.device.as_ref(),
+        &PaymentAuth {
+            kind: MoneyMove::Check,
+            user_id: payer_id,
+            idempotency_key: key,
+            from_account: req.account,
+            to_account: check.merchant_account,
+            amount_minor: check.amount_minor,
+            currency: &check.currency,
+            check_id: Some(check_id),
+        },
+    )
+    .await?;
     check.require_open(&mut conn).await?;
     if check.merchant_user_id == payer_id {
         return Err(ApiError::BadRequest(
@@ -1315,7 +1352,7 @@ pub async fn pay_check_fingerprint(
     let fingerprint = format!("check_pay:{check_id}:{merchant_id}");
 
     let mut conn = db(state.ledger.pool().acquire().await)?;
-    let check = load_check(&mut conn, check_id, key, true)
+    let check = load_check(&mut conn, check_id, key, true, None)
         .await?
         .filter(|c| c.merchant_user_id == merchant_id)
         .ok_or_else(|| ApiError::NotFound("check not found".to_string()))?;
