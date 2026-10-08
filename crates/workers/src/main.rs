@@ -6,8 +6,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crypto::rfc3161::TsaTrust;
 use crypto::{Sealer, TrustedKeys};
+use ledger_tigerbeetle::{AnyTb, HybridLedger, TbClient};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
+use storage::PostgresLedger;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
@@ -16,8 +18,9 @@ use workers::anchor::{Anchor, AnchorConfig, AnchorCursor, AnchorReport, AnyAncho
 use workers::env::Env;
 use workers::signer::{AnySigner, CheckpointSigner, SignerConfig};
 use workers::{
-    EventPublisher, FullReconciliation, LeaderLock, LoggingPublisher, NatsPublisher,
-    ReconcileConfig, RetentionConfig, VerifyReport, VerifyState, WorkerError, LEADER_LOCK_KEY,
+    record_recovery, Balances, EventPublisher, FullReconciliation, LeaderLock, LoggingPublisher,
+    NatsPublisher, ReconcileConfig, RetentionConfig, VerifyReport, VerifyState, WorkerError,
+    LEADER_LOCK_KEY,
 };
 
 type BoxError = Box<dyn std::error::Error>;
@@ -283,6 +286,11 @@ async fn main() -> Result<(), BoxError> {
         .init();
 
     let database_url = database_url()?;
+    let tigerbeetle = ledger_tigerbeetle::backend_from_env()?;
+    let recovery_interval = Duration::from_secs(env_or("TIGERBEETLE_RECOVERY_INTERVAL_SECS", 2)?);
+    if !(1..=60).contains(&recovery_interval.as_secs()) {
+        return Err("TIGERBEETLE_RECOVERY_INTERVAL_SECS must be 1..=60".into());
+    }
     let interval_secs: u64 = env_or("WORKER_INTERVAL_SECS", 5)?;
     let relay_interval_secs: u64 = env_or("RELAY_INTERVAL_SECS", 2)?;
     let batch_size: i64 = env_or("SEAL_BATCH_SIZE", 500)?;
@@ -375,9 +383,24 @@ async fn main() -> Result<(), BoxError> {
         .connect_with(connect_options.clone())
         .await?;
 
+    let ledger = match tigerbeetle {
+        Some(cfg) => Some(HybridLedger::connect(cfg, PostgresLedger::new(pool.clone())).await?),
+        None => None,
+    };
+    match &ledger {
+        Some(l) => tracing::info!(
+            cluster_id = %format!("{:x}", l.tb().client().cluster_id()),
+            recovery_interval_secs = recovery_interval.as_secs(),
+            "LEDGER_BACKEND=tigerbeetle: recovering abandoned reservations and reconciling the cluster against the journal"
+        ),
+        None => tracing::info!("LEDGER_BACKEND=postgres: reconciling the balances table"),
+    }
+
     let cfg = Config {
         pool,
         connect_options,
+        ledger,
+        recovery_interval,
         signer: SignerSlot {
             cfg: signer_cfg,
             signer,
@@ -421,6 +444,9 @@ async fn main() -> Result<(), BoxError> {
 struct Config {
     pool: PgPool,
     connect_options: PgConnectOptions,
+    /// LEDGER_BACKEND=tigerbeetle.
+    ledger: Option<HybridLedger<AnyTb>>,
+    recovery_interval: Duration,
     signer: SignerSlot,
     trusted: TrustedKeys,
     tsa_trust: Option<TsaTrust>,
@@ -481,6 +507,7 @@ struct Liveness {
     seal: AtomicU64,
     duties: AtomicU64,
     anchor: AtomicU64,
+    recovery: AtomicU64,
 }
 
 impl Liveness {
@@ -498,6 +525,7 @@ async fn heartbeat_loop(
     interval_secs: u64,
     relay_interval_secs: u64,
     anchor_tick: Option<Duration>,
+    recovery_tick: Option<Duration>,
     mut stop: watch::Receiver<bool>,
 ) {
     let path = heartbeat_path();
@@ -509,6 +537,9 @@ async fn heartbeat_loop(
     // An anchor tick may wait out several witnesses' HTTP timeouts.
     if let Some(tick) = anchor_tick {
         limits.push(("anchor", &liveness.anchor, 3 * tick.as_secs() + 900));
+    }
+    if let Some(tick) = recovery_tick {
+        limits.push(("recovery", &liveness.recovery, 3 * tick.as_secs() + 120));
     }
     let mut ticker = ticker(Duration::from_secs(interval_secs));
     loop {
@@ -738,6 +769,13 @@ enum FullVerify {
     },
 }
 
+fn balances(ledger: &Option<HybridLedger<AnyTb>>) -> Balances<'_> {
+    match ledger {
+        Some(l) => Balances::TigerBeetle(l),
+        None => Balances::Postgres,
+    }
+}
+
 /// Verification, reconciliation and retention. Full passes advance in bounded
 /// steps under a per-tick time budget, so incremental checks keep their cadence
 /// while a full pass over a large ledger is in progress.
@@ -753,6 +791,7 @@ struct Duties {
     retention_interval: Duration,
     retention: RetentionConfig,
     reconcile: ReconcileConfig,
+    ledger: Option<HybridLedger<AnyTb>>,
 
     // None until the first full verification completes; then advances only
     // over new checkpoints.
@@ -770,6 +809,9 @@ struct Duties {
 
     // Accounts whose balance disagreed; re-checked every pass until they agree.
     suspects: BTreeSet<Uuid>,
+    // TigerBeetle accounts whose exact re-check stayed undecided (busy): re-checked every
+    // pass, not counted as unhealthy.
+    inconclusive: BTreeSet<Uuid>,
     reconcile_backlog: bool,
     last_reconcile: Option<Instant>,
     unbalanced_seen: bool,
@@ -795,6 +837,7 @@ impl Duties {
             retention_interval: cfg.retention_interval,
             retention: cfg.retention.clone(),
             reconcile: ReconcileConfig::default(),
+            ledger: cfg.ledger.clone(),
             verify_state: None,
             verify_pending: false,
             last_verify: None,
@@ -805,6 +848,7 @@ impl Duties {
             anchor_cursor: AnchorCursor::default(),
             verified_tx,
             suspects: BTreeSet::new(),
+            inconclusive: BTreeSet::new(),
             reconcile_backlog: false,
             last_reconcile: None,
             unbalanced_seen: false,
@@ -1061,16 +1105,23 @@ impl Duties {
             return;
         }
         self.last_reconcile = Some(Instant::now());
-        let suspects: Vec<Uuid> = self.suspects.iter().copied().collect();
-        let report =
-            match workers::reconcile_incremental(&self.pool, &self.reconcile, &suspects).await {
-                Ok(report) => report,
-                Err(e) => {
-                    metrics::counter!("worker_errors_total", "duty" => "reconcile").increment(1);
-                    tracing::error!(error = %e, "reconciliation error");
-                    return;
-                }
-            };
+        let suspects: Vec<Uuid> = self.suspects.union(&self.inconclusive).copied().collect();
+        let report = match workers::reconcile_incremental(
+            &self.pool,
+            &self.reconcile,
+            &suspects,
+            balances(&self.ledger),
+        )
+        .await
+        {
+            Ok(report) => report,
+            Err(e) => {
+                metrics::counter!("worker_errors_total", "duty" => "reconcile").increment(1);
+                tracing::error!(error = %e, "reconciliation error");
+                return;
+            }
+        };
+        record_recovery(&report.recovered, "reconcile");
         if report.folded_unchecked > 0 {
             tracing::info!(
                 transactions = report.folded_unchecked,
@@ -1090,8 +1141,13 @@ impl Duties {
             .iter()
             .map(|m| m.account_id)
             .collect();
+        self.inconclusive = report.inconclusive.iter().copied().collect();
         self.unbalanced_seen = !report.unbalanced_transactions.is_empty();
         metrics::gauge!("reconciliation_accounts_checked").set(report.accounts_checked as f64);
+        metrics::gauge!("reconciliation_inconclusive_accounts").set(self.inconclusive.len() as f64);
+        if !self.inconclusive.is_empty() {
+            tracing::warn!(accounts = ?self.inconclusive, "TigerBeetle re-check inconclusive (posts kept landing while it read); re-checking next pass");
+        }
         if report.is_healthy() {
             tracing::debug!(
                 accounts = report.accounts_checked,
@@ -1114,7 +1170,10 @@ impl Duties {
             return false;
         };
         let started = *started;
-        match full.step(&self.pool, &self.reconcile).await {
+        match full
+            .step(&self.pool, &self.reconcile, balances(&self.ledger))
+            .await
+        {
             Ok(false) => true,
             Ok(true) => {
                 let report = self
@@ -1123,8 +1182,11 @@ impl Duties {
                     .expect("checked above")
                     .0
                     .into_report();
+                record_recovery(&report.recovered, "reconcile");
                 self.suspects
                     .extend(report.balance_mismatches.iter().map(|m| m.account_id));
+                self.inconclusive
+                    .extend(report.inconclusive.iter().copied());
                 self.full_reconcile_unhealthy =
                     !report.currency_imbalances.is_empty() || !report.sum_mismatches.is_empty();
                 self.next_full_reconcile = if report.is_healthy() {
@@ -1344,6 +1406,7 @@ async fn run<P: EventPublisher + Send + Sync + 'static>(
         &liveness.seal,
         &liveness.duties,
         &liveness.anchor,
+        &liveness.recovery,
     ] {
         Liveness::beat(slot);
     }
@@ -1351,6 +1414,17 @@ async fn run<P: EventPublisher + Send + Sync + 'static>(
     let (verified_tx, verified_rx) = watch::channel(None);
     let anchor_tick =
         (!cfg.anchors.is_empty()).then(|| cfg.anchor_interval.min(Duration::from_secs(60)));
+    let recovery_tick = cfg.ledger.as_ref().map(|_| cfg.recovery_interval);
+    let recovery = cfg.ledger.clone().map(|ledger| {
+        let liveness = liveness.clone();
+        tokio::spawn(workers::recovery_loop(
+            ledger,
+            cfg.recovery_interval,
+            leader_rx.clone(),
+            stop_rx.clone(),
+            move || Liveness::beat(&liveness.recovery),
+        ))
+    });
 
     let election = tokio::spawn(election_loop(
         cfg.connect_options.clone(),
@@ -1379,6 +1453,7 @@ async fn run<P: EventPublisher + Send + Sync + 'static>(
         cfg.interval_secs,
         cfg.relay_interval_secs,
         anchor_tick,
+        recovery_tick,
         stop_rx.clone(),
     ));
     let anchor = anchor_tick.map(|tick| {
@@ -1407,6 +1482,9 @@ async fn run<P: EventPublisher + Send + Sync + 'static>(
     let _ = tokio::join!(relay, seal, duties, heartbeat);
     if let Some(anchor) = anchor {
         let _ = anchor.await;
+    }
+    if let Some(recovery) = recovery {
+        let _ = recovery.await;
     }
     // Released only after the leader-only loops have finished their batch.
     if let Ok(Some(lock)) = election.await {

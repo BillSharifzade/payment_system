@@ -14,10 +14,17 @@ path = "src/lib.rs"
 name = "payment-server"
 path = "src/main.rs"
 
+[features]
+# LEDGER_BACKEND=tigerbeetle: TigerBeetle's native client. Off by default, because building
+# it needs Zig and libclang; without it the server refuses LEDGER_BACKEND=tigerbeetle. The
+# hybrid protocol itself is always compiled (and tested against the in-process cluster model).
+tigerbeetle = ["ledger-tigerbeetle/native-client"]
+
 [dependencies]
 money = { workspace = true }
 ledger = { workspace = true }
 storage = { workspace = true }
+ledger-tigerbeetle = { path = "../ledger-tigerbeetle" }
 auth = { workspace = true }
 biometric = { workspace = true }
 base64 = { workspace = true }
@@ -37,6 +44,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 
 [dev-dependencies]
+ledger-tigerbeetle = { path = "../ledger-tigerbeetle", features = ["testkit"] }
 rand_core = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

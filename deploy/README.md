@@ -551,6 +551,112 @@ it signed the history), deploy with the overlay, then change the old entry to
 (or `WORKER_SIGNER=vault|pkcs11`) `deploy.sh` no longer generates or trusts a
 local key. Back up Vault itself with `vault operator raft snapshot save`.
 
+## TigerBeetle ledger (optional overlay)
+
+`docker-compose.tigerbeetle.yml` switches the ledger backend to TigerBeetle
+(`LEDGER_BACKEND=tigerbeetle`, DESIGN.md §15): balances and the no-overdraft
+rule live in a TigerBeetle replica; users, the journal (entries), idempotency,
+the outbox and the posting guards (AML, single-use checks and deposits) stay in
+Postgres. The overlay builds the image with TigerBeetle's client (Dockerfile
+`TIGERBEETLE=1`: pinned Zig + libclang in the builder; the default image has
+neither), runs one replica (`ghcr.io/tigerbeetle/tigerbeetle`, digest-pinned)
+on an internal network of its own with a fixed address (the client resolves no
+host names), and gives the server and workers `LEDGER_BACKEND`,
+`TIGERBEETLE_CLUSTER_ID` and `TIGERBEETLE_ADDRESSES`. `.env` holds
+`TIGERBEETLE_CLUSTER_ID` (required) and, if the defaults collide with a local
+network, `TIGERBEETLE_SUBNET` / `TIGERBEETLE_IP` (172.31.250.0/29, .2); other
+knobs (`TIGERBEETLE_REQUEST_TIMEOUT_MS`, `_PENDING_TIMEOUT_SECS`,
+`_HOLD_WAIT_MS`, `_RECOVERY_INTERVAL_SECS`, …) go in `app.env` (README.md lists
+them).
+
+**One cluster belongs to one database, for good.** The servers and workers
+refuse to start on a database whose balances never reached the cluster, on a
+cluster that lacks the database's newest wallets (wrong `TIGERBEETLE_CLUSTER_ID`,
+a reformatted data file), and on a cluster that was rolled back.
+
+Sizing: the replica allocates its memory at start — **2.3 GiB resident**
+measured for 0.17.9 with the overlay's `--cache-grid=256MiB`
+(`TIGERBEETLE_CACHE_GRID`). That does not fit beside the prod stack on a 4 GB
+box: use 8 GB, or a host of its own. Docker ≥ 25 blocks io_uring in its default
+seccomp profile, so the replica runs `seccomp=unconfined` (capabilities stay
+dropped, root filesystem read-only), as TigerBeetle's Docker guide prescribes.
+
+### Fresh install (no money in Postgres yet)
+
+```bash
+# deploy/.env
+COMPOSE_FILE=docker-compose.prod.yml:docker-compose.tigerbeetle.yml   # + your other overlays
+TIGERBEETLE_CLUSTER_ID=<python3 -c 'import uuid; print(uuid.uuid4().int)'>
+
+docker compose run --rm --no-deps tigerbeetle format \
+  --cluster="$TIGERBEETLE_CLUSTER_ID" --replica=0 --replica-count=1 /data/0_0.tigerbeetle
+./deploy.sh
+```
+
+### Cut-over (an install with money in Postgres)
+
+Money must not move from step 3 until step 6 serves; plan a few minutes of
+downtime (the import reads every balance once and refuses unless `balances`
+equals the entries and every currency sums to zero).
+
+```bash
+# 1. Be on this release with LEDGER_BACKEND=postgres first (migrations 0033/0034).
+./deploy.sh
+# 2. Overlay on (deploy/.env as above, a FRESH cluster id), build, format the replica.
+docker compose build payment-server
+docker compose run --rm --no-deps tigerbeetle format \
+  --cluster="$TIGERBEETLE_CLUSTER_ID" --replica=0 --replica-count=1 /data/0_0.tigerbeetle
+# 3. Stop money movement; take a backup (Backups, above).
+docker compose stop payment-server payment-workers
+# 4. Start the replica and import: every account, each non-zero balance as one
+#    opening transfer; re-running is a no-op. Exit 0 = imported, 1 = refused (JSON says why).
+docker compose up -d tigerbeetle
+docker compose run --rm --no-deps payment-server tigerbeetle-import
+# 5. Roll out on TigerBeetle.
+./deploy.sh
+# 6. Watch: the workers log "reconciliation OK", reconciliation_healthy == 1,
+#    tigerbeetle_recovery_last_success_timestamp_seconds advancing.
+```
+
+From then on `balances` is no longer written (it keeps its cut-over values);
+balance reads come from the cluster, conservation and customer funds from the
+journal, and the reconciliation worker compares the cluster with the journal
+(a mismatch is re-checked exactly after a recovery pass before it alerts).
+
+### Rollback to Postgres
+
+```bash
+docker compose stop payment-server payment-workers            # money stops
+docker compose run --rm --no-deps payment-server tigerbeetle-rollback
+# settles every reservation, requires cluster == journal for EVERY account,
+# rewrites balances from the journal in one transaction, marks the cluster
+# rolled back. Exit 0 = done, 1 = refused (nothing changed).
+# deploy/.env: drop docker-compose.tigerbeetle.yml from COMPOSE_FILE, then
+./deploy.sh
+```
+
+The rolled-back cluster is never served again (Postgres moves money it will not
+see); a later cut-over needs a freshly formatted cluster with a new id.
+
+### Operating it
+
+- **Alerts** (monitoring overlay): `TigerBeetleRecoveryStale` (no successful
+  recovery pass for a minute: payments whose post was lost wait in the journal),
+  `TigerBeetleForcedRepost` (recovery was down past half the pending timeout),
+  `TigerBeetleProtocolError` (an invariant broke: page a human, stop money
+  movement, reconcile), `TigerBeetleUnavailable` (money requests answered 503).
+- **Backups:** the replica's state is one file in the `tigerbeetledata` volume;
+  copy it with the replica stopped. It is only consistent with a Postgres
+  backup taken at the same quiet moment. The journal is complete, though, so
+  after losing the replica, or after restoring Postgres to an earlier point,
+  rebuild instead: with money stopped, rewrite `balances` from the entries (as
+  payment_owner: the statement `tigerbeetle-rollback` runs, in
+  crates/ledger-tigerbeetle/src/import.rs) and cut over into a fresh cluster.
+- **Limits:** one replica on one host (TigerBeetle's durability comes from its
+  replication: a 3- or 6-replica cluster on separate hosts is
+  `TIGERBEETLE_ADDRESSES=ip1:3000,ip2:3000,…`, not in this overlay); x86_64
+  image builds only (the Zig archive pinned in the Dockerfile).
+
 ## Admin console and the admin allowlist
 
 Caddy serves the console at `https://<SITE_ADDRESS>/admin/` from the

@@ -11,8 +11,13 @@ description = "Load-test harness for the money path: end to end over HTTP or in-
 name = "payment-loadtest"
 path = "src/main.rs"
 
+[features]
+# Verify runs against a server with LEDGER_BACKEND=tigerbeetle (reads the cluster's balances).
+tigerbeetle = ["api/tigerbeetle"]
+
 [dependencies]
 api = { path = "../api" }
+ledger-tigerbeetle = { path = "../ledger-tigerbeetle" }
 storage = { workspace = true }
 ledger = { workspace = true }
 money = { workspace = true }

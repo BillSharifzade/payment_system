@@ -4,8 +4,9 @@
 #
 #   scripts/image-digest.sh postgres:16.15 caddy:2.11.7 gcr.io/distroless/cc-debian12:nonroot
 #
-# Docker Hub (library/ implied for bare names), gcr.io and quay.io. Prints the
-# multi-arch index digest when the tag has one. Needs curl and jq.
+# Docker Hub (library/ implied for bare names), gcr.io, quay.io and ghcr.io
+# (anonymous pull token). Prints the multi-arch index digest when the tag has
+# one. Needs curl and jq.
 set -euo pipefail
 accept='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json'
 [[ $# -gt 0 ]] || { sed -n '2,8p' "$0"; exit 2; }
@@ -17,6 +18,11 @@ for ref in "$@"; do
     gcr.io/*|quay.io/*)
       host=${name%%/*}; path=${name#*/}
       d=$(curl -fsSI -H "Accept: $accept" "https://$host/v2/$path/manifests/$tag" | digest_header) ;;
+    ghcr.io/*)
+      path=${name#*/}
+      tok=$(curl -fsS "https://ghcr.io/token?scope=repository:$path:pull" | jq -r .token)
+      d=$(curl -fsSI -H "Authorization: Bearer $tok" -H "Accept: $accept" \
+            "https://ghcr.io/v2/$path/manifests/$tag" | digest_header) ;;
     *)
       [[ "$name" == */* ]] || name="library/$name"
       tok=$(curl -fsS "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$name:pull" | jq -r .token)

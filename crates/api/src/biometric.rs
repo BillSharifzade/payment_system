@@ -8,7 +8,7 @@ use biometric::{
     decide, Candidate, Decision, HttpMatcher, MatchPolicy, MatcherError, Template, TemplateCipher,
     DEFAULT_IDENTIFY_SCALE,
 };
-use ledger::{AccountType, Transaction, TransactionId};
+use ledger::{AccountId, AccountType, Transaction, TransactionId};
 use money::Money;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
@@ -825,10 +825,12 @@ async fn settle_check(
         check.merchant_account,
         check.amount_minor,
     );
-    let wallet = db(sqlx::query(
-        "SELECT a.id, b.raw_minor, k.full_name
+    // The payer's candidate wallets (oldest first), then the one with the largest committed
+    // balance, as Postgres reads it. Under TigerBeetle, holds of requests still in flight are
+    // not subtracted: the post waits for them and decides (found by the live runs).
+    let rows = db(sqlx::query(
+        "SELECT a.id, k.full_name
          FROM accounts a
-         JOIN balances b ON b.account_id = a.id
          LEFT JOIN LATERAL (
              SELECT full_name FROM kyc_submissions
              WHERE user_id = $1 AND status = 'approved'
@@ -836,15 +838,14 @@ async fn settle_check(
          ) k ON TRUE
          WHERE a.owner_user_id = $1 AND a.currency = $2 AND a.account_type = 'user_wallet'
            AND ($3::uuid IS NULL OR a.id = $3::uuid)
-         ORDER BY b.raw_minor DESC, a.created_at ASC
-         LIMIT 1",
+         ORDER BY a.created_at ASC, a.id ASC",
     )
     .bind(payer_id)
     .bind(&check.currency)
     .bind(s.wallet)
-    .fetch_optional(&mut *conn)
+    .fetch_all(&mut *conn)
     .await)?;
-    let Some(wallet) = wallet else {
+    let Some(first) = rows.first() else {
         return Err(match s.wallet {
             Some(_) => {
                 ApiError::BadRequest(format!("account is not your {} wallet", check.currency))
@@ -852,11 +853,21 @@ async fn settle_check(
             None => ApiError::InsufficientFunds(format!("payer has no {} wallet", check.currency)),
         });
     };
-    let payer_account: Uuid = db(wallet.try_get("id"))?;
-    let raw_minor: i64 = db(wallet.try_get("raw_minor"))?;
-    let full_name: Option<String> = db(wallet.try_get("full_name"))?;
+    let full_name: Option<String> = db(first.try_get("full_name"))?;
     let payer_name = full_name.as_deref().and_then(mask_name);
-    if raw_minor < amount_minor {
+    let ids = rows
+        .iter()
+        .map(|r| r.try_get("id").map(AccountId))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)?;
+    let balances = state.ledger.balances(&mut *conn, &ids).await?;
+    let best = balances
+        .iter()
+        .rev()
+        .max_by_key(|b| b.posted.minor_units())
+        .expect("one candidate at least");
+    let payer_account = best.account.as_uuid();
+    if best.posted.minor_units() < amount_minor as i128 {
         return Err(ApiError::InsufficientFunds(
             "payer has insufficient funds".to_string(),
         ));

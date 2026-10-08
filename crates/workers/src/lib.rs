@@ -3,6 +3,7 @@ pub mod env;
 mod error;
 mod leader;
 mod reconcile;
+mod recovery;
 mod relay;
 mod retention;
 mod sealer;
@@ -11,9 +12,10 @@ pub mod signer;
 pub use error::{Result, WorkerError};
 pub use leader::{LeaderLock, LEADER_LOCK_KEY};
 pub use reconcile::{
-    reconcile, reconcile_full, reconcile_incremental, unsealed_lag, BalanceMismatch,
-    FullReconciliation, ReconcileConfig, ReconciliationReport,
+    confirm, reconcile, reconcile_full, reconcile_incremental, unsealed_lag, BalanceMismatch,
+    Balances, Confirmation, Derive, FullReconciliation, ReconcileConfig, ReconciliationReport,
 };
+pub use recovery::{record_recovery, recover_once, recovery_loop};
 pub use relay::{
     outbox_lag, relay_all, relay_once, EventPublisher, LoggingPublisher, NatsPublisher,
     OutboxEvent, PublishError, PUBLISH_TIMEOUT,

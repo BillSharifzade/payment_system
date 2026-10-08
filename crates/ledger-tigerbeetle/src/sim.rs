@@ -5,7 +5,7 @@
 //! nothing, `linked_event_failed` for the rest), two-phase transfers and their timeouts,
 //! balance limits, `exists*` idempotency and the ids TigerBeetle remembers after a transient
 //! failure (`id_already_failed`). Imported events and account closing are not modelled.
-//! The live crate runs the same operation sequences against a real cluster and the model and
+//! `tests/live.rs` runs the same operation sequences against a real cluster and the model and
 //! requires identical results, so a divergence fails CI instead of hiding behind the model.
 //!
 //! Faults: a request can be dropped before the cluster sees it, or applied with its reply lost.

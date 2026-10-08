@@ -14,8 +14,17 @@ path = "src/lib.rs"
 name = "payment-workers"
 path = "src/main.rs"
 
+[features]
+# LEDGER_BACKEND=tigerbeetle: TigerBeetle's native client, for the recovery loop and the
+# reconciliation against the cluster. Off by default (building it needs Zig and libclang);
+# without it the workers refuse LEDGER_BACKEND=tigerbeetle.
+tigerbeetle = ["ledger-tigerbeetle/native-client"]
+
 [dependencies]
 crypto = { workspace = true }
+ledger = { workspace = true }
+storage = { workspace = true }
+ledger-tigerbeetle = { path = "../ledger-tigerbeetle" }
 hex = { workspace = true }
 sqlx = { workspace = true }
 serde_json.workspace = true
@@ -37,9 +46,8 @@ cryptoki = "0.12"
 
 [dev-dependencies]
 crypto = { workspace = true, features = ["test-tsa"] }
+ledger-tigerbeetle = { path = "../ledger-tigerbeetle", features = ["testkit"] }
 axum = { workspace = true }
-storage = { workspace = true }
-ledger = { workspace = true }
 money = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }

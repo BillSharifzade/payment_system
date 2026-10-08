@@ -143,21 +143,36 @@ impl<C: TbClient> TbLedger<C> {
 
     /// Creates the account in TigerBeetle (idempotent) and registers it.
     pub async fn open_account(&self, account: &LedgerAccount) -> Result<()> {
-        self.create_accounts(vec![Account {
-            id: account.id.as_uuid().as_u128(),
-            ledger: ids::ledger_of(account.currency),
-            code: ids::code_of(account.account_type),
-            flags: ids::flags_of(account.account_type),
-            ..Account::default()
-        }])
-        .await?;
-        self.registry.write().expect("registry poisoned").insert(
-            account.id,
-            AccountInfo {
-                account_type: account.account_type,
-                currency: account.currency,
-            },
-        );
+        self.open_accounts(std::slice::from_ref(account)).await
+    }
+
+    /// [`open_account`](Self::open_account) for many, in request-sized batches.
+    pub async fn open_accounts(&self, accounts: &[LedgerAccount]) -> Result<()> {
+        for chunk in accounts.chunks(crate::client::CREATE_BATCH) {
+            self.create_accounts(
+                chunk
+                    .iter()
+                    .map(|a| Account {
+                        id: a.id.as_uuid().as_u128(),
+                        ledger: ids::ledger_of(a.currency),
+                        code: ids::code_of(a.account_type),
+                        flags: ids::flags_of(a.account_type),
+                        ..Account::default()
+                    })
+                    .collect(),
+            )
+            .await?;
+            let mut reg = self.registry.write().expect("registry poisoned");
+            for a in chunk {
+                reg.insert(
+                    a.id,
+                    AccountInfo {
+                        account_type: a.account_type,
+                        currency: a.currency,
+                    },
+                );
+            }
+        }
         Ok(())
     }
 
@@ -217,8 +232,57 @@ impl<C: TbClient> TbLedger<C> {
             .collect()
     }
 
+    /// Raw posted balances (credit positive, comparable with the journal) of the accounts
+    /// that exist in the cluster; the others are absent.
+    pub async fn raw_balances(&self, accounts: &[AccountId]) -> Result<HashMap<AccountId, i128>> {
+        let mut out = HashMap::with_capacity(accounts.len());
+        for chunk in accounts.chunks(crate::client::LOOKUP_BATCH) {
+            let ids = chunk.iter().map(|a| a.as_uuid().as_u128()).collect();
+            for a in self.call(self.tb.lookup_accounts(ids)).await? {
+                let id = AccountId(Uuid::from_u128(a.id));
+                out.insert(id, balance_of(id, &a)?.raw);
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn balance(&self, account: AccountId) -> Result<Money> {
         Ok(self.balances(&[account]).await?[0].posted)
+    }
+
+    /// The timestamp of the newest transfer in the cluster (0 for none). Timestamps strictly
+    /// increase, so every transfer applied before this call is at or below it, and every one
+    /// applied after it is above.
+    pub async fn newest_timestamp(&self) -> Result<u64> {
+        let newest = self
+            .call(self.tb.query_transfers(crate::client::QueryFilter {
+                limit: 1,
+                reversed: true,
+                ..Default::default()
+            }))
+            .await?;
+        Ok(newest.first().map_or(0, |t| t.timestamp))
+    }
+
+    /// When each transaction's movement was applied (the cluster timestamp of its post, or of
+    /// its forced re-post); transactions not (yet) posted are absent.
+    pub async fn posted_at(&self, transactions: &[Uuid]) -> Result<HashMap<Uuid, u64>> {
+        let mut out = HashMap::with_capacity(transactions.len());
+        for chunk in transactions.chunks(crate::client::LOOKUP_BATCH) {
+            let by_post: HashMap<u128, Uuid> = chunk
+                .iter()
+                .map(|t| (ids::leg(ids::post_base(t.as_u128()), 0), *t))
+                .collect();
+            let found = self
+                .call(self.tb.lookup_transfers(by_post.keys().copied().collect()))
+                .await?;
+            out.extend(
+                found
+                    .into_iter()
+                    .filter_map(|t| by_post.get(&t.id).map(|txn| (*txn, t.timestamp))),
+            );
+        }
+        Ok(out)
     }
 
     /// The pure-TigerBeetle fast path: one linked chain, no Postgres, no guards. The chain

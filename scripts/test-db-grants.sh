@@ -122,6 +122,11 @@ if [[ "$(as_super -d "$db" -tAc "SELECT to_regclass('public.reconcile_watermark'
   expect_denied "INSERT reconcile_watermark"   "INSERT INTO reconcile_watermark (id, through_sealed_seq) VALUES (true, 0)"
   expect_denied "DELETE reconcile_watermark"   "DELETE FROM reconcile_watermark"
 fi
+if [[ "$(as_super -d "$db" -tAc "SELECT to_regclass('public.tb_cutover') IS NOT NULL")" == t ]]; then
+  expect_denied "DELETE tb_recovery_watermark" "DELETE FROM tb_recovery_watermark"
+  expect_denied "DELETE tb_cutover"            "DELETE FROM tb_cutover"
+  expect_denied "TRUNCATE tb_cutover"          "TRUNCATE tb_cutover"
+fi
 expect_denied "ALTER ROLE payment_app"         "ALTER ROLE payment_app SUPERUSER"
 expect_denied "GRANT pg_write_server_files"    "GRANT pg_write_server_files TO payment_app"
 
@@ -202,6 +207,13 @@ BEGIN
     EXECUTE $q$INSERT INTO tb_recovery_watermark (cluster_id, through_timestamp)
                VALUES ('0192f0c0-0000-7000-8000-00000000a007', 0)
                ON CONFLICT (cluster_id) DO UPDATE SET through_timestamp = EXCLUDED.through_timestamp$q$;
+  END IF;
+  IF to_regclass('public.tb_cutover') IS NOT NULL THEN
+    -- payment-server tigerbeetle-import records the cut-over, tigerbeetle-rollback stamps it
+    EXECUTE $q$INSERT INTO tb_cutover (cluster_id, accounts, opening_balances, through_seq)
+               VALUES ('0192f0c0-0000-7000-8000-00000000a008', 1, 1, 1)$q$;
+    EXECUTE $q$UPDATE tb_cutover SET rolled_back_at = now()
+               WHERE cluster_id = '0192f0c0-0000-7000-8000-00000000a008'$q$;
   END IF;
   IF to_regclass('public.terminals') IS NOT NULL THEN
     EXECUTE $q$INSERT INTO terminals (id, merchant_user_id, label, key_hash, created_by)

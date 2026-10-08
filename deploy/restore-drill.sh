@@ -40,6 +40,9 @@
 #   3. shape         — migration table, ledger tables, migration count
 #   4. conservation  — per currency, SUM(balances.raw_minor) = 0
 #   5. integrity     — every balance equals the signed sum of its entries
+#                      (a database served by LEDGER_BACKEND=tigerbeetle keeps its
+#                      balances in the cluster, not in the dump: there 4 sums the
+#                      entries per currency and 5 checks every transaction balances)
 #   6. chain         — `payment-workers verify-chain` (the workers image) against
 #                      the restored database and the trusted public keys
 #   7. KYC archive   — decrypts and lists completely (gzip CRC checked); every
@@ -321,20 +324,43 @@ checkpoints=$(q "SELECT COUNT(*) FROM checkpoints")
 echo "    migrations=$migrations transactions=$txns entries=$entries accounts=$accounts checkpoints=$checkpoints"
 [[ "$migrations" -ge "$MIN_MIGRATIONS" ]] || FAIL "only $migrations migrations applied in the dump (expected >= $MIN_MIGRATIONS)"
 
+# Served by TigerBeetle (DESIGN.md §15): the hybrid has posted, and no rollback rebuilt
+# `balances` since. Then `balances` holds its cut-over values by design.
+backend=postgres
+if [[ "$(q "SELECT to_regclass('public.tb_intents') IS NOT NULL AND EXISTS (SELECT 1 FROM tb_intents)")" == t ]] \
+   && [[ "$(q "SELECT NOT EXISTS (SELECT 1 FROM tb_cutover
+                                  WHERE rolled_back_at >= (SELECT max(created_at) FROM tb_intents))")" == t ]]; then
+  backend=tigerbeetle
+  echo "    ledger backend: tigerbeetle (balances live in the cluster; the dump holds the journal)"
+fi
+signed="CASE direction WHEN 'credit' THEN amount_minor ELSE -amount_minor END"
+
 # ---- 4. conservation --------------------------------------------------------------------
-imbalance=$(q "SELECT string_agg(currency || '=' || total, ', ')
-               FROM (SELECT a.currency, SUM(b.raw_minor) AS total
-                     FROM balances b JOIN accounts a ON a.id = b.account_id
-                     GROUP BY a.currency HAVING SUM(b.raw_minor) <> 0) x")
+if [[ $backend == postgres ]]; then
+  imbalance=$(q "SELECT string_agg(currency || '=' || total, ', ')
+                 FROM (SELECT a.currency, SUM(b.raw_minor) AS total
+                       FROM balances b JOIN accounts a ON a.id = b.account_id
+                       GROUP BY a.currency HAVING SUM(b.raw_minor) <> 0) x")
+else
+  imbalance=$(q "SELECT string_agg(currency || '=' || total, ', ')
+                 FROM (SELECT currency, SUM($signed) AS total FROM entries
+                       GROUP BY currency HAVING SUM($signed) <> 0) x")
+fi
 if [[ -n "$imbalance" ]]; then FAIL "conservation broken: $imbalance"; else ok "conservation (every currency sums to 0)"; fi
 
 # ---- 5. integrity -------------------------------------------------------------------------
-mismatches=$(q "SELECT COUNT(*) FROM balances b
-                LEFT JOIN (SELECT account_id,
-                                  SUM(CASE direction WHEN 'credit' THEN amount_minor ELSE -amount_minor END) AS derived
-                           FROM entries GROUP BY account_id) d ON d.account_id = b.account_id
-                WHERE b.raw_minor <> COALESCE(d.derived, 0)")
-if [[ "$mismatches" != "0" ]]; then FAIL "$mismatches account balance(s) disagree with their entries"; else ok "integrity (all $accounts balances match their entries)"; fi
+if [[ $backend == postgres ]]; then
+  mismatches=$(q "SELECT COUNT(*) FROM balances b
+                  LEFT JOIN (SELECT account_id, SUM($signed) AS derived
+                             FROM entries GROUP BY account_id) d ON d.account_id = b.account_id
+                  WHERE b.raw_minor <> COALESCE(d.derived, 0)")
+  if [[ "$mismatches" != "0" ]]; then FAIL "$mismatches account balance(s) disagree with their entries"; else ok "integrity (all $accounts balances match their entries)"; fi
+else
+  unbalanced=$(q "SELECT COUNT(DISTINCT transaction_id) FROM (
+                    SELECT transaction_id FROM entries GROUP BY transaction_id, currency
+                    HAVING SUM($signed) <> 0) x")
+  if [[ "$unbalanced" != "0" ]]; then FAIL "$unbalanced transaction(s) do not balance"; else ok "integrity (every transaction balances; reconcile the restored cluster against this journal)"; fi
+fi
 
 # ---- 6. checkpoint chain ----------------------------------------------------------------------
 if [[ $SKIP_CHAIN -eq 1 ]]; then

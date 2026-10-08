@@ -1,9 +1,12 @@
 // After every run the database must agree with physics (conservation, balances = entries) and
 // with what the client was told: every acknowledged money move exists exactly as asked, no
-// refused one exists, and nothing else touched the run's wallets.
+// refused one exists, and nothing else touched the run's wallets. Balances are the backend's
+// (LEDGER_BACKEND, as the server ran with): `balances`, or the TigerBeetle cluster.
 
 use std::collections::{HashMap, HashSet};
 
+use api::Ledger;
+use ledger::AccountId;
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -70,12 +73,47 @@ fn same_legs(mut got: Vec<(Uuid, i64)>, want: &[(Uuid, i64)]) -> bool {
     got == want
 }
 
+/// Stored balances of `ids` from the backend (raw, credit positive); absent ones are missing.
+async fn stored(ledger: &Ledger, ids: &[Uuid]) -> Result<HashMap<Uuid, i64>, String> {
+    match ledger {
+        Ledger::Postgres(l) => {
+            let rows = sqlx::query(
+                "SELECT account_id, raw_minor FROM balances WHERE account_id = ANY($1)",
+            )
+            .bind(ids)
+            .fetch_all(l.pool())
+            .await
+            .map_err(|e| format!("verify: {e}"))?;
+            Ok(rows
+                .iter()
+                .map(|r| (r.get("account_id"), r.get("raw_minor")))
+                .collect())
+        }
+        Ledger::TigerBeetle(l) => {
+            let ids: Vec<AccountId> = ids.iter().copied().map(AccountId).collect();
+            let raw = l
+                .tb()
+                .raw_balances(&ids)
+                .await
+                .map_err(|e| format!("verify: {e}"))?;
+            raw.into_iter()
+                .map(|(id, raw)| {
+                    i64::try_from(raw)
+                        .map(|r| (id.as_uuid(), r))
+                        .map_err(|_| format!("verify: balance of {id} beyond BIGINT"))
+                })
+                .collect()
+        }
+    }
+}
+
 pub async fn verify(
-    pool: &PgPool,
+    ledger: &Ledger,
     wallets: &[Uuid],
     funding: &[Funding],
     rec: &Recorder,
 ) -> Result<Verification, String> {
+    let pool = ledger.pool();
     let db = |e: sqlx::Error| format!("verify: {e}");
     let mut v = Verification {
         acknowledged: rec.posted.len(),
@@ -83,23 +121,39 @@ pub async fn verify(
         ..Verification::default()
     };
 
-    v.unbalanced_currencies = sqlx::query_scalar(
-        "SELECT a.currency FROM balances b JOIN accounts a ON a.id = b.account_id
-         GROUP BY a.currency HAVING SUM(b.raw_minor) <> 0 ORDER BY 1",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(db)?;
-    v.balance_mismatches = sqlx::query_scalar(
-        "SELECT count(*) FROM balances b
-         LEFT JOIN (SELECT account_id,
-                           SUM(CASE direction WHEN 'credit' THEN amount_minor ELSE -amount_minor END) AS s
-                    FROM entries GROUP BY account_id) e ON e.account_id = b.account_id
-         WHERE b.raw_minor <> COALESCE(e.s, 0)",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(db)?;
+    v.unbalanced_currencies = ledger
+        .conservation()
+        .await
+        .map_err(|e| format!("verify: {e}"))?
+        .into_iter()
+        .filter(|(_, net)| *net != 0)
+        .map(|(currency, _)| currency)
+        .collect();
+    v.balance_mismatches = match ledger {
+        Ledger::Postgres(_) => sqlx::query_scalar(
+            "SELECT count(*) FROM balances b
+             LEFT JOIN (SELECT account_id,
+                               SUM(CASE direction WHEN 'credit' THEN amount_minor ELSE -amount_minor END) AS s
+                        FROM entries GROUP BY account_id) e ON e.account_id = b.account_id
+             WHERE b.raw_minor <> COALESCE(e.s, 0)",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(db)?,
+        // The server is gone, so every reservation it left can be settled now, and then the
+        // cluster must equal the journal account for account.
+        Ledger::TigerBeetle(l) => {
+            l.recover_quiesced().await.map_err(|e| format!("verify: {e}"))?;
+            let all: Vec<AccountId> = sqlx::query_scalar("SELECT id FROM accounts")
+                .fetch_all(pool)
+                .await
+                .map_err(db)?
+                .into_iter()
+                .map(AccountId)
+                .collect();
+            l.reconcile(&all).await.map_err(|e| format!("verify: {e}"))?.len() as i64
+        }
+    };
 
     let wallet_set: HashSet<Uuid> = wallets.iter().copied().collect();
     let ids: Vec<Uuid> = rec.posted.iter().map(|p| p.id).collect();
@@ -158,16 +212,10 @@ pub async fn verify(
         .await
         .map_err(db)?;
         v.unexpected_transactions += touching.iter().filter(|t| !known.contains(t)).count();
-        let rows =
-            sqlx::query("SELECT account_id, raw_minor FROM balances WHERE account_id = ANY($1)")
-                .bind(chunk)
-                .fetch_all(pool)
-                .await
-                .map_err(db)?;
-        v.wallet_drift += chunk.len() - rows.len();
-        for r in rows {
-            let id: Uuid = r.get("account_id");
-            if expected.get(&id).copied() != Some(r.get::<i64, _>("raw_minor")) {
+        let found = stored(ledger, chunk).await?;
+        v.wallet_drift += chunk.len() - found.len();
+        for (id, raw) in found {
+            if expected.get(&id).copied() != Some(raw) {
                 v.wallet_drift += 1;
             }
         }

@@ -18,18 +18,22 @@
 //! the backstop for a recovery worker that is down.
 
 use std::future::Future;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use ledger::{Account as LedgerAccount, LedgerError, Transaction};
+use ledger::{Account as LedgerAccount, AccountId, LedgerError, NormalSide, Transaction};
 use sqlx::{Connection, PgConnection, PgPool};
 use storage::{HookError, IdempotencyRecord, PostOptions, PostgresLedger, StorageError};
 use uuid::Uuid;
 
 use crate::client::{transfer_flags as tf, TbClient, Transfer, TransferResult, AMOUNT_MAX};
-use crate::error::{first_failure, Result, TbError};
+use crate::error::{first_failure, leg_failure, LegFailure, Result, TbError};
 use crate::ids::{self, leg};
 use crate::plan::Leg;
 use crate::tb::{link, low64, TbLedger};
+
+/// How often a reservation refused only for others' holds is retried (doubling).
+const HOLD_BACKOFF_MIN: Duration = Duration::from_millis(1);
+const HOLD_BACKOFF_MAX: Duration = Duration::from_millis(50);
 
 /// Points where a test can kill the protocol (`testkit`): the process "dies" there, leaving
 /// TigerBeetle and Postgres exactly as a crash would.
@@ -278,6 +282,14 @@ impl<C: TbClient> HybridLedger<C> {
         opts: PostOptions,
         probe: &P,
     ) -> Result<()> {
+        // A savepoint is not a commit point: the post would follow a COMMIT the caller's
+        // transaction can still undo.
+        if conn.is_in_transaction() {
+            return Err(StorageError::DataIntegrity(
+                "HybridLedger::post_on needs a connection outside any transaction".into(),
+            )
+            .into());
+        }
         txn.validate()?;
         let plan = self.tb.plan(txn).await?;
         if plan.legs.is_empty() {
@@ -287,16 +299,34 @@ impl<C: TbClient> HybridLedger<C> {
                 Err(Commit::RolledBack(e) | Commit::Unknown(e) | Commit::Crashed(e)) => Err(e),
             };
         }
-        let attempt = Attempt {
-            base: ids::new_attempt(),
-            transaction: txn.id.as_uuid().as_u128(),
-            legs: plan.legs.clone(),
+        let waiting_since = Instant::now();
+        let mut backoff = HOLD_BACKOFF_MIN;
+        let (attempt, started) = loop {
+            // Fresh ids every try: TigerBeetle remembers ids that failed for funds.
+            let attempt = Attempt {
+                base: ids::new_attempt(),
+                transaction: txn.id.as_uuid().as_u128(),
+                legs: plan.legs.clone(),
+            };
+            let started = Instant::now();
+            let reserve = attempt.reserve(self.tb.config().pending_timeout_secs);
+            let Some((i, r)) = first_failure(&self.tb.create(reserve).await?) else {
+                break (attempt, started);
+            };
+            // Short only because of holds of requests still in flight, which may yet void:
+            // wait for them as `PostgresLedger` waits for the wallet's row lock, so a hold
+            // never turns into an insufficient-funds answer the committed balance contradicts.
+            if !self.held_by_others(&plan, i, r).await? {
+                return Err(self.reserve_failed(txn, &plan, i, r).await);
+            }
+            if waiting_since.elapsed() >= self.tb.config().hold_wait {
+                return Err(TbError::Retry(
+                    "the funds are held by requests still in flight",
+                ));
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(HOLD_BACKOFF_MAX);
         };
-        let started = Instant::now();
-        let reserve = attempt.reserve(self.tb.config().pending_timeout_secs);
-        if let Some((i, r)) = first_failure(&self.tb.create(reserve).await?) {
-            return Err(self.reserve_failed(txn, &plan, i, r).await);
-        }
         crash(probe, Step::Reserved).await?;
 
         match self
@@ -333,6 +363,35 @@ impl<C: TbClient> HybridLedger<C> {
             tracing::error!(attempt = %hex(attempt.base), transaction = %txn.id, error = %e, "post left to recovery");
         }
         Ok(())
+    }
+
+    /// Whether leg `i` failed for funds only because of other reservations: the account's
+    /// posted balance covers the transaction's net effect on it. The holds that refused it may
+    /// already be gone by this read (voided or posted; found by the live runs), and a posted
+    /// balance that rose since says the same: either way the next attempt decides.
+    async fn held_by_others(
+        &self,
+        plan: &crate::plan::Plan,
+        i: usize,
+        r: TransferResult,
+    ) -> Result<bool> {
+        let LegFailure::Insufficient { debit_side } = leg_failure(r) else {
+            return Ok(false);
+        };
+        let leg = plan.legs[i];
+        let id = if debit_side { leg.debit } else { leg.credit };
+        let account = AccountId(Uuid::from_u128(id));
+        let info = self.tb.account_info(&[account]).await?;
+        let Some(info) = info.get(&account) else {
+            return Ok(false);
+        };
+        let b = self.tb.balances(&[account]).await?[0];
+        let after = b.raw + plan.deltas[&id];
+        let after = match info.account_type.normal_side() {
+            NormalSide::Credit => after,
+            NormalSide::Debit => -after,
+        };
+        Ok(after >= 0)
     }
 
     async fn reserve_failed(
@@ -372,8 +431,9 @@ impl<C: TbClient> HybridLedger<C> {
         attempt: Option<(&Attempt, Instant)>,
         probe: &P,
     ) -> core::result::Result<(), Commit> {
+        // Generic plans, as `PostgresLedger::post_on` uses (its comment has the measurements).
         let mut db = conn
-            .begin()
+            .begin_with("BEGIN; SET LOCAL plan_cache_mode = force_generic_plan")
             .await
             .map_err(|e| Commit::RolledBack(e.into()))?;
         // Roll back explicitly: until it happens the claim and intent keys stay locked, and
@@ -592,7 +652,11 @@ fn posted_event_payload(txn: &Transaction) -> serde_json::Value {
 }
 
 /// The journal `PostgresLedger` writes, minus the balance rows TigerBeetle now owns: the
-/// entries (statements, sealing, reconciliation), the outbox event and the idempotency record.
+/// entries (statements, sealing, reconciliation, and the AML windows' trigger), the outbox
+/// event and the idempotency record. The last statement before COMMIT, so it also lifts
+/// statement_timeout for the COMMIT (`storage::commit_durable` explains why): a COMMIT the
+/// timeout cancelled while it waited for a synchronous standby would read as success for a
+/// transaction a failover can still lose, and its post would then move money no journal holds.
 async fn mirror(
     db: &mut PgConnection,
     txn: &Transaction,
@@ -624,11 +688,13 @@ async fn mirror(
          ), o AS (
              INSERT INTO outbox (id, aggregate_id, event_type, payload)
              VALUES ($7::uuid, $1, 'transaction.posted', $8::jsonb)
+         ), i AS (
+             INSERT INTO idempotency_keys (key, fingerprint, response_status, response_body)
+             SELECT $9::uuid, $10::text, $11::int, $12::jsonb
+             WHERE $9::uuid IS NOT NULL
+             ON CONFLICT (key) DO NOTHING
          )
-         INSERT INTO idempotency_keys (key, fingerprint, response_status, response_body)
-         SELECT $9::uuid, $10::text, $11::int, $12::jsonb
-         WHERE $9::uuid IS NOT NULL
-         ON CONFLICT (key) DO NOTHING",
+         SELECT set_config('statement_timeout', '0', true)",
     )
     .bind(txn.id.as_uuid())
     .bind(&ids)

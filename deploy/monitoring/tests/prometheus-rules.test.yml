@@ -113,6 +113,95 @@ tests:
               summary: "2 payment-workers replicas believe they are the leader"
               description: "Workers' DATABASE_URL must be a direct/session-mode connection (never transaction-mode pgbouncer): concurrent sealers would fork the checkpoint chain."
 
+  # LEDGER_BACKEND=postgres exports no TigerBeetle series: every TigerBeetle rule is quiet.
+  - interval: 1m
+    input_series:
+      - series: 'worker_leader{job="payment-workers",instance="w:9101"}'
+        values: '1x120'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: TigerBeetleRecoveryStale
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: TigerBeetleForcedRepost
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: TigerBeetleProtocolError
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: TigerBeetleUnavailable
+        exp_alerts: []
+
+  # The leader's recovery passes succeed every minute, then stop at 10m. A replica that lost
+  # leadership long ago exports a stale success time: it must not count.
+  - interval: 1m
+    input_series:
+      - series: 'worker_leader{job="payment-workers",instance="w:9101"}'
+        values: '1x20'
+      - series: 'tigerbeetle_recovery_last_success_timestamp_seconds{job="payment-workers",instance="w:9101"}'
+        values: '0+60x10 600x10'
+      - series: 'worker_leader{job="payment-workers",instance="w2:9101"}'
+        values: '0x20'
+      - series: 'tigerbeetle_recovery_last_success_timestamp_seconds{job="payment-workers",instance="w2:9101"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: TigerBeetleRecoveryStale
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: TigerBeetleRecoveryStale
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: TigerBeetleRecoveryStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No successful TigerBeetle recovery pass for 4m 0s"
+              description: "Abandoned reservations are not being settled. Is the cluster reachable from payment-workers (TIGERBEETLE_ADDRESSES)? See `tigerbeetle_recovery_errors_total` and `docker compose logs payment-workers tigerbeetle`."
+
+  # A forced re-post, a protocol violation in recovery, and requests shed for an unreachable
+  # cluster (one a second, from the API).
+  - interval: 1m
+    input_series:
+      - series: 'tigerbeetle_recovered_total{job="payment-workers",instance="w:9101",outcome="forced",by="recovery"}'
+        values: '0 0 0 1 1 1 1 1 1 1'
+      - series: 'tigerbeetle_recovery_errors_total{job="payment-workers",instance="w:9101",kind="protocol"}'
+        values: '0 0 0 0 1 1 1 1 1 1'
+      - series: 'tigerbeetle_request_errors_total{job="payment-api",instance="a:9100",kind="unavailable"}'
+        values: '0+60x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: TigerBeetleForcedRepost
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: TigerBeetleProtocolError
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: TigerBeetleForcedRepost
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "1 committed transaction(s) re-posted after their reservation expired"
+              description: "Recovery was down for longer than half the pending timeout. Find out why (TigerBeetleRecoveryStale, worker logs: 'expired reservation re-posted') and check reconciliation."
+      - eval_time: 9m
+        alertname: TigerBeetleProtocolError
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "TigerBeetle protocol violation (1 in 10 min)"
+              description: "A post, void or recovery met a result the protocol rules out (e.g. a committed transaction that could not be re-posted). Money may need repair by hand: preserve logs ('tigerbeetle protocol violation'), stop money movement, reconcile."
+      - eval_time: 9m
+        alertname: TigerBeetleUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Money requests are failing with TigerBeetle unavailable (1.00/s)"
+              description: "Is the cluster up and reachable (`docker compose ps tigerbeetle`, replica logs)?"
+
   # Full chain verification: last run at t=0, every 6 h expected.
   - interval: 1m
     input_series:

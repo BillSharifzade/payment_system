@@ -36,6 +36,9 @@ env:
   CADDY_IMAGE: caddy:2.11.7@sha256:f2a1290d0463aad60660d4ec134943f183ee2a5f6c3eb7bf32dd984f2f020772
   TRIVY_IMAGE: aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
   GITLEAKS_IMAGE: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  # Builds TigerBeetle's native client (the `tigerbeetle` features); as in tigerbeetle.yml.
+  ZIG_VERSION: "0.14.1"
+  ZIG_SHA256: 24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
 
 jobs:
   rust:
@@ -113,6 +116,20 @@ jobs:
 
       - name: Format check
         run: cargo fmt --all -- --check
+
+      # `--all-features` includes LEDGER_BACKEND=tigerbeetle's native client (the api and
+      # workers `tigerbeetle` features), which compiles with Zig and the runner's libclang:
+      # the same pinned Zig step as tigerbeetle.yml, so the lint below covers every feature on
+      # every PR. Everything else here builds without it.
+      - name: Zig ${{ env.ZIG_VERSION }} (builds TigerBeetle's native client)
+        run: |
+          set -euo pipefail
+          archive="zig-x86_64-linux-$ZIG_VERSION"
+          curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" "https://ziglang.org/download/$ZIG_VERSION/$archive.tar.xz"
+          echo "$ZIG_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          rm "$RUNNER_TEMP/zig.tar.xz"
+          echo "ZIG_PATH=$RUNNER_TEMP/$archive/zig" >> "$GITHUB_ENV"
 
       - name: Clippy (warnings = errors)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -300,7 +317,8 @@ jobs:
           set -euo pipefail
           cd deploy
           printf '%s\n' 'ADMIN_ALLOW_CIDR=203.0.113.7/32' 'LAN_BIND_ADDRESS=192.168.1.156' \
-            'GRAFANA_PASSWORD=ci' 'ALERT_WEBHOOK_URL=http://example/ci' 'ALERT_HEARTBEAT_URL=http://example/hb' > .env
+            'GRAFANA_PASSWORD=ci' 'ALERT_WEBHOOK_URL=http://example/ci' 'ALERT_HEARTBEAT_URL=http://example/hb' \
+            'TIGERBEETLE_CLUSTER_ID=1' > .env
           mkdir -p secrets
           for s in postgres_password pg_owner_password pg_app_password pg_backup_password pg_monitor_password \
                    database_url migration_database_url jwt_secret worker_signing_key worker_trusted_public_keys \
@@ -315,7 +333,11 @@ jobs:
                        docker-compose.lan.yml:docker-compose.monitoring.yml \
                        docker-compose.prod.yml:docker-compose.anchor.yml \
                        docker-compose.prod.yml:docker-compose.vault.yml:docker-compose.anchor.yml \
-                       docker-compose.lan.yml:docker-compose.anchor.yml; do
+                       docker-compose.lan.yml:docker-compose.anchor.yml \
+                       docker-compose.prod.yml:docker-compose.tigerbeetle.yml \
+                       docker-compose.prod.yml:docker-compose.monitoring.yml:docker-compose.tigerbeetle.yml \
+                       docker-compose.prod.yml:docker-compose.vault.yml:docker-compose.anchor.yml:docker-compose.tigerbeetle.yml \
+                       docker-compose.lan.yml:docker-compose.tigerbeetle.yml; do
             echo "compose config: $combo"
             COMPOSE_FILE=$combo docker compose config -q
           done
@@ -328,6 +350,21 @@ jobs:
           COMPOSE_FILE=docker-compose.prod.yml:docker-compose.vault.yml:docker-compose.anchor.yml docker compose config --format json \
             | jq -e '(.services."payment-workers".networks | keys | sort) == ["backend", "egress", "vault"]
                      and .services."payment-workers".environment.ANCHOR_RFC3161_CERTS_FILE == "/etc/payment/tsa-certs.pem"'
+          # The TigerBeetle overlay: the replica publishes nothing and sits alone with the two
+          # app services on an internal network, at the address both are given (the client
+          # resolves no names); the image is built with the native client.
+          COMPOSE_FILE=docker-compose.prod.yml:docker-compose.monitoring.yml:docker-compose.tigerbeetle.yml docker compose config --format json \
+            | jq -e '[.services | to_entries[] | select(.value.ports) | .key] | sort == ["caddy", "grafana"]'
+          COMPOSE_FILE=docker-compose.prod.yml:docker-compose.tigerbeetle.yml docker compose config --format json \
+            | jq -e '.networks.tigerbeetle.internal == true
+                     and ([.services | to_entries[] | select((.value.networks // {}) | has("tigerbeetle")) | .key] | sort)
+                         == ["payment-server", "payment-workers", "tigerbeetle"]
+                     and (.services.tigerbeetle.networks.tigerbeetle.ipv4_address + ":3000") as $tb
+                     | .services."payment-server".environment.TIGERBEETLE_ADDRESSES == $tb
+                       and .services."payment-workers".environment.TIGERBEETLE_ADDRESSES == $tb
+                       and .services."payment-server".environment.LEDGER_BACKEND == "tigerbeetle"
+                       and .services."payment-workers".environment.LEDGER_BACKEND == "tigerbeetle"
+                       and .services."payment-server".build.args.TIGERBEETLE == "1"'
           rm -rf secrets anchor .env app.env
 
       - name: End-to-end backup + restore drill (images from this run)

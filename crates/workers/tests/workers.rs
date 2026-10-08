@@ -1,5 +1,6 @@
 use crypto::{Sealer, TrustedKeys};
 use ledger::{Account, AccountId, AccountType, Entry, Transaction};
+use ledger_tigerbeetle::{AnyTb, HybridLedger, TbLedger};
 use money::{Currency, Money};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
@@ -8,8 +9,9 @@ use storage::{LedgerStore, PostgresLedger};
 use uuid::Uuid;
 use workers::{
     prune_expired, reconcile, reconcile_full, reconcile_incremental, relay_all, seal_all,
-    verify_chain, verify_chain_from, EventPublisher, FullReconciliation, LeaderLock, NatsPublisher,
-    OutboxEvent, PublishError, ReconcileConfig, RetentionConfig, VerifyState, WorkerError,
+    verify_chain, verify_chain_from, Balances, EventPublisher, FullReconciliation, LeaderLock,
+    NatsPublisher, OutboxEvent, PublishError, ReconcileConfig, RetentionConfig, VerifyState,
+    WorkerError,
 };
 
 // The tests share one database and its single checkpoint chain, so they run
@@ -44,16 +46,110 @@ fn tjs() -> Currency {
     Currency::tjs()
 }
 
-async fn setup() -> (PgPool, PostgresLedger) {
+async fn setup() -> (PgPool, TestLedger) {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&url)
         .await
         .unwrap();
-    let ledger = PostgresLedger::new(pool.clone());
-    ledger.migrate().await.unwrap();
-    (pool, ledger)
+    let pg = PostgresLedger::new(pool.clone());
+    pg.migrate().await.unwrap();
+    (pool, TestLedger::new(pg).await)
+}
+
+/// The ledger the suite posts through, `TEST_LEDGER_BACKEND`: `postgres` (default) or
+/// `tigerbeetle` (the hybrid against a live cluster, `TIGERBEETLE_ADDRESSES`; build with
+/// `--features tigerbeetle`). Reconciliation reads every account in the database, so the
+/// TigerBeetle lane needs a database used with nothing but that cluster.
+enum TestLedger {
+    Postgres(PostgresLedger),
+    TigerBeetle(HybridLedger<AnyTb>),
+}
+
+impl TestLedger {
+    async fn new(pg: PostgresLedger) -> Self {
+        match std::env::var("TEST_LEDGER_BACKEND").as_deref() {
+            Err(_) | Ok("postgres") => TestLedger::Postgres(pg),
+            Ok("tigerbeetle") => {
+                let ledger = HybridLedger::new(live_cluster(), pg);
+                ledger.open_system_accounts().await.unwrap();
+                TestLedger::TigerBeetle(ledger)
+            }
+            Ok(other) => panic!("TEST_LEDGER_BACKEND={other:?}: postgres or tigerbeetle"),
+        }
+    }
+
+    fn balances(&self) -> Balances<'_> {
+        match self {
+            TestLedger::Postgres(_) => Balances::Postgres,
+            TestLedger::TigerBeetle(l) => Balances::TigerBeetle(l),
+        }
+    }
+
+    async fn open_account(&self, account: &Account) -> storage::Result<()> {
+        match self {
+            TestLedger::Postgres(l) => l.open_account(account).await,
+            TestLedger::TigerBeetle(l) => Ok(l.open_account(account).await?),
+        }
+    }
+
+    async fn post(&self, txn: &Transaction) -> storage::Result<()> {
+        match self {
+            TestLedger::Postgres(l) => l.post(txn).await,
+            TestLedger::TigerBeetle(l) => Ok(l.post(txn).await?),
+        }
+    }
+
+    /// Moves `account`'s stored balance by `delta` behind the journal's back: `balances` under
+    /// Postgres; under TigerBeetle a transfer straight into the cluster, whose other side is
+    /// `counterpart` (TigerBeetle has no one-sided change). Returns the accounts that drifted.
+    async fn drift(
+        &self,
+        pool: &PgPool,
+        account: AccountId,
+        counterpart: AccountId,
+        delta: i64,
+    ) -> Vec<Uuid> {
+        match self {
+            TestLedger::Postgres(_) => {
+                sqlx::query("UPDATE balances SET raw_minor = raw_minor + $2 WHERE account_id = $1")
+                    .bind(account.as_uuid())
+                    .bind(delta)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+                vec![account.as_uuid()]
+            }
+            TestLedger::TigerBeetle(l) => {
+                let (from, to) = if delta > 0 {
+                    (counterpart, account)
+                } else {
+                    (account, counterpart)
+                };
+                l.tb()
+                    .post_direct(&transfer(from, to, delta.unsigned_abs() as i128))
+                    .await
+                    .unwrap();
+                let mut both = vec![account.as_uuid(), counterpart.as_uuid()];
+                both.sort();
+                both
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tigerbeetle")]
+fn live_cluster() -> TbLedger<AnyTb> {
+    use ledger_tigerbeetle::{TbClient, TbConfig};
+    let tb = AnyTb::Live(Arc::new(ledger_tigerbeetle::LiveTb::from_test_env()));
+    let cfg = TbConfig::new(tb.cluster_id(), "test");
+    TbLedger::new(tb, cfg)
+}
+
+#[cfg(not(feature = "tigerbeetle"))]
+fn live_cluster() -> TbLedger<AnyTb> {
+    panic!("TEST_LEDGER_BACKEND=tigerbeetle needs `--features tigerbeetle`")
 }
 
 /// Runs `sql` with triggers disabled — what a superuser tampering with the
@@ -81,7 +177,7 @@ struct Books {
     bob: AccountId,
 }
 
-async fn open_books(ledger: &PostgresLedger) -> Books {
+async fn open_books(ledger: &TestLedger) -> Books {
     let books = Books {
         settlement: AccountId::new(),
         alice: AccountId::new(),
@@ -136,7 +232,10 @@ async fn seal_verify_and_detect_tampering() {
         .await
         .expect("chain should verify");
     assert!(report.checkpoints_verified >= 1);
-    assert!(reconcile(&pool).await.unwrap().is_healthy());
+    assert!(reconcile(&pool, ledger.balances())
+        .await
+        .unwrap()
+        .is_healthy());
 
     let row = sqlx::query(
         "SELECT id, amount_minor FROM entries
@@ -161,7 +260,7 @@ async fn seal_verify_and_detect_tampering() {
 
     let (_, reason) = broken_reason(verify_chain(&pool, &trusted()).await);
     assert!(reason.contains("Merkle root"), "{reason}");
-    let tampered = reconcile(&pool).await.unwrap();
+    let tampered = reconcile(&pool, ledger.balances()).await.unwrap();
     assert!(!tampered.is_healthy());
     assert!(tampered
         .balance_mismatches
@@ -179,7 +278,10 @@ async fn seal_verify_and_detect_tampering() {
     verify_chain(&pool, &trusted())
         .await
         .expect("chain verifies again after restore");
-    assert!(reconcile(&pool).await.unwrap().is_healthy());
+    assert!(reconcile(&pool, ledger.balances())
+        .await
+        .unwrap()
+        .is_healthy());
 }
 
 #[tokio::test]
@@ -418,7 +520,10 @@ async fn incremental_reconciliation_uses_the_watermark() {
     let (pool, ledger) = setup().await;
     let cfg = ReconcileConfig::default();
     seal_all(&pool, &key_b(), 500).await.unwrap();
-    assert!(reconcile(&pool).await.unwrap().is_healthy());
+    assert!(reconcile(&pool, ledger.balances())
+        .await
+        .unwrap()
+        .is_healthy());
 
     let b = open_books(&ledger).await;
     ledger
@@ -428,13 +533,17 @@ async fn incremental_reconciliation_uses_the_watermark() {
     ledger.post(&transfer(b.alice, b.bob, 1_000)).await.unwrap();
 
     // Unsealed transactions are reconciled from the tail.
-    let pass = reconcile_incremental(&pool, &cfg, &[]).await.unwrap();
+    let pass = reconcile_incremental(&pool, &cfg, &[], ledger.balances())
+        .await
+        .unwrap();
     assert!(pass.is_healthy(), "{pass:?}");
     assert_eq!(pass.accounts_checked, 3);
     assert_eq!(pass.transactions_folded, 0);
 
     seal_all(&pool, &key_b(), 500).await.unwrap();
-    let pass = reconcile_incremental(&pool, &cfg, &[]).await.unwrap();
+    let pass = reconcile_incremental(&pool, &cfg, &[], ledger.balances())
+        .await
+        .unwrap();
     assert!(pass.is_healthy(), "{pass:?}");
     assert_eq!(pass.transactions_folded, 2);
     let base: i64 =
@@ -444,7 +553,9 @@ async fn incremental_reconciliation_uses_the_watermark() {
             .await
             .unwrap();
     assert_eq!(base, 8_000);
-    let pass = reconcile_incremental(&pool, &cfg, &[]).await.unwrap();
+    let pass = reconcile_incremental(&pool, &cfg, &[], ledger.balances())
+        .await
+        .unwrap();
     assert_eq!(
         (pass.accounts_checked, pass.transactions_folded),
         (0, 0),
@@ -452,42 +563,50 @@ async fn incremental_reconciliation_uses_the_watermark() {
     );
 
     // A drifted balance is caught when its account is next touched...
-    let drift = "UPDATE balances SET raw_minor = raw_minor + $2 WHERE account_id = $1";
-    let mut tx = pool.begin().await.unwrap();
-    sqlx::query(drift)
-        .bind(b.bob.as_uuid())
-        .bind(5i64)
-        .execute(&mut *tx)
+    let drifted = ledger.drift(&pool, b.bob, b.settlement, 5).await;
+    let pass = reconcile_incremental(&pool, &cfg, &[], ledger.balances())
         .await
         .unwrap();
-    tx.commit().await.unwrap();
-    let pass = reconcile_incremental(&pool, &cfg, &[]).await.unwrap();
     assert!(
         pass.is_healthy(),
         "bob untouched: not visible incrementally"
     );
-    let full = reconcile_full(&pool, &cfg).await.unwrap();
-    assert_eq!(full.balance_mismatches.len(), 1);
-    assert_eq!(full.balance_mismatches[0].account_id, b.bob.as_uuid());
-    assert_eq!(full.currency_imbalances, vec![("TJS".to_string(), 5)]);
+    let full = reconcile_full(&pool, &cfg, ledger.balances())
+        .await
+        .unwrap();
+    let mut found: Vec<Uuid> = full
+        .balance_mismatches
+        .iter()
+        .map(|m| m.account_id)
+        .collect();
+    found.sort();
+    assert_eq!(found, drifted, "{full:?}");
+    match ledger {
+        // `balances` lost conservation; TigerBeetle cannot, and the journal still has it.
+        TestLedger::Postgres(_) => {
+            assert_eq!(full.currency_imbalances, vec![("TJS".to_string(), 5)])
+        }
+        TestLedger::TigerBeetle(_) => assert_eq!(full.currency_imbalances, vec![]),
+    }
 
     ledger.post(&transfer(b.alice, b.bob, 1)).await.unwrap();
-    let pass = reconcile_incremental(&pool, &cfg, &[]).await.unwrap();
+    let pass = reconcile_incremental(&pool, &cfg, &[], ledger.balances())
+        .await
+        .unwrap();
     assert_eq!(pass.balance_mismatches.len(), 1, "{pass:?}");
     assert_eq!(pass.balance_mismatches[0].stored_minor, 1_006);
     assert_eq!(pass.balance_mismatches[0].derived_minor, 1_001);
 
     // ...and keeps being reported, as a suspect, until it is fixed.
     let suspects = [b.bob.as_uuid()];
-    let pass = reconcile_incremental(&pool, &cfg, &suspects).await.unwrap();
-    assert_eq!(pass.balance_mismatches.len(), 1);
-    sqlx::query(drift)
-        .bind(b.bob.as_uuid())
-        .bind(-5i64)
-        .execute(&pool)
+    let pass = reconcile_incremental(&pool, &cfg, &suspects, ledger.balances())
         .await
         .unwrap();
-    let pass = reconcile_incremental(&pool, &cfg, &suspects).await.unwrap();
+    assert_eq!(pass.balance_mismatches.len(), 1);
+    ledger.drift(&pool, b.bob, b.settlement, -5).await;
+    let pass = reconcile_incremental(&pool, &cfg, &suspects, ledger.balances())
+        .await
+        .unwrap();
     assert!(pass.is_healthy());
 
     // The sums table itself is audited by the full pass.
@@ -498,7 +617,9 @@ async fn incremental_reconciliation_uses_the_watermark() {
         .execute(&pool)
         .await
         .unwrap();
-    let full = reconcile_full(&pool, &cfg).await.unwrap();
+    let full = reconcile_full(&pool, &cfg, ledger.balances())
+        .await
+        .unwrap();
     assert_eq!(full.sum_mismatches.len(), 1, "{full:?}");
     assert_eq!(full.sum_mismatches[0].account_id, b.alice.as_uuid());
     assert!(full.balance_mismatches.is_empty());
@@ -508,7 +629,10 @@ async fn incremental_reconciliation_uses_the_watermark() {
         .execute(&pool)
         .await
         .unwrap();
-    assert!(reconcile(&pool).await.unwrap().is_healthy());
+    assert!(reconcile(&pool, ledger.balances())
+        .await
+        .unwrap()
+        .is_healthy());
 }
 
 #[tokio::test]
@@ -516,7 +640,10 @@ async fn incremental_reconciliation_uses_the_watermark() {
 async fn reconciliation_works_in_bounded_chunks() {
     let (pool, ledger) = setup().await;
     seal_all(&pool, &key_b(), 500).await.unwrap();
-    assert!(reconcile(&pool).await.unwrap().is_healthy());
+    assert!(reconcile(&pool, ledger.balances())
+        .await
+        .unwrap()
+        .is_healthy());
 
     let b = open_books(&ledger).await;
     ledger
@@ -542,7 +669,9 @@ async fn reconciliation_works_in_bounded_chunks() {
     let mut calls = 0;
     let mut unchecked = 0;
     loop {
-        let pass = reconcile_incremental(&pool, &cfg, &[]).await.unwrap();
+        let pass = reconcile_incremental(&pool, &cfg, &[], ledger.balances())
+            .await
+            .unwrap();
         calls += 1;
         unchecked += pass.folded_unchecked;
         if !pass.backlog_remaining {
@@ -566,19 +695,31 @@ async fn reconciliation_works_in_bounded_chunks() {
         .unwrap();
     let ours = || async {
         let mut full = FullReconciliation::starting_after(Uuid::from_u128(first - 1));
-        while !full.step(&pool, &cfg).await.unwrap() {}
+        while !full.step(&pool, &cfg, ledger.balances()).await.unwrap() {}
         full.into_report()
     };
     let full = ours().await;
     assert!(full.is_healthy(), "{full:?}");
     assert!(full.accounts_checked >= 3);
-    let drift = "UPDATE balances SET raw_minor = raw_minor + $2 WHERE account_id = $1";
-    sqlx::query(drift)
-        .bind(b.alice.as_uuid())
-        .bind(3i64)
-        .execute(&pool)
-        .await
+    let drifted = ledger.drift(&pool, b.alice, b.settlement, 3).await;
+    let full = ours().await;
+    let mut found: Vec<Uuid> = full
+        .balance_mismatches
+        .iter()
+        .map(|m| m.account_id)
+        .collect();
+    found.sort();
+    assert_eq!(found, drifted, "{full:?}");
+    let alice = full
+        .balance_mismatches
+        .iter()
+        .find(|m| m.account_id == b.alice.as_uuid())
         .unwrap();
+    assert_eq!(alice.stored_minor - alice.derived_minor, 3);
+    assert!(full.sum_mismatches.is_empty(), "{full:?}");
+
+    // A skewed sum is audited on its own. (Under TigerBeetle the balance re-check derives
+    // through those sums, so alice's reported difference then includes the skew.)
     let skew = "UPDATE reconciled_sums SET sum_minor = sum_minor + $2 WHERE account_id = $1";
     sqlx::query(skew)
         .bind(b.alice.as_uuid())
@@ -587,23 +728,19 @@ async fn reconciliation_works_in_bounded_chunks() {
         .await
         .unwrap();
     let full = ours().await;
-    assert_eq!(full.balance_mismatches.len(), 1, "{full:?}");
-    assert_eq!(full.balance_mismatches[0].account_id, b.alice.as_uuid());
-    assert_eq!(
-        full.balance_mismatches[0].stored_minor - full.balance_mismatches[0].derived_minor,
-        3
-    );
+    let mut found: Vec<Uuid> = full
+        .balance_mismatches
+        .iter()
+        .map(|m| m.account_id)
+        .collect();
+    found.sort();
+    assert_eq!(found, drifted, "{full:?}");
     assert_eq!(full.sum_mismatches.len(), 1, "{full:?}");
     assert_eq!(
         full.sum_mismatches[0].stored_minor - full.sum_mismatches[0].derived_minor,
         4
     );
-    sqlx::query(drift)
-        .bind(b.alice.as_uuid())
-        .bind(-3i64)
-        .execute(&pool)
-        .await
-        .unwrap();
+    ledger.drift(&pool, b.alice, b.settlement, -3).await;
     sqlx::query(skew)
         .bind(b.alice.as_uuid())
         .bind(-4i64)

@@ -1,5 +1,5 @@
 //! The slice of the TigerBeetle client API this backend uses. It is a trait so the protocol runs
-//! unchanged against a real cluster (the `live` crate wraps the native client) and against
+//! unchanged against a real cluster (`LiveTb`, feature `native-client`) and against
 //! [`SimTb`](crate::SimTb), the in-process model the workspace tests use. Field layout, flag
 //! bits and result codes are TigerBeetle's own wire values (`tb_client.h`, release 0.16/0.17).
 

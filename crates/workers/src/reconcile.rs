@@ -1,8 +1,22 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Duration;
 
 use crate::error::{Result, WorkerError};
+use ledger::AccountId;
+use ledger_tigerbeetle::{AnyTb, HybridLedger, RecoveryReport};
 use sqlx::{PgConnection, PgPool, Postgres, Row};
 use uuid::Uuid;
+
+/// Where the balances under reconciliation are stored.
+#[derive(Clone, Copy)]
+pub enum Balances<'a> {
+    /// The `balances` table, read in the reconciliation's own snapshot.
+    Postgres,
+    /// TigerBeetle (`LEDGER_BACKEND=tigerbeetle`, which no longer writes `balances`). Its
+    /// balances are read outside the snapshot, so a mismatch may only be a committed post
+    /// still in flight; each one is re-checked exactly after a recovery pass ([`confirm`]).
+    TigerBeetle(&'a HybridLedger<AnyTb>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileConfig {
@@ -52,6 +66,12 @@ pub struct ReconciliationReport {
     pub folded_unchecked: i64,
     /// The backlog was not fully folded in this call and no check ran.
     pub backlog_remaining: bool,
+    /// TigerBeetle: accounts whose re-check kept meeting posts applied while it read them
+    /// (a very busy account), so it could neither confirm nor clear them. Not a mismatch;
+    /// the caller re-checks them on its next pass.
+    pub inconclusive: Vec<Uuid>,
+    /// TigerBeetle: the recovery passes the re-checks ran first.
+    pub recovered: RecoveryReport,
 }
 
 impl ReconciliationReport {
@@ -68,11 +88,22 @@ impl ReconciliationReport {
             .extend(other.unbalanced_transactions);
         self.balance_mismatches.extend(other.balance_mismatches);
         self.sum_mismatches.extend(other.sum_mismatches);
+        self.inconclusive.extend(other.inconclusive);
+        absorb(&mut self.recovered, &other.recovered);
         self.accounts_checked += other.accounts_checked;
         self.transactions_folded += other.transactions_folded;
         self.folded_unchecked += other.folded_unchecked;
         self.backlog_remaining = other.backlog_remaining;
     }
+}
+
+fn absorb(into: &mut RecoveryReport, r: &RecoveryReport) {
+    into.scanned += r.scanned;
+    into.settled += r.settled;
+    into.posted += r.posted;
+    into.forced += r.forced;
+    into.voided += r.voided;
+    into.watermark = into.watermark.max(r.watermark);
 }
 
 /// Ids of the transactions not yet folded into `reconciled_sums`: sealed after
@@ -142,6 +173,7 @@ pub async fn reconcile_incremental(
     pool: &PgPool,
     cfg: &ReconcileConfig,
     also_check: &[Uuid],
+    balances: Balances<'_>,
 ) -> Result<ReconciliationReport> {
     let mut report = ReconciliationReport::default();
     let chunk = cfg.fold_chunk.max(1);
@@ -216,22 +248,230 @@ pub async fn reconcile_incremental(
         .fetch_all(&mut *db)
         .await?;
         report.accounts_checked += rows.len() as i64;
+        let mut checked = Vec::with_capacity(rows.len());
         for row in rows {
-            let stored_minor: i64 = row.try_get("stored")?;
-            let derived_minor: i64 = row.try_get("derived")?;
-            if stored_minor != derived_minor {
-                report.balance_mismatches.push(BalanceMismatch {
-                    account_id: row.try_get("id")?,
+            checked.push(BalanceMismatch {
+                account_id: row.try_get("id")?,
+                stored_minor: row.try_get("stored")?,
+                derived_minor: row.try_get("derived")?,
+            });
+        }
+
+        report.transactions_folded += fold(&mut db, after, sealed_max).await?;
+        db.commit().await?;
+        compare(pool, balances, checked, &mut report, Derive::Folded).await?;
+        return Ok(report);
+    }
+}
+
+/// How [`confirm`] derives an account's balance from the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Derive {
+    /// `reconciled_sums` plus the tail: O(transactions since the last fold), what the
+    /// incremental pass compares with. Trusts the folded sums, which the full pass audits.
+    Folded,
+    /// Every entry of the account: what the full pass compares with for accounts small
+    /// enough to sum in one statement.
+    Entries,
+}
+
+/// Keeps the accounts whose stored balance differs from the derived one. `checked` carries
+/// `balances` as stored; under TigerBeetle the cluster's balance replaces it, and a
+/// difference counts only once [`confirm`] proves it.
+async fn compare(
+    pool: &PgPool,
+    balances: Balances<'_>,
+    mut checked: Vec<BalanceMismatch>,
+    report: &mut ReconciliationReport,
+    derive: Derive,
+) -> Result<()> {
+    let Balances::TigerBeetle(ledger) = balances else {
+        report.balance_mismatches.extend(
+            checked
+                .into_iter()
+                .filter(|m| m.stored_minor != m.derived_minor),
+        );
+        return Ok(());
+    };
+    let ids: Vec<AccountId> = checked.iter().map(|m| AccountId(m.account_id)).collect();
+    let tb = ledger.tb().raw_balances(&ids).await?;
+    let mut suspects = Vec::new();
+    for m in &mut checked {
+        m.stored_minor = stored_minor(&tb, m.account_id)?;
+        if m.stored_minor != m.derived_minor {
+            suspects.push(m.account_id);
+        }
+    }
+    if suspects.is_empty() {
+        return Ok(());
+    }
+    let confirmed = confirm(pool, ledger, &suspects, derive).await?;
+    report.balance_mismatches.extend(confirmed.mismatches);
+    report.inconclusive.extend(confirmed.inconclusive);
+    absorb(&mut report.recovered, &confirmed.recovered);
+    Ok(())
+}
+
+fn stored_minor(tb: &HashMap<AccountId, i128>, id: Uuid) -> Result<i64> {
+    let raw = tb.get(&AccountId(id)).copied().unwrap_or(0);
+    i64::try_from(raw).map_err(|_| {
+        WorkerError::DataIntegrity(format!("tigerbeetle balance of {id} is beyond BIGINT"))
+    })
+}
+
+/// What [`confirm`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Confirmation {
+    pub mismatches: Vec<BalanceMismatch>,
+    pub inconclusive: Vec<Uuid>,
+    pub recovered: RecoveryReport,
+}
+
+/// How far TigerBeetle's and Postgres's clocks may disagree: a transaction committed after a
+/// recovery pass began is at most this much older on the Postgres clock than its
+/// reservation is on the cluster's.
+const CLOCK_SKEW: Duration = Duration::from_secs(60);
+/// Reads of one re-check that may meet a post landing between them before it gives up.
+const CONFIRM_ATTEMPTS: usize = 5;
+
+/// The exact re-check of accounts whose TigerBeetle balance differed from the journal.
+///
+/// A post is applied after its Postgres COMMIT, so the cluster may lag the journal by the
+/// transactions committed but not yet posted — and only by those. A recovery pass first
+/// posts every committed attempt older than the recovery grace. Then the cluster balance is
+/// read between two readings of the cluster's newest timestamp `n0` and `n1`, and the journal
+/// in a snapshot taken after it, with each account's recent transactions (committed since the
+/// pass began, less the grace and [`CLOCK_SKEW`]: no other one can still be unposted). Each of
+/// those whose post is missing, or was applied after `n1`, was not in the read; one applied
+/// at or before `n0` was. So `cluster = journal − those not in the read`, exactly — unless a
+/// post landed between `n0` and `n1`, when the account is read again (at most
+/// [`CONFIRM_ATTEMPTS`] times, then reported inconclusive).
+pub async fn confirm(
+    pool: &PgPool,
+    ledger: &HybridLedger<AnyTb>,
+    accounts: &[Uuid],
+    derive: Derive,
+) -> Result<Confirmation> {
+    let began: f64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM now())::FLOAT8")
+        .fetch_one(pool)
+        .await?;
+    let mut out = Confirmation {
+        recovered: ledger.recover().await?,
+        ..Confirmation::default()
+    };
+    let since = began - (ledger.tb().config().recovery_grace + CLOCK_SKEW).as_secs_f64();
+    let cluster = Uuid::from_u128(ledger_tigerbeetle::TbClient::cluster_id(
+        ledger.tb().client(),
+    ));
+    let mut pending: Vec<Uuid> = accounts.to_vec();
+    for _ in 0..CONFIRM_ATTEMPTS {
+        if pending.is_empty() {
+            break;
+        }
+        let ids: Vec<AccountId> = pending.iter().copied().map(AccountId).collect();
+        let n0 = ledger.tb().newest_timestamp().await?;
+        let tb = ledger.tb().raw_balances(&ids).await?;
+        let n1 = ledger.tb().newest_timestamp().await?;
+
+        let mut db = snapshot(pool).await?;
+        let derived: HashMap<Uuid, i64> = match derive {
+            Derive::Folded => {
+                let through = watermark(&mut db).await?;
+                sqlx::query_as(concat!(
+                    "WITH tail AS (
+                         SELECT e.account_id,
+                                SUM(CASE e.direction WHEN 'credit' THEN e.amount_minor
+                                                     ELSE -e.amount_minor END)::BIGINT AS tail
+                         FROM (",
+                    tail_ids!("$2"),
+                    ") t JOIN entries e ON e.transaction_id = t.id
+                         WHERE e.account_id = ANY($1)
+                         GROUP BY e.account_id
+                     )
+                     SELECT u.id, COALESCE(r.sum_minor, 0) + COALESCE(tl.tail, 0)
+                     FROM UNNEST($1::uuid[]) AS u(id)
+                     LEFT JOIN reconciled_sums r ON r.account_id = u.id
+                     LEFT JOIN tail tl ON tl.account_id = u.id"
+                ))
+                .bind(&pending)
+                .bind(through)
+                .fetch_all(&mut *db)
+                .await?
+            }
+            Derive::Entries => {
+                sqlx::query_as(
+                    "SELECT e.account_id,
+                            SUM(CASE e.direction WHEN 'credit' THEN e.amount_minor
+                                                 ELSE -e.amount_minor END)::BIGINT
+                     FROM entries e WHERE e.account_id = ANY($1)
+                     GROUP BY e.account_id",
+                )
+                .bind(&pending)
+                .fetch_all(&mut *db)
+                .await?
+            }
+        }
+        .into_iter()
+        .collect();
+        // Transactions from before the cut-over moved into the cluster as opening balances.
+        let recent: Vec<(Uuid, Uuid, i64)> = sqlx::query_as(
+            "SELECT e.transaction_id, e.account_id,
+                    SUM(CASE e.direction WHEN 'credit' THEN e.amount_minor
+                                         ELSE -e.amount_minor END)::BIGINT
+             FROM entries e JOIN transactions t ON t.id = e.transaction_id
+             WHERE e.account_id = ANY($1) AND e.created_at >= to_timestamp($2)
+               AND t.seq > COALESCE((SELECT through_seq FROM tb_cutover
+                                     WHERE cluster_id = $3), 0)
+             GROUP BY e.transaction_id, e.account_id
+             HAVING SUM(CASE e.direction WHEN 'credit' THEN e.amount_minor
+                                         ELSE -e.amount_minor END) <> 0",
+        )
+        .bind(&pending)
+        .bind(since)
+        .bind(cluster)
+        .fetch_all(&mut *db)
+        .await?;
+        db.commit().await?;
+
+        let txns: Vec<Uuid> = recent
+            .iter()
+            .map(|(t, _, _)| *t)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let posted = ledger.tb().posted_at(&txns).await?;
+        let mut unposted: HashMap<Uuid, i64> = HashMap::new();
+        let mut ambiguous: HashSet<Uuid> = HashSet::new();
+        for (txn, account, signed) in recent {
+            match posted.get(&txn) {
+                Some(&at) if at <= n0 => {}
+                Some(&at) if at <= n1 => {
+                    ambiguous.insert(account);
+                }
+                _ => *unposted.entry(account).or_default() += signed,
+            }
+        }
+        let mut again = Vec::new();
+        for id in pending {
+            if ambiguous.contains(&id) {
+                again.push(id);
+                continue;
+            }
+            let stored_minor = stored_minor(&tb, id)?;
+            let derived_minor = derived.get(&id).copied().unwrap_or(0);
+            let in_flight = unposted.get(&id).copied().unwrap_or(0);
+            if derived_minor.checked_sub(in_flight) != Some(stored_minor) {
+                out.mismatches.push(BalanceMismatch {
+                    account_id: id,
                     stored_minor,
                     derived_minor,
                 });
             }
         }
-
-        report.transactions_folded += fold(&mut db, after, sealed_max).await?;
-        db.commit().await?;
-        return Ok(report);
+        pending = again;
     }
+    out.inconclusive = pending;
+    Ok(out)
 }
 
 enum Unit {
@@ -293,20 +533,45 @@ impl FullReconciliation {
     }
 
     /// Runs one bounded unit of work. Returns true once the pass is complete.
-    pub async fn step(&mut self, pool: &PgPool, cfg: &ReconcileConfig) -> Result<bool> {
+    pub async fn step(
+        &mut self,
+        pool: &PgPool,
+        cfg: &ReconcileConfig,
+        balances: Balances<'_>,
+    ) -> Result<bool> {
         if self.done {
             return Ok(true);
         }
         if !self.started {
             self.started = true;
-            let rows = sqlx::query(
-                "SELECT a.currency, SUM(b.raw_minor)::BIGINT AS total
-                 FROM balances b JOIN accounts a ON a.id = b.account_id
-                 GROUP BY a.currency
-                 HAVING SUM(b.raw_minor) <> 0",
-            )
-            .fetch_all(pool)
-            .await?;
+            // TigerBeetle conserves per ledger by construction (every transfer debits and
+            // credits one ledger), so there what must sum to zero is the journal: the
+            // reconciled sums plus the tail, one statement, one snapshot.
+            let sql = match balances {
+                Balances::Postgres => {
+                    "SELECT a.currency, SUM(b.raw_minor)::BIGINT AS total
+                     FROM balances b JOIN accounts a ON a.id = b.account_id
+                     GROUP BY a.currency
+                     HAVING SUM(b.raw_minor) <> 0"
+                }
+                Balances::TigerBeetle(_) => concat!(
+                    "WITH w AS (SELECT through_sealed_seq AS s FROM reconcile_watermark),
+                     j AS (
+                         SELECT account_id, sum_minor AS raw FROM reconciled_sums
+                         UNION ALL
+                         SELECT e.account_id, CASE e.direction WHEN 'credit' THEN e.amount_minor
+                                                               ELSE -e.amount_minor END
+                         FROM (",
+                    tail_ids!("(SELECT s FROM w)"),
+                    ") t JOIN entries e ON e.transaction_id = t.id
+                     )
+                     SELECT a.currency, SUM(j.raw)::BIGINT AS total
+                     FROM j JOIN accounts a ON a.id = j.account_id
+                     GROUP BY a.currency
+                     HAVING SUM(j.raw) <> 0"
+                ),
+            };
+            let rows = sqlx::query(sql).fetch_all(pool).await?;
             for row in rows {
                 self.report
                     .currency_imbalances
@@ -317,12 +582,14 @@ impl FullReconciliation {
         if let Some(paged) = self.paging.as_mut() {
             if page_account(pool, paged, cfg.full_chunk_entries).await? {
                 let paged = self.paging.take().expect("checked above");
-                finish_account(pool, &paged, &mut self.report).await?;
+                finish_account(pool, &paged, &mut self.report, balances).await?;
             }
             return Ok(false);
         }
         match self.queue.pop_front() {
-            Some(Unit::Accounts(ids)) => check_accounts(pool, &ids, &mut self.report).await?,
+            Some(Unit::Accounts(ids)) => {
+                check_accounts(pool, &ids, &mut self.report, balances).await?
+            }
             Some(Unit::Large(id)) => {
                 let through = watermark(&mut *pool.acquire().await?).await?;
                 self.paging = Some(PagedAccount {
@@ -333,7 +600,7 @@ impl FullReconciliation {
                 });
             }
             None => {
-                if !self.plan(pool, cfg).await? {
+                if !self.plan(pool, cfg, balances).await? {
                     self.done = true;
                 }
             }
@@ -341,17 +608,33 @@ impl FullReconciliation {
         Ok(self.done)
     }
 
-    async fn plan(&mut self, pool: &PgPool, cfg: &ReconcileConfig) -> Result<bool> {
-        let rows = sqlx::query(
-            "SELECT a.id, COALESCE(b.version, 0) AS version
-             FROM accounts a LEFT JOIN balances b ON b.account_id = a.id
-             WHERE a.id > $1 ORDER BY a.id LIMIT $2",
-        )
-        .bind(self.after)
-        .bind(PLAN_ACCOUNTS)
-        .fetch_all(pool)
-        .await?;
+    async fn plan(
+        &mut self,
+        pool: &PgPool,
+        cfg: &ReconcileConfig,
+        balances: Balances<'_>,
+    ) -> Result<bool> {
         let budget = cfg.full_chunk_entries.max(1);
+        // Without balance rows (TigerBeetle) the entries themselves are counted, along the
+        // statement index and no further than the budget.
+        let sql = match balances {
+            Balances::Postgres => {
+                "SELECT a.id, COALESCE(b.version, 0) AS version
+                 FROM accounts a LEFT JOIN balances b ON b.account_id = a.id
+                 WHERE a.id > $1 ORDER BY a.id LIMIT $2"
+            }
+            Balances::TigerBeetle(_) => {
+                "SELECT a.id, (SELECT count(*) FROM (SELECT 1 FROM entries e
+                                                    WHERE e.account_id = a.id LIMIT $3) x)
+                                  AS version
+                 FROM accounts a WHERE a.id > $1 ORDER BY a.id LIMIT $2"
+            }
+        };
+        let mut query = sqlx::query(sql).bind(self.after).bind(PLAN_ACCOUNTS);
+        if let Balances::TigerBeetle(_) = balances {
+            query = query.bind(budget + 1);
+        }
+        let rows = query.fetch_all(pool).await?;
         let mut group = Vec::new();
         let mut cost = 0i64;
         for row in rows {
@@ -383,6 +666,7 @@ async fn check_accounts(
     pool: &PgPool,
     ids: &[Uuid],
     report: &mut ReconciliationReport,
+    balances: Balances<'_>,
 ) -> Result<()> {
     let mut db = snapshot(pool).await?;
     let through = watermark(&mut db).await?;
@@ -415,18 +699,17 @@ async fn check_accounts(
     .bind(through)
     .fetch_all(&mut *db)
     .await?;
+    db.commit().await?;
     report.accounts_checked += rows.len() as i64;
+    let mut checked = Vec::with_capacity(rows.len());
     for row in rows {
         let account_id: Uuid = row.try_get("id")?;
-        let stored_minor: i64 = row.try_get("stored")?;
         let derived_minor: i64 = row.try_get("derived")?;
-        if stored_minor != derived_minor {
-            report.balance_mismatches.push(BalanceMismatch {
-                account_id,
-                stored_minor,
-                derived_minor,
-            });
-        }
+        checked.push(BalanceMismatch {
+            account_id,
+            stored_minor: row.try_get("stored")?,
+            derived_minor,
+        });
         let base: i64 = row.try_get("base")?;
         let through_w = derived_minor
             .checked_sub(row.try_get("tail")?)
@@ -439,7 +722,7 @@ async fn check_accounts(
             });
         }
     }
-    Ok(())
+    compare(pool, balances, checked, report, Derive::Entries).await
 }
 
 /// Sums the next page of a large account's entries (newest first, along the
@@ -490,6 +773,7 @@ async fn finish_account(
     pool: &PgPool,
     paged: &PagedAccount,
     report: &mut ReconciliationReport,
+    balances: Balances<'_>,
 ) -> Result<()> {
     let mut db = snapshot(pool).await?;
     let row = sqlx::query(concat!(
@@ -529,14 +813,8 @@ async fn finish_account(
     let derived_minor = expected_base
         .checked_add(row.try_get("tail")?)
         .ok_or_else(overflow)?;
+    db.commit().await?;
     report.accounts_checked += 1;
-    if stored_minor != derived_minor {
-        report.balance_mismatches.push(BalanceMismatch {
-            account_id: paged.id,
-            stored_minor,
-            derived_minor,
-        });
-    }
     if base != expected_base {
         report.sum_mismatches.push(BalanceMismatch {
             account_id: paged.id,
@@ -544,28 +822,37 @@ async fn finish_account(
             derived_minor: expected_base,
         });
     }
-    Ok(())
+    let checked = BalanceMismatch {
+        account_id: paged.id,
+        stored_minor,
+        derived_minor,
+    };
+    compare(pool, balances, vec![checked], report, Derive::Folded).await
 }
 
-pub async fn reconcile_full(pool: &PgPool, cfg: &ReconcileConfig) -> Result<ReconciliationReport> {
+pub async fn reconcile_full(
+    pool: &PgPool,
+    cfg: &ReconcileConfig,
+    balances: Balances<'_>,
+) -> Result<ReconciliationReport> {
     let mut full = FullReconciliation::new();
-    while !full.step(pool, cfg).await? {}
+    while !full.step(pool, cfg, balances).await? {}
     Ok(full.into_report())
 }
 
 /// Brings the reconciled sums up to date, then checks every account.
-pub async fn reconcile(pool: &PgPool) -> Result<ReconciliationReport> {
+pub async fn reconcile(pool: &PgPool, balances: Balances<'_>) -> Result<ReconciliationReport> {
     let cfg = ReconcileConfig::default();
     let mut report = ReconciliationReport::default();
     loop {
-        let pass = reconcile_incremental(pool, &cfg, &[]).await?;
+        let pass = reconcile_incremental(pool, &cfg, &[], balances).await?;
         let more = pass.backlog_remaining;
         report.merge(pass);
         if !more {
             break;
         }
     }
-    report.merge(reconcile_full(pool, &cfg).await?);
+    report.merge(reconcile_full(pool, &cfg, balances).await?);
     Ok(report)
 }
 

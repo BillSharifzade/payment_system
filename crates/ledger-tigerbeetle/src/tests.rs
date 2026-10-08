@@ -1,6 +1,6 @@
 //! The shared suites against `SimTb`. Those needing Postgres are ignored by default, like the
-//! storage ones: `DATABASE_URL=… cargo test -p ledger-tigerbeetle -- --ignored`. The `live`
-//! crate runs the same suites against a real cluster.
+//! storage ones: `DATABASE_URL=… cargo test -p ledger-tigerbeetle -- --ignored`.
+//! `tests/live.rs` (feature `native-client`) runs the same suites against a real cluster.
 
 use std::time::Duration;
 
@@ -52,6 +52,18 @@ async fn double_spend_same_id_and_aml_races() {
 #[ignore = "requires PostgreSQL (DATABASE_URL)"]
 async fn postgres_balances_cut_over_into_tigerbeetle() {
     import_cutover(SimTb::new()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL (DATABASE_URL)"]
+async fn timestamps_bound_what_a_read_saw() {
+    timestamps(SimTb::new(), &postgres().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL (DATABASE_URL)"]
+async fn a_post_waits_for_holds_in_flight_like_for_a_row_lock() {
+    holds(SimTb::new(), &postgres().await).await;
 }
 
 /// Lost replies, which only the model can inject: TigerBeetle applied a request the caller

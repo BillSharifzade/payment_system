@@ -49,12 +49,23 @@ pub struct TbConfig {
     /// `TIGERBEETLE_RECOVERY_GRACE_SECS` (default 10): recovery leaves younger reservations to
     /// the request that made them. Correctness does not depend on it, only on whom it fails.
     pub recovery_grace: Duration,
+    /// `TIGERBEETLE_SESSIONS` (default 1, at most 16): client sessions per process. A session
+    /// has one request in flight and batches concurrent calls into the next; more sessions
+    /// pipeline requests in the replica, and each takes a slot in the cluster's client table.
+    pub sessions: usize,
+    /// `TIGERBEETLE_HOLD_WAIT_MS` (default 2000, at most 30000): how long a post refused only
+    /// because other requests' reservations hold the funds waits for them to post or void,
+    /// as a Postgres post waits for a wallet's row lock (`DB_LOCK_TIMEOUT_MS`); then it fails
+    /// as retryable (503), never as insufficient funds the committed balance contradicts.
+    pub hold_wait: Duration,
 }
 
 impl TbConfig {
     pub const DEFAULT_PENDING_TIMEOUT_SECS: u32 = 120;
     pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
     pub const DEFAULT_RECOVERY_GRACE_SECS: u64 = 10;
+    pub const MAX_SESSIONS: usize = 16;
+    pub const DEFAULT_HOLD_WAIT_MS: u64 = 2_000;
 
     pub fn new(cluster_id: u128, addresses: impl Into<String>) -> Self {
         Self {
@@ -63,6 +74,8 @@ impl TbConfig {
             pending_timeout_secs: Self::DEFAULT_PENDING_TIMEOUT_SECS,
             request_timeout: Duration::from_millis(Self::DEFAULT_REQUEST_TIMEOUT_MS),
             recovery_grace: Duration::from_secs(Self::DEFAULT_RECOVERY_GRACE_SECS),
+            sessions: 1,
+            hold_wait: Duration::from_millis(Self::DEFAULT_HOLD_WAIT_MS),
         }
     }
 
@@ -110,6 +123,13 @@ impl TbConfig {
         )? {
             cfg.recovery_grace = Duration::from_secs(s);
         }
+        if let Some(n) = parse("TIGERBEETLE_SESSIONS", get("TIGERBEETLE_SESSIONS"))? {
+            cfg.sessions = n;
+        }
+        if let Some(ms) = parse::<u64>("TIGERBEETLE_HOLD_WAIT_MS", get("TIGERBEETLE_HOLD_WAIT_MS"))?
+        {
+            cfg.hold_wait = Duration::from_millis(ms);
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -133,6 +153,19 @@ impl TbConfig {
                 "TIGERBEETLE_RECOVERY_GRACE_SECS={grace} must be 1..=600"
             ));
         }
+        if self.hold_wait > Duration::from_secs(30) {
+            return Err(format!(
+                "TIGERBEETLE_HOLD_WAIT_MS={} must be 0..=30000",
+                self.hold_wait.as_millis()
+            ));
+        }
+        if !(1..=Self::MAX_SESSIONS).contains(&self.sessions) {
+            return Err(format!(
+                "TIGERBEETLE_SESSIONS={} must be 1..={}",
+                self.sessions,
+                Self::MAX_SESSIONS
+            ));
+        }
         if self
             .commit_budget()
             .is_some_and(|b| self.recovery_grace >= b)
@@ -146,9 +179,14 @@ impl TbConfig {
     }
 }
 
+/// What the client accepts: a port (on 127.0.0.1), `ipv4:port` or `[ipv6]:port`. It does not
+/// resolve names, so a hostname is refused here rather than when connecting.
 fn parse_addresses(raw: &str) -> Result<String, String> {
     let bad = || {
-        format!("TIGERBEETLE_ADDRESSES={raw:?} must be a comma-separated list of port or host:port")
+        format!(
+            "TIGERBEETLE_ADDRESSES={raw:?} must be a comma-separated list of port, ipv4:port or \
+             [ipv6]:port (the client resolves no names)"
+        )
     };
     let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
     if parts.is_empty() || parts.len() > 6 {
@@ -156,8 +194,16 @@ fn parse_addresses(raw: &str) -> Result<String, String> {
     }
     for p in &parts {
         let port = match p.rsplit_once(':') {
-            Some((host, port)) if !host.is_empty() => port,
-            Some(_) => return Err(bad()),
+            Some((host, port)) => {
+                let ip = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+                    Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+                    None => host.parse::<std::net::Ipv4Addr>().is_ok(),
+                };
+                if !ip {
+                    return Err(bad());
+                }
+                port
+            }
             None => p,
         };
         if port.parse::<u16>().ok().filter(|p| *p > 0).is_none() {
@@ -201,11 +247,19 @@ mod tests {
             ("TIGERBEETLE_ADDRESSES", "3000,"),
             ("TIGERBEETLE_ADDRESSES", ":3000"),
             ("TIGERBEETLE_ADDRESSES", "host:http"),
+            ("TIGERBEETLE_ADDRESSES", "tigerbeetle:3000"),
+            ("TIGERBEETLE_ADDRESSES", "10.0.0.300:3000"),
+            ("TIGERBEETLE_ADDRESSES", "[::1:3000"),
             ("TIGERBEETLE_PENDING_TIMEOUT_SECS", "5"),
             ("TIGERBEETLE_PENDING_TIMEOUT_SECS", "1m"),
             ("TIGERBEETLE_REQUEST_TIMEOUT_MS", "0"),
             ("TIGERBEETLE_RECOVERY_GRACE_SECS", "0"),
             ("TIGERBEETLE_RECOVERY_GRACE_SECS", "60"),
+            ("TIGERBEETLE_SESSIONS", "0"),
+            ("TIGERBEETLE_SESSIONS", "17"),
+            ("TIGERBEETLE_SESSIONS", "two"),
+            ("TIGERBEETLE_HOLD_WAIT_MS", "30001"),
+            ("TIGERBEETLE_HOLD_WAIT_MS", "-1"),
         ] {
             let mut vars = base.to_vec();
             vars.retain(|(key, _)| *key != k);
@@ -216,6 +270,14 @@ mod tests {
         never.push(("TIGERBEETLE_PENDING_TIMEOUT_SECS", "0"));
         never.push(("TIGERBEETLE_RECOVERY_GRACE_SECS", "600"));
         assert_eq!(cfg(&never).unwrap().commit_budget(), None);
+        let mut sessions = base.to_vec();
+        sessions.push(("TIGERBEETLE_SESSIONS", "4"));
+        assert_eq!(cfg(&sessions).unwrap().sessions, 4);
+        let v6 = [
+            ("TIGERBEETLE_CLUSTER_ID", "7"),
+            ("TIGERBEETLE_ADDRESSES", "[::1]:3000,3001"),
+        ];
+        assert_eq!(cfg(&v6).unwrap().addresses, "[::1]:3000,3001");
 
         assert_eq!("tigerbeetle".parse(), Ok(Backend::TigerBeetle));
         assert!("TigerBeetle".parse::<Backend>().is_err());

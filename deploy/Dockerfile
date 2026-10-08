@@ -41,15 +41,44 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # ---- builder ------------------------------------------------------------
 FROM chef AS builder
+# LEDGER_BACKEND=tigerbeetle needs the binaries built with TigerBeetle's native
+# client, which compiles with Zig and libclang. Only on request:
+#   docker build --build-arg TIGERBEETLE=1 -f deploy/Dockerfile -t payment-system:<tag> .
+# (deploy/docker-compose.tigerbeetle.yml sets it, so ./deploy.sh does). Zig is pinned by version
+# and SHA-256, as in .github/workflows/tigerbeetle.yml; x86_64 builders only
+# until an aarch64 archive is pinned too.
+ARG TIGERBEETLE=0
+ARG ZIG_VERSION=0.14.1
+ARG ZIG_SHA256=24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
+RUN case "$TIGERBEETLE" in \
+      0) ;; \
+      1) test "$(uname -m)" = x86_64 \
+           || { echo "TIGERBEETLE=1: only the x86_64 Zig archive is pinned" >&2; exit 1; } \
+         && apt-get update \
+         && apt-get install -y --no-install-recommends libclang-dev xz-utils \
+         && rm -rf /var/lib/apt/lists/* \
+         && curl -fsSL -o /tmp/zig.tar.xz \
+              "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+         && echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - \
+         && tar -xJf /tmp/zig.tar.xz -C /opt && rm /tmp/zig.tar.xz \
+         && ln -s "/opt/zig-x86_64-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig ;; \
+      *) echo "TIGERBEETLE must be 0 or 1, not '$TIGERBEETLE'" >&2; exit 1 ;; \
+    esac
 COPY --from=planner /build/recipe.json recipe.json
 # Compiles ONLY the dependency graph. This layer is reused until Cargo.lock or
 # a crate manifest changes.
-RUN cargo chef cook --release --locked --recipe-path recipe.json
+RUN if [ "$TIGERBEETLE" = 1 ]; then \
+      export ZIG_PATH=/usr/local/bin/zig; set -- --features api/tigerbeetle,workers/tigerbeetle; \
+    fi \
+    && cargo chef cook --release --locked "$@" --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # The storage crate embeds migrations/ at compile time (sqlx::migrate!).
 COPY migrations ./migrations
-RUN cargo build --release --locked --bin payment-server --bin payment-workers \
+RUN if [ "$TIGERBEETLE" = 1 ]; then \
+      export ZIG_PATH=/usr/local/bin/zig; set -- --features api/tigerbeetle,workers/tigerbeetle; \
+    fi \
+    && cargo build --release --locked "$@" --bin payment-server --bin payment-workers \
     && mkdir -p /out/kyc-docs \
     && cp target/release/payment-server target/release/payment-workers /out/
 

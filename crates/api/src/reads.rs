@@ -2,7 +2,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use ledger::{Account, AccountId, AccountType, LedgerError};
-use money::{Currency, Money};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use storage::StorageError;
@@ -131,35 +130,35 @@ pub struct WalletResponse {
 }
 
 pub(crate) async fn wallets_of(state: &AppState, owner: Uuid) -> ApiResult<Vec<WalletResponse>> {
-    let rows = sqlx::query(
-        "SELECT a.id, a.currency, c.exponent, b.raw_minor
-         FROM accounts a
-         JOIN balances b ON b.account_id = a.id
-         JOIN currencies c ON c.code = a.currency
-         WHERE a.owner_user_id = $1
-         ORDER BY a.created_at",
-    )
-    .bind(owner)
-    .fetch_all(state.ledger.pool())
-    .await
-    .map_err(StorageError::from)?;
-
-    let mut wallets = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id: Uuid = row.try_get("id").map_err(StorageError::from)?;
-        let code: String = row.try_get("currency").map_err(StorageError::from)?;
-        let exponent: i16 = row.try_get("exponent").map_err(StorageError::from)?;
-        let raw_minor: i64 = row.try_get("raw_minor").map_err(StorageError::from)?;
-        let currency = Currency::new(&code, exponent as u8)
-            .map_err(|e| StorageError::DataIntegrity(e.to_string()))?;
-        wallets.push(WalletResponse {
-            id,
-            currency: code,
-            balance_minor: raw_minor,
-            display: Money::from_minor(raw_minor as i128, currency).to_string(),
-        });
-    }
-    Ok(wallets)
+    let mut conn = state
+        .ledger
+        .pool()
+        .acquire()
+        .await
+        .map_err(StorageError::from)?;
+    let ids: Vec<AccountId> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE owner_user_id = $1 ORDER BY created_at")
+            .bind(owner)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(StorageError::from)?
+            .into_iter()
+            .map(AccountId)
+            .collect();
+    let balances = state.ledger.balances(&mut *conn, &ids).await?;
+    balances
+        .into_iter()
+        .map(|b| {
+            let balance_minor = i64::try_from(b.posted.minor_units())
+                .map_err(|_| StorageError::AmountTooLarge(b.posted.minor_units()))?;
+            Ok(WalletResponse {
+                id: b.account.as_uuid(),
+                currency: b.posted.currency().code().to_string(),
+                balance_minor,
+                display: b.posted.to_string(),
+            })
+        })
+        .collect()
 }
 
 pub async fn list_wallets(

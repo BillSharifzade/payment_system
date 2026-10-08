@@ -1,16 +1,18 @@
 //! TigerBeetle's native client (via `tigerbeetle-unofficial`, release 0.16.78, wire-compatible
 //! with 0.16.4+ … 0.17.x servers) behind [`TbClient`]. The conversion is field for field; the
 //! client reports only failed events, so the results are expanded back to one per event.
+//! Feature `native-client`: building it needs Zig (`ZIG_PATH`, else the build downloads one)
+//! and libclang.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
-use ledger_tigerbeetle::testkit::Cluster;
-use ledger_tigerbeetle::{
-    Account, AccountResult, ClientError, QueryFilter, TbClient, Transfer, TransferResult,
-};
 use tb::error::{CreateAccountsError, CreateTransfersError};
 use tigerbeetle_unofficial as tb;
+
+use crate::client::{
+    Account, AccountResult, ClientError, QueryFilter, TbClient, Transfer, TransferResult,
+};
+use crate::config::TbConfig;
 
 /// A client is one session with one request in flight; concurrent calls on it are batched
 /// into its next request. The hybrid protocol makes two dependent calls per posting, so it
@@ -38,16 +40,23 @@ impl LiveTb {
         })
     }
 
-    /// `TB_ADDRESS` (default 3000), `TB_CLUSTER_ID` (default 0) and `TB_SESSIONS` (default 1).
+    pub fn from_config(cfg: &TbConfig) -> Result<Self, ClientError> {
+        Self::connect(cfg.cluster_id, &cfg.addresses, cfg.sessions)
+    }
+
+    /// For tests and the benchmark: `TIGERBEETLE_ADDRESSES` (default 3000),
+    /// `TIGERBEETLE_CLUSTER_ID` (default 0), `TIGERBEETLE_SESSIONS` (default 1).
     pub fn from_test_env() -> Self {
         let var = |k: &str, default: &str| std::env::var(k).unwrap_or_else(|_| default.into());
-        let cluster = var("TB_CLUSTER_ID", "0")
-            .parse()
-            .expect("TB_CLUSTER_ID is a u128");
-        let sessions = var("TB_SESSIONS", "1")
-            .parse()
-            .expect("TB_SESSIONS is a count");
-        Self::connect(cluster, &var("TB_ADDRESS", "3000"), sessions).expect("TigerBeetle client")
+        let cfg = TbConfig::from_lookup(|k| {
+            Some(match k {
+                "TIGERBEETLE_CLUSTER_ID" => var(k, "0"),
+                "TIGERBEETLE_ADDRESSES" => var(k, "3000"),
+                _ => std::env::var(k).ok()?,
+            })
+        })
+        .expect("TIGERBEETLE_* for the test cluster");
+        Self::from_config(&cfg).expect("TigerBeetle client")
     }
 
     fn client(&self) -> &tb::Client {
@@ -216,9 +225,10 @@ impl TbClient for LiveTb {
 }
 
 /// Cluster time is wall time: the suites really wait out pending timeouts.
-impl Cluster for LiveTb {
+#[cfg(feature = "testkit")]
+impl crate::testkit::Cluster for LiveTb {
     async fn pass_time(&self, secs: u64) {
-        tokio::time::sleep(Duration::from_secs(secs)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
     }
 
     fn short_timeout(&self) -> u32 {

@@ -12,7 +12,7 @@ for the clients, and [`deploy/README.md`](./deploy/README.md) to run it in produ
 | `crates/money` | Currency-safe integer money. No floats, ever. *(pure)* |
 | `crates/ledger` | Double-entry core: accounts, transactions, balancing and conservation invariants. *(pure)* |
 | `crates/storage` | `PostgresLedger` — durable, row-locked, concurrency-safe posting (BEGIN, claim, guard, wallet locks, one write statement, COMMIT). |
-| `crates/ledger-tigerbeetle` | Hybrid TigerBeetle backend (reserve in TigerBeetle, guards + journal in Postgres, post), crash-recovery protocol, benchmark. |
+| `crates/ledger-tigerbeetle` | `LEDGER_BACKEND=tigerbeetle` (opt-in): balances in TigerBeetle, guards + journal in Postgres (reserve → commit → post), crash recovery, cut-over/rollback, the in-process cluster model, benchmark `tb-bench`. |
 | `crates/loadtest` | `payment-loadtest`: load generator (HTTP or in process) with post-run ledger verification; A/B runner `matrix.sh`. |
 | `fuzz/` | 14 property-checking cargo-fuzz targets (nightly; `fuzz/run.sh`). |
 | `crates/auth` | Argon2id passwords, JWT access tokens, hashed rotating refresh tokens. *(pure)* |
@@ -124,7 +124,8 @@ cargo test -p workers -- --ignored --test-threads=1
 cargo build --release -p api -p loadtest && target/release/payment-loadtest \
   --database-url "$DATABASE_URL" --server-bin target/release/payment-server --workload mixed --duration 30s
 
-# Lint gate used in CI.
+# Lint gate used in CI. --all-features includes TigerBeetle's native client:
+# it needs Zig 0.14.1 (ZIG_PATH=/path/to/zig) and libclang (see below).
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -132,6 +133,53 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 (cd console && npm ci && npm run lint && npm test && npm run build)
 (cd mobile && ./gradlew :core:test :app:testDevDebugUnitTest)
 ```
+
+### The TigerBeetle backend (`LEDGER_BACKEND=tigerbeetle`, DESIGN.md §15)
+
+The default build has no TigerBeetle client and refuses `LEDGER_BACKEND=tigerbeetle`; the
+hybrid protocol itself is always compiled and tested against an in-process cluster model.
+`--features tigerbeetle` (crates `api`, `workers`, `loadtest`; `native-client` on
+`ledger-tigerbeetle`) builds TigerBeetle's client, which needs **Zig 0.14.1** (`ZIG_PATH`; the
+build otherwise tries to download one) and **libclang** (`apt install libclang-dev`, or
+`LIBCLANG_PATH`). Every suite runs against Postgres (above), the model, and a live replica —
+one cluster and one database per lane, as in production (a cluster belongs to one database):
+
+```bash
+# One single-replica cluster per lane (release 0.17.9, github.com/tigerbeetle/tigerbeetle/releases).
+for c in 0 1 2; do
+  tigerbeetle format --cluster=$c --replica=0 --replica-count=1 --development $c.tigerbeetle
+  tigerbeetle start --addresses=127.0.0.1:300$c --development $c.tigerbeetle &
+done
+
+# The crate's suites: the model, then the live cluster (serially: recovery settles everything).
+DATABASE_URL=.../payment_tb_crate cargo test -p ledger-tigerbeetle -- --ignored
+TIGERBEETLE_ADDRESSES=127.0.0.1:3000 TIGERBEETLE_CLUSTER_ID=0 DATABASE_URL=.../payment_tb_crate \
+  cargo test -p ledger-tigerbeetle --features native-client,testkit --test live -- --ignored --test-threads=1
+
+# Every api suite through the TigerBeetle backend: the model, then a live cluster.
+TEST_LEDGER_BACKEND=tigerbeetle-sim DATABASE_URL=.../payment_tb_model cargo test -p api -- --ignored
+TEST_LEDGER_BACKEND=tigerbeetle TIGERBEETLE_ADDRESSES=127.0.0.1:3001 TIGERBEETLE_CLUSTER_ID=1 \
+  DATABASE_URL=.../payment_tb_api cargo test -p api --features tigerbeetle -- --ignored
+
+# Every workers suite against a live cluster of its own.
+TEST_LEDGER_BACKEND=tigerbeetle TIGERBEETLE_ADDRESSES=127.0.0.1:3002 TIGERBEETLE_CLUSTER_ID=2 \
+  DATABASE_URL=.../payment_tb_workers cargo test -p workers --features tigerbeetle -- --ignored --test-threads=1
+```
+
+`.github/workflows/tigerbeetle.yml` runs exactly these lanes. Configuration (strictly parsed; a
+bad value refuses to boot), for `payment-server` and `payment-workers`:
+
+| Variable | Default | |
+|---|---|---|
+| `LEDGER_BACKEND` | `postgres` | `postgres` or `tigerbeetle` (needs a `--features tigerbeetle` build) |
+| `TIGERBEETLE_CLUSTER_ID` | — (required) | the u128 the data file was formatted with |
+| `TIGERBEETLE_ADDRESSES` | — (required) | replicas, comma-separated: `port`, `ipv4:port` or `[ipv6]:port` (no host names: the client does not resolve them) |
+| `TIGERBEETLE_REQUEST_TIMEOUT_MS` | 5000 | an unanswered request fails as `503 retry_later` (100–60000) |
+| `TIGERBEETLE_PENDING_TIMEOUT_SECS` | 120 | reservations the cluster voids by itself if recovery is down (0 = never, else 10–86400) |
+| `TIGERBEETLE_RECOVERY_GRACE_SECS` | 10 | recovery leaves younger reservations to their request (1–600, below half the pending timeout) |
+| `TIGERBEETLE_HOLD_WAIT_MS` | 2000 | a post refused only for other requests' holds waits this long for them, then `503` (0–30000) |
+| `TIGERBEETLE_SESSIONS` | 1 | client sessions per process (1–16) |
+| `TIGERBEETLE_RECOVERY_INTERVAL_SECS` | 2 | workers: the leader's recovery pass (1–60) |
 
 Fuzzing needs nightly: `rustup toolchain install nightly-2026-10-08 && cargo install cargo-fuzz --locked --version 0.13.2`,
 then `FUZZ_TOOLCHAIN=nightly-2026-10-08 fuzz/run.sh 60` (every target, 60 s each) or
@@ -175,6 +223,11 @@ Since the hardening pass:
   hashes anchored with RFC 3161 TSAs and OpenTimestamps
   (`docker-compose.anchor.yml`), and the signing key in Vault transit or an HSM
   (`docker-compose.vault.yml`, `WORKER_SIGNER=pkcs11`).
+- **TigerBeetle ledger (optional overlay `docker-compose.tigerbeetle.yml`)**:
+  balances and the no-overdraft rule in a TigerBeetle replica, everything else
+  in Postgres; the image is built with its client only then. Cut-over with
+  `payment-server tigerbeetle-import`, back with `tigerbeetle-rollback`
+  (deploy/README.md, "TigerBeetle").
 - **Existing installs** upgrade once with `deploy/upgrade-hardening.sh`
   (idempotent; moves secrets into files, creates the roles, transfers
   ownership), then `deploy/deploy.sh`.

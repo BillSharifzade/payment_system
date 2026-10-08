@@ -209,6 +209,17 @@ async fn run(cfg: Config) -> Result<bool, String> {
     eprintln!("seed {}", cfg.seed);
     let mut rng = Rng::new(cfg.seed);
     let admin_pool = connect(&cfg, 4).await?;
+    // The backend the verification reads balances from: LEDGER_BACKEND / TIGERBEETLE_* as the
+    // server runs with (a spawned server inherits them). Connected after the run, once the
+    // server has migrated the database.
+    let tigerbeetle = ledger_tigerbeetle::backend_from_env()?;
+    if cfg.mode == Mode::Direct && tigerbeetle.is_some() {
+        return Err(
+            "--mode direct drives PostgresLedger in-process; with LEDGER_BACKEND=tigerbeetle \
+                    use --mode http (or ledger-tigerbeetle's tb-bench)"
+                .into(),
+        );
+    }
     let setup_started = Instant::now();
     let mut server = None;
     let (target, funding, wallets) = match cfg.mode {
@@ -276,7 +287,12 @@ async fn run(cfg: Config) -> Result<bool, String> {
     drop((target, server));
 
     let verify_started = Instant::now();
-    let verification = verify::verify(&admin_pool, &wallets, &funding, &rec).await?;
+    let ledger = api::Ledger::connect(
+        tigerbeetle,
+        storage::PostgresLedger::new(admin_pool.clone()),
+    )
+    .await?;
+    let verification = verify::verify(&ledger, &wallets, &funding, &rec).await?;
     let summary = rec.summarise(measured.max(Duration::from_millis(1)), cfg.interval);
     let cpu = cpu::diff(&cpu_before, &cpu_after, summary.total.ok);
     print(&summary, &verification);

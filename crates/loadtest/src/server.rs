@@ -37,6 +37,12 @@ pub async fn spawn(cfg: &Config) -> Result<(Child, String), String> {
             "DOCUMENT_STORE_DIR",
             std::env::temp_dir().join("payment-loadtest-kyc"),
         );
+    // The ledger backend is the bench's own (its verification reads the same balances).
+    for (k, v) in std::env::vars() {
+        if k == "LEDGER_BACKEND" || k.starts_with("TIGERBEETLE_") {
+            cmd.env(k, v);
+        }
+    }
     for level in ["L1", "L2"] {
         for limit in ["PER_TX_MINOR", "DAILY_MINOR", "VELOCITY_PER_HOUR"] {
             cmd.env(format!("AML_{level}_{limit}"), NO_LIMIT);

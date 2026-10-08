@@ -82,6 +82,12 @@ any failure:
   Idempotency-Key, as a client must) that the ledger shows posted; and every wallet's balance
   equals its funding plus the legs the client knows of.
 
+Under `LEDGER_BACKEND=tigerbeetle` (build with `--features tigerbeetle`; the harness passes
+`LEDGER_BACKEND` and `TIGERBEETLE_*` on to the server it spawns) `balances` is not written:
+conservation sums the journal, and *balances = entries* becomes *cluster = journal* for every
+account after a quiesced recovery pass; wallet balances are read from the cluster. `direct`
+mode posts through `PostgresLedger` and refuses that setting.
+
 Any failed request also fails the run unless `--allow-errors` is given (invariants are always
 enforced); `--p99-ceiling-ms` adds a latency ceiling.
 
@@ -204,6 +210,29 @@ keys fixed both.
 | Batching commits (group commit in the server) | bounded first with `synchronous_commit=off` as a diagnostic (never a setting): only +3.6% (HTTP) / +5.8% (direct) at this concurrency — Postgres already groups WAL flushes; not worth the extra failure modes and proofs |
 | mimalloc in the server | server CPU 0.382 → 0.339 ms/op, throughput 1671 → 1704 ok/s (within noise), one signed run with stalls: not worth a new allocator |
 | Pool size (`DB_MAX_CONNECTIONS`) | HTTP 8 / 16 / 32 / 64: 1013 / 1235 / 1620 / 1431 ok/s; direct 1142 / 1938 / 2004 / 2020. 32 (the default) stays right for 4 cores |
+
+### Postgres vs TigerBeetle (`LEDGER_BACKEND`, October 2026)
+
+The same release binaries (`--features api/tigerbeetle,loadtest/tigerbeetle`), HTTP, 1 000
+users, 64 clients, 20 s after 5 s warm-up; every run on a fresh database and, for TigerBeetle, a
+freshly formatted single-replica 0.17.9 cluster (`--development`, same box); variants
+interleaved, order flipped per repeat; median (min–max) of 3, every run verified:
+
+| case | backend | ok/s | p50 ms | p99 ms | Postgres CPU ms/op | server CPU ms/op |
+|---|---|---|---|---|---|---|
+| uniform | postgres | 1759 (1704–1774) | 36.5 | 54.2 | 1.605 | 0.427 |
+| uniform | tigerbeetle | 1452 (1437–1523) | 42.4 | 95.7 | 1.298 | 0.474 |
+| uniform | tigerbeetle, 4 sessions | 1214 (1199–1231) | 49.0 | 131.2 | 1.374 | 0.573 |
+| hot, 1 merchant | postgres | 564 (564–597) | 79.8 | 392.7 | 2.712 | 0.704 |
+| hot, 1 merchant | tigerbeetle | **1500** (1492–1603) | 40.7 | **98.0** | 1.318 | 0.477 |
+| hot, 1 merchant | tigerbeetle, 4 sessions | 1291 (1228–1329) | 46.3 | 134.0 | 1.355 | 0.560 |
+
+Spread-out traffic pays two cluster round trips per post (reserve, then post) for less Postgres
+work; a hot recipient no longer queues on its balance row (2.7× the throughput, a quarter of
+the p99). More client sessions only added CPU on this 4-core box. To reproduce, export
+`LEDGER_BACKEND=tigerbeetle TIGERBEETLE_CLUSTER_ID=… TIGERBEETLE_ADDRESSES=…` for the harness
+itself (it verifies through the same backend and forwards the settings to the server it spawns)
+and reformat the replica before every run: a cluster belongs to one database.
 
 ### Reproduce
 

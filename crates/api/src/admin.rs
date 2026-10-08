@@ -561,21 +561,16 @@ pub async fn admin_status(
             .await
             .map_err(StorageError::from)?;
 
-    let rows = sqlx::query(
-        "SELECT a.currency, SUM(b.raw_minor)::BIGINT AS net
-         FROM balances b JOIN accounts a ON a.id = b.account_id
-         GROUP BY a.currency ORDER BY a.currency",
-    )
-    .fetch_all(state.ledger.pool())
-    .await
-    .map_err(StorageError::from)?;
-    let mut conservation = Vec::with_capacity(rows.len());
-    for row in rows {
-        conservation.push(ConservationStatus {
-            currency: row.try_get("currency").map_err(StorageError::from)?,
-            net_minor: row.try_get("net").map_err(StorageError::from)?,
-        });
-    }
+    let conservation = state
+        .ledger
+        .conservation()
+        .await?
+        .into_iter()
+        .map(|(currency, net_minor)| ConservationStatus {
+            currency,
+            net_minor,
+        })
+        .collect();
 
     Ok(Json(AdminStatusResponse {
         latest_checkpoint,
@@ -753,22 +748,16 @@ pub async fn admin_metrics(
         });
     }
 
-    let funds_rows = sqlx::query(
-        "SELECT a.currency, SUM(b.raw_minor)::BIGINT AS total
-         FROM balances b JOIN accounts a ON a.id = b.account_id
-         WHERE a.account_type = 'user_wallet'
-         GROUP BY a.currency ORDER BY a.currency",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(StorageError::from)?;
-    let mut customer_funds = Vec::with_capacity(funds_rows.len());
-    for row in funds_rows {
-        customer_funds.push(CurrencyTotal {
-            currency: row.try_get("currency").map_err(StorageError::from)?,
-            total_minor: row.try_get("total").map_err(StorageError::from)?,
-        });
-    }
+    let customer_funds = state
+        .ledger
+        .customer_funds()
+        .await?
+        .into_iter()
+        .map(|(currency, total_minor)| CurrencyTotal {
+            currency,
+            total_minor,
+        })
+        .collect();
 
     let users_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
         .fetch_one(pool)

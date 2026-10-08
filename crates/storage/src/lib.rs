@@ -231,6 +231,8 @@ impl PostgresLedger {
         Ok(currency)
     }
 
+    /// Reads `balances`, which only this backend writes: under `LEDGER_BACKEND=tigerbeetle` it
+    /// is stale, and callers read balances through the backend (`api::Ledger`).
     pub async fn balance_with_owner(&self, account_id: AccountId) -> Result<(Option<Uuid>, Money)> {
         let row = sqlx::query(
             "SELECT a.account_type, a.currency, a.owner_user_id, c.exponent, b.raw_minor

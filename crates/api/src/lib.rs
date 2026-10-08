@@ -1,4 +1,5 @@
 mod admin;
+mod backend;
 pub mod biometric;
 mod common;
 pub mod config;
@@ -14,6 +15,7 @@ mod session;
 mod terminals;
 mod transactions;
 
+pub use backend::Ledger;
 pub use biometric::{BiometricConfig, MatcherBackend};
 pub use config::{DeviceBinding, DeviceConfig};
 pub use error::{ApiError, ApiResult};
@@ -187,7 +189,7 @@ impl DepositConfig {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub ledger: PostgresLedger,
+    pub ledger: Ledger,
     pub auth: AuthConfig,
     pub rate_limit: RateLimitState,
     pub login_limit: RateLimitState,

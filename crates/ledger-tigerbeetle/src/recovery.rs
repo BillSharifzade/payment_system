@@ -53,6 +53,13 @@ impl<C: TbClient> HybridLedger<C> {
             .await
     }
 
+    /// A pass with no grace, for when nothing is in flight (the cut-over commands, after a
+    /// load test): it settles every reservation, so a request still running would lose its
+    /// reservation and fail as retryable — safe, but not what a serving system wants.
+    pub async fn recover_quiesced(&self) -> Result<RecoveryReport> {
+        self.recover_probed(Duration::ZERO, &NoFaults).await
+    }
+
     pub(crate) async fn recover_probed<P: Probe>(
         &self,
         grace: Duration,

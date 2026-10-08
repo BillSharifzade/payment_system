@@ -4,7 +4,7 @@ use std::time::Duration;
 use api::config::{env_flag, env_or, env_or_file};
 use api::{
     build_router, run_migrations, warm_password_hasher, AmlConfig, AppState, AuthConfig,
-    BiometricConfig, DepositConfig, DeviceConfig, FeeConfig, RateLimitState,
+    BiometricConfig, DepositConfig, DeviceConfig, FeeConfig, Ledger, RateLimitState,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use storage::PostgresLedger;
@@ -14,8 +14,12 @@ type BoxError = Box<dyn std::error::Error>;
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
-        return healthcheck().await;
+    match std::env::args().nth(1).as_deref() {
+        Some("healthcheck") => return healthcheck().await,
+        Some(cmd @ ("tigerbeetle-import" | "tigerbeetle-rollback")) => {
+            std::process::exit(cutover_command(cmd).await)
+        }
+        _ => {}
     }
 
     tracing_subscriber::fmt()
@@ -63,6 +67,8 @@ async fn main() -> Result<(), BoxError> {
         }
     };
 
+    // The ledger backend first: a bad TIGERBEETLE_* setting refuses to boot before anything connects.
+    let tigerbeetle = ledger_tigerbeetle::backend_from_env()?;
     let fees = FeeConfig::from_env()?;
     let aml = AmlConfig::from_env()?;
     let deposits = DepositConfig::from_env(is_prod)?;
@@ -125,12 +131,14 @@ async fn main() -> Result<(), BoxError> {
         .connect_with(connect_options)
         .await?;
 
-    let ledger = PostgresLedger::new(pool.clone());
-    run_migrations(&ledger, migration_url.as_deref()).await?;
+    let pg = PostgresLedger::new(pool.clone());
+    run_migrations(&pg, migration_url.as_deref()).await?;
     tracing::info!(
         separate_owner_credentials = migration_url.is_some(),
         "migrations applied"
     );
+    let ledger = Ledger::connect(tigerbeetle, pg).await?;
+    tracing::info!(backend = ledger.name(), "ledger backend ready");
 
     {
         let pool = pool.clone();
@@ -240,6 +248,75 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("shutdown signal received; draining in-flight requests");
+}
+
+/// `payment-server tigerbeetle-import | tigerbeetle-rollback`: the cut-over to
+/// `LEDGER_BACKEND=tigerbeetle` and the way back (deploy/README.md), run with money movement
+/// stopped. Reads DATABASE_URL (MIGRATION_DATABASE_URL, if set, applies migrations first) and
+/// TIGERBEETLE_*. One JSON object on stdout; exit 0 = done, 1 = refused, 2 = could not run.
+async fn cutover_command(cmd: &str) -> i32 {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .json()
+        .init();
+    let (code, report) = match cutover(cmd).await {
+        Ok(Ok(report)) => (0, report),
+        Ok(Err(refusal)) => (
+            1,
+            serde_json::json!({"status": "refused", "error": refusal.to_string()}),
+        ),
+        Err(e) => (
+            2,
+            serde_json::json!({"status": "error", "error": e.to_string()}),
+        ),
+    };
+    println!("{report}");
+    code
+}
+
+/// `Ok(Err(_))`: the command ran and declined (drift, a stale or mismatched cluster), having
+/// changed nothing.
+async fn cutover(cmd: &str) -> Result<Result<serde_json::Value, BoxError>, BoxError> {
+    use ledger_tigerbeetle::{HybridLedger, TbConfig, TbError};
+    if !cfg!(feature = "tigerbeetle") {
+        return Err("this payment-server was built without `--features tigerbeetle`".into());
+    }
+    // TIGERBEETLE_* whatever LEDGER_BACKEND says: the servers are stopped during a cut-over.
+    let cfg = TbConfig::from_env()?;
+    let url = env_or_file("DATABASE_URL")?.ok_or("DATABASE_URL must be set")?;
+    let options = PgConnectOptions::from_str(&url)?.application_name("payment-server-cutover");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(30))
+        .connect_with(options)
+        .await?;
+    let pg = PostgresLedger::new(pool);
+    run_migrations(&pg, env_or_file("MIGRATION_DATABASE_URL")?.as_deref()).await?;
+    let ledger = HybridLedger::live(cfg, pg)?;
+    let outcome = match cmd {
+        "tigerbeetle-import" => ledger.import_from_postgres().await.map(|r| {
+            serde_json::json!({
+                "status": "imported", "accounts": r.accounts,
+                "opening_balances": r.opening_balances, "through_seq": r.through_seq,
+            })
+        }),
+        _ => ledger.rollback_to_postgres().await.map(|r| {
+            serde_json::json!({
+                "status": "rolled_back", "accounts": r.accounts,
+                "balances_rewritten": r.balances_rewritten,
+                "settled": {"posted": r.settled.posted, "forced": r.settled.forced,
+                            "voided": r.settled.voided},
+            })
+        }),
+    };
+    match outcome {
+        Ok(report) => Ok(Ok(report)),
+        Err(e @ TbError::Storage(storage::StorageError::DataIntegrity(_))) => Ok(Err(e.into())),
+        Err(e) => Err(e.into()),
+    }
 }
 
 async fn healthcheck() -> Result<(), BoxError> {

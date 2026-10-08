@@ -11,18 +11,18 @@
 //! median over rounds and the spread. `--guard aml` adds the per-user AML guard's shape (user
 //! row lock + windowed debit sum) to the Postgres-backed paths; `direct` cannot run guards.
 //!
-//! `TB_ADDRESS`, `TB_CLUSTER_ID`, `DATABASE_URL`; flags: `--concurrency 1,4,16,32`
-//! `--seconds 5` `--rounds 3` `--wallets 2000` `--guard none|aml` `--tb-sessions 1`
-//! `--recipients 0` (0: any wallet pays any other; N: everyone pays one of the first N, so
-//! `--recipients 1` is a single hot merchant account).
+//! `TIGERBEETLE_ADDRESSES`, `TIGERBEETLE_CLUSTER_ID`, `DATABASE_URL`; flags:
+//! `--concurrency 1,4,16,32` `--seconds 5` `--rounds 3` `--wallets 2000` `--guard none|aml`
+//! `--tb-sessions 1` `--recipients 0` (0: any wallet pays any other; N: everyone pays one of the
+//! first N, so `--recipients 1` is a single hot merchant account). Build with
+//! `cargo run -p ledger-tigerbeetle --features native-client --release --bin tb-bench -- …`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ledger::{Account, AccountId, AccountType, Entry, Transaction};
-use ledger_tigerbeetle::{HybridLedger, SimTb, TbClient, TbConfig, TbLedger};
-use ledger_tigerbeetle_live::LiveTb;
+use ledger_tigerbeetle::{HybridLedger, LiveTb, SimTb, TbClient, TbConfig, TbLedger};
 use money::{Currency, Money};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgConnection;
@@ -304,8 +304,9 @@ async fn main() {
         ..TbConfig::new(cluster, "bench")
     };
     let live = LiveTb::connect(
-        std::env::var("TB_CLUSTER_ID").map_or(0, |c| c.parse().expect("TB_CLUSTER_ID")),
-        &std::env::var("TB_ADDRESS").unwrap_or_else(|_| "3000".into()),
+        std::env::var("TIGERBEETLE_CLUSTER_ID")
+            .map_or(0, |c| c.parse().expect("TIGERBEETLE_CLUSTER_ID")),
+        &std::env::var("TIGERBEETLE_ADDRESSES").unwrap_or_else(|_| "3000".into()),
         a.sessions,
     )
     .expect("TigerBeetle client");

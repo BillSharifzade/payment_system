@@ -51,6 +51,21 @@ impl From<money::MoneyError> for TbError {
     }
 }
 
+/// For callers that speak `storage`'s taxonomy (the API): the two retryable cases become
+/// `Unavailable`, a protocol violation is a data-integrity fault.
+impl From<TbError> for StorageError {
+    fn from(e: TbError) -> Self {
+        match e {
+            TbError::Storage(e) => e,
+            TbError::Unavailable(m) => StorageError::Unavailable(m),
+            TbError::Retry(m) => StorageError::Unavailable(m.to_string()),
+            TbError::Protocol(m) => {
+                StorageError::DataIntegrity(format!("tigerbeetle protocol violation: {m}"))
+            }
+        }
+    }
+}
+
 impl TbError {
     pub fn as_ledger(&self) -> Option<&LedgerError> {
         match self {

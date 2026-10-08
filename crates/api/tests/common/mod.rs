@@ -1,26 +1,118 @@
 #![allow(dead_code)]
 
+use std::sync::Arc;
+
 use api::{
     build_router, AmlConfig, AppState, AuthConfig, BiometricConfig, DepositConfig, DeviceConfig,
-    FeeConfig, RateLimitState,
+    FeeConfig, Ledger, RateLimitState,
 };
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use ledger::{AccountId, Transaction};
+use ledger_tigerbeetle::{AnyTb, HybridLedger, SimTb, TbConfig, TbLedger};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use storage::PostgresLedger;
+use tokio::sync::OnceCell;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+/// The ledger backend every suite runs against, `TEST_LEDGER_BACKEND`:
+/// - `postgres` (default): `PostgresLedger`;
+/// - `tigerbeetle`: the hybrid against a live cluster (`TIGERBEETLE_ADDRESSES`, default 3000;
+///   `TIGERBEETLE_CLUSTER_ID`, default 0), in a build with `--features tigerbeetle`;
+/// - `tigerbeetle-sim`: the hybrid against the in-process cluster model.
+///
+/// Give each backend a database of its own: under TigerBeetle `balances` is stale by design,
+/// and suites read the whole database (conservation, statements).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Postgres,
+    TigerBeetle,
+    TigerBeetleSim,
+}
+
+pub fn backend() -> Backend {
+    match std::env::var("TEST_LEDGER_BACKEND").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("postgres") => Backend::Postgres,
+        Ok("tigerbeetle") => Backend::TigerBeetle,
+        Ok("tigerbeetle-sim") => Backend::TigerBeetleSim,
+        other => panic!("TEST_LEDGER_BACKEND={other:?}: postgres, tigerbeetle or tigerbeetle-sim"),
+    }
+}
+
+/// One cluster client per test process (each test has its own runtime; the client has its
+/// own thread), with the migrated database's system accounts created in it.
+static CLUSTER: OnceCell<Option<AnyTb>> = OnceCell::const_new();
+
+fn tb_config(tb: &AnyTb) -> TbConfig {
+    use ledger_tigerbeetle::TbClient;
+    TbConfig::new(tb.cluster_id(), "test")
+}
+
+#[cfg(feature = "tigerbeetle")]
+fn live_cluster() -> AnyTb {
+    AnyTb::Live(Arc::new(ledger_tigerbeetle::LiveTb::from_test_env()))
+}
+
+#[cfg(not(feature = "tigerbeetle"))]
+fn live_cluster() -> AnyTb {
+    panic!("TEST_LEDGER_BACKEND=tigerbeetle needs `--features tigerbeetle`")
+}
+
+async fn cluster(pool: &PgPool) -> Option<AnyTb> {
+    CLUSTER
+        .get_or_init(|| async {
+            let tb = match backend() {
+                Backend::Postgres => return None,
+                Backend::TigerBeetle => live_cluster(),
+                Backend::TigerBeetleSim => AnyTb::Sim(Arc::new(SimTb::new())),
+            };
+            let pg = PostgresLedger::new(pool.clone());
+            pg.migrate().await.unwrap();
+            HybridLedger::new(TbLedger::new(tb.clone(), tb_config(&tb)), pg)
+                .open_system_accounts()
+                .await
+                .expect("system accounts in the cluster");
+            Some(tb)
+        })
+        .await
+        .clone()
+}
+
+/// The backend `router` serves with. Needs `connect` (or `migrated_pool`) to have run.
+pub fn ledger(pool: PgPool) -> Ledger {
+    let pg = PostgresLedger::new(pool);
+    match CLUSTER.get() {
+        Some(Some(tb)) => Ledger::TigerBeetle(HybridLedger::new(
+            TbLedger::new(tb.clone(), tb_config(tb)),
+            pg,
+        )),
+        Some(None) => Ledger::Postgres(pg),
+        None => panic!("connect() before router(): it prepares the ledger backend"),
+    }
+}
+
 pub async fn connect() -> PgPool {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    PgPoolOptions::new()
+    let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&url)
         .await
-        .unwrap()
+        .unwrap();
+    cluster(&pool).await;
+    pool
+}
+
+/// For a transaction a test wrote into the journal itself (as another code path would have),
+/// keeps the books consistent: under TigerBeetle its movement goes into the cluster directly
+/// (no guard, no journal); under Postgres the caller updates `balances` in its own transaction.
+pub async fn mirror_into_cluster(pool: &PgPool, txn: &Transaction) {
+    if let Ledger::TigerBeetle(l) = ledger(pool.clone()) {
+        l.tb().post_direct(txn).await.unwrap();
+    }
 }
 
 pub struct TestConfig {
@@ -60,8 +152,13 @@ impl Default for TestConfig {
 }
 
 pub fn router(pool: PgPool, cfg: TestConfig) -> axum::Router {
+    router_on(ledger(pool), cfg)
+}
+
+/// A router on a backend the test built itself.
+pub fn router_on(ledger: Ledger, cfg: TestConfig) -> axum::Router {
     build_router(AppState {
-        ledger: PostgresLedger::new(pool),
+        ledger,
         auth: cfg.auth,
         rate_limit: cfg.rate_limit,
         login_limit: cfg.login_limit,
@@ -283,17 +380,30 @@ pub async fn create_wallet_cur(app: &axum::Router, token: &str, currency: &str) 
     body["id"].as_str().unwrap().to_string()
 }
 
+/// The raw (credit-positive) balance of every account of a kind, summed, from the backend.
 pub async fn system_total(pool: &PgPool, account_type: &str, currency: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT COALESCE(SUM(b.raw_minor), 0)::BIGINT
-         FROM balances b JOIN accounts a ON a.id = b.account_id
-         WHERE a.account_type = $1 AND a.currency = $2",
-    )
-    .bind(account_type)
-    .bind(currency)
-    .fetch_one(pool)
-    .await
-    .unwrap()
+    let ids: Vec<AccountId> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE account_type = $1 AND currency = $2")
+            .bind(account_type)
+            .bind(currency)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(AccountId)
+            .collect();
+    let total: i128 = match ledger(pool.clone()) {
+        // An account the cluster lacks (opened by a direct write) holds nothing there.
+        Ledger::TigerBeetle(l) => l.tb().raw_balances(&ids).await.unwrap().values().sum(),
+        backend => backend
+            .balances(pool, &ids)
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.raw)
+            .sum(),
+    };
+    total as i64
 }
 
 pub async fn approve_named_kyc(pool: &PgPool, user_id: &str, full_name: &str) {

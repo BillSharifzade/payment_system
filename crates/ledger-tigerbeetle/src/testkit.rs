@@ -1,4 +1,4 @@
-//! Suites shared by the workspace tests (against [`SimTb`]) and the `live` crate (against a
+//! Suites shared by the workspace tests (against [`SimTb`]) and `tests/live.rs` (against a
 //! real cluster). Every suite asserts the backend's invariants itself and panics with the
 //! seed or scenario that broke one. The Postgres ones need `DATABASE_URL`; they create their
 //! own accounts, so they can share a database and (run serially) a cluster.
@@ -493,11 +493,113 @@ impl<'a, C: TbClient> Scene<'a, C> {
     }
 }
 
-async fn recover_all<C: TbClient>(ledger: &HybridLedger<C>) -> crate::RecoveryReport {
+/// A recovery pass that does not leave young reservations to their requests (for tests with
+/// nothing else in flight).
+pub async fn recover_all<C: TbClient>(ledger: &HybridLedger<C>) -> crate::RecoveryReport {
     ledger
         .recover_probed(Duration::ZERO, &NoFaults)
         .await
         .expect("recovery pass")
+}
+
+/// A post refused only because other requests hold the funds waits for them, as a Postgres
+/// post waits for the wallet's row lock: it goes through once they void, fails as retryable
+/// if they outlast the wait, and a balance that is short even without them fails at once.
+pub async fn holds<C: TbClient>(tb: C, pg: &PostgresLedger) {
+    let wait = Duration::from_millis(500);
+    let cfg = TbConfig {
+        hold_wait: wait,
+        ..config(0)
+    };
+    let ledger = hybrid(tb, pg, cfg).await;
+    let scene = Scene::new(&ledger, AMOUNT + FEE).await;
+    // A request died holding the whole balance; recovery has not run.
+    post_and_crash(&ledger, &scene.payment(), CrashPoint::Reserved).await;
+
+    let t = std::time::Instant::now();
+    let r = ledger.post(&scene.payment()).await;
+    assert!(matches!(r, Err(TbError::Retry(_))), "outlasted: {r:?}");
+    assert!(t.elapsed() >= wait);
+
+    let waiting = {
+        let (ledger, payment) = (ledger.clone(), scene.payment());
+        tokio::spawn(async move { ledger.post(&payment).await })
+    };
+    tokio::time::sleep(wait / 5).await;
+    assert_eq!(recover_all(&ledger).await.voided, 1);
+    waiting
+        .await
+        .unwrap()
+        .expect("the hold voided while the post waited");
+    scene.assert_moved(1, "after the hold voided").await;
+
+    let t = std::time::Instant::now();
+    let r = ledger.post(&scene.payment()).await;
+    assert!(
+        matches!(
+            r.as_ref().map_err(TbError::as_ledger),
+            Err(Some(LedgerError::InsufficientFunds { .. }))
+        ),
+        "short without holds: {r:?}"
+    );
+    assert!(t.elapsed() < wait, "no wait for a genuinely short balance");
+}
+
+/// What reconciliation leans on to tell a post in flight from drift: the cluster's newest
+/// timestamp bounds every transfer applied before the call (an unfiltered query), and each
+/// transaction's post is found under its commit-record id, absent until it is applied.
+pub async fn timestamps<C: TbClient>(tb: C, pg: &PostgresLedger) {
+    let ledger = hybrid(tb, pg, config(0)).await;
+    let scene = Scene::new(&ledger, 10_000).await;
+    let first = scene.payment();
+    ledger.post(&first).await.unwrap();
+    let n0 = ledger.tb().newest_timestamp().await.unwrap();
+    let at = ledger.tb().posted_at(&[first.id.as_uuid()]).await.unwrap();
+    let posted = at[&first.id.as_uuid()];
+    assert!(0 < posted && posted <= n0, "{posted} <= {n0}");
+
+    let stranded = scene.payment();
+    post_and_crash(&ledger, &stranded, CrashPoint::Committed).await;
+    let none = ledger.tb().posted_at(&[stranded.id.as_uuid()]).await;
+    assert!(none.unwrap().is_empty(), "committed, not posted");
+    assert!(recover_all(&ledger).await.posted >= 1);
+    let later = ledger
+        .tb()
+        .posted_at(&[stranded.id.as_uuid()])
+        .await
+        .unwrap();
+    assert!(later[&stranded.id.as_uuid()] > n0);
+    assert!(ledger.tb().newest_timestamp().await.unwrap() >= later[&stranded.id.as_uuid()]);
+    assert!(!scene.held().await, "no reservation left");
+    assert_eq!(ledger.reconcile(&scene.ids()).await.unwrap(), vec![]);
+}
+
+/// Where [`post_and_crash`] kills a post.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrashPoint {
+    /// The reservation is in the cluster; Postgres never saw the transaction.
+    Reserved,
+    /// Postgres committed the transaction (journal, outbox, idempotency record); its post
+    /// was never sent.
+    Committed,
+}
+
+/// Posts `txn` and "dies" at `at`, leaving the cluster and Postgres exactly as a crash there
+/// would: for other crates' tests of recovery and reconciliation.
+pub async fn post_and_crash<C: TbClient>(
+    ledger: &HybridLedger<C>,
+    txn: &Transaction,
+    at: CrashPoint,
+) {
+    let step = match at {
+        CrashPoint::Reserved => Step::Reserved,
+        CrashPoint::Committed => Step::Committed,
+    };
+    let mut conn = ledger.pool().acquire().await.expect("connection");
+    let r = ledger
+        .post_probed(&mut conn, txn, PostOptions::default(), &CrashAt(Some(step)))
+        .await;
+    assert!(injected(&r), "a crash at {at:?} was injected: {r:?}");
 }
 
 fn injected(r: &crate::Result<()>) -> bool {
@@ -1047,7 +1149,18 @@ pub async fn import_cutover<C: TbClient>(tb: C) {
     }
 
     let ledger = hybrid(tb, &pg, config(0)).await;
+    let refused = |r: crate::Result<()>, why: &str| match r {
+        Err(TbError::Storage(storage::StorageError::DataIntegrity(m))) => {
+            assert!(m.contains(why), "{m}")
+        }
+        other => panic!("expected a refusal ({why}), got {other:?}"),
+    };
+    refused(ledger.prepare().await, "never imported");
     let first = ledger.import_from_postgres().await.unwrap();
+    ledger
+        .prepare()
+        .await
+        .expect("imported: the cluster may serve");
     let ids: Vec<AccountId> = accounts.iter().map(|a| a.id).collect();
     let before: Vec<i128> = ledger
         .tb()
@@ -1091,6 +1204,40 @@ pub async fn import_cutover<C: TbClient>(tb: C) {
     assert_eq!(
         ledger.tb().balance(wallets[2]).await.unwrap().minor_units(),
         500
+    );
+
+    // The way back: a committed transaction whose post never happened is settled first,
+    // then `balances` is rebuilt from the journal and equals the cluster account for account.
+    let stranded = Transaction::with_entries(vec![
+        Entry::debit(wallets[0], m(7, tjs)),
+        Entry::credit(wallets[2], m(7, tjs)),
+    ]);
+    post_and_crash(&ledger, &stranded, CrashPoint::Committed).await;
+    let back = ledger.rollback_to_postgres().await.unwrap();
+    assert_eq!(back.settled.posted, 1, "{back:?}");
+    assert_eq!(
+        back.balances_rewritten, 3,
+        "wallets 0, 1 and 2 moved since the cut-over"
+    );
+    let after = ledger.tb().balances(&ids).await.unwrap();
+    for b in &after {
+        assert_eq!(
+            b.posted,
+            pg.balance(b.account).await.unwrap(),
+            "{}",
+            b.account
+        );
+    }
+    pg.post(&Transaction::with_entries(vec![
+        Entry::debit(wallets[2], m(507, tjs)),
+        Entry::credit(wallets[0], m(507, tjs)),
+    ]))
+    .await
+    .expect("Postgres posts on the rebuilt balances");
+    refused(ledger.prepare().await, "rolled back");
+    refused(
+        ledger.import_from_postgres().await.map(|_| ()),
+        "rolled back",
     );
 
     pg.pool().close().await;

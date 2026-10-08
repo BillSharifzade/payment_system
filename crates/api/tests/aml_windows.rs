@@ -3,6 +3,8 @@ mod common;
 use api::{AmlConfig, Limits, RateLimitState};
 use axum::http::StatusCode;
 use common::*;
+use ledger::{AccountId, Entry, Transaction, TransactionId};
+use money::{Currency, Money};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -49,15 +51,26 @@ async fn debits_at(pool: &PgPool, wallet: &str, count: i64, amount: i64, ago: &s
     .execute(&mut *tx)
     .await
     .unwrap();
-    for (account, delta) in [(wallet, -amount * count), (settlement, amount * count)] {
-        sqlx::query("UPDATE balances SET raw_minor = raw_minor + $2 WHERE account_id = $1")
-            .bind(account)
-            .bind(delta)
-            .execute(&mut *tx)
-            .await
-            .unwrap();
+    if backend() == Backend::Postgres {
+        for (account, delta) in [(wallet, -amount * count), (settlement, amount * count)] {
+            sqlx::query("UPDATE balances SET raw_minor = raw_minor + $2 WHERE account_id = $1")
+                .bind(account)
+                .bind(delta)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
     }
     tx.commit().await.unwrap();
+    let total = Money::from_minor((amount * count) as i128, Currency::tjs());
+    let moved = Transaction::new(
+        TransactionId(txn),
+        vec![
+            Entry::debit(AccountId(wallet), total),
+            Entry::credit(AccountId(settlement), total),
+        ],
+    );
+    mirror_into_cluster(pool, &moved).await;
 }
 
 /// The stored window next to a full recount of the entries at the same edges (what the guard

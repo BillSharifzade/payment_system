@@ -169,6 +169,11 @@ impl ApiError {
             ApiError::Storage(StorageError::Database(e)) if is_transient(e) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "retry_later")
             }
+            // TigerBeetle did not answer, or the attempt lost its reservation: nothing was
+            // posted that recovery will not settle, so the same key may be retried.
+            ApiError::Storage(StorageError::Unavailable(_)) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "retry_later")
+            }
             ApiError::Storage(StorageError::Database(_))
             | ApiError::Storage(StorageError::DataIntegrity(_)) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
@@ -288,5 +293,11 @@ mod tests {
             assert_eq!(parts_of(sqlstate(code)), fault, "SQLSTATE {code}");
         }
         assert_eq!(parts_of(sqlx::Error::RowNotFound), fault);
+    }
+
+    #[test]
+    fn an_unavailable_ledger_backend_is_retry_later() {
+        let e = ApiError::Storage(StorageError::Unavailable("no reply within 5s".into()));
+        assert_eq!(e.parts(), (StatusCode::SERVICE_UNAVAILABLE, "retry_later"));
     }
 }

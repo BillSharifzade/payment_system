@@ -262,6 +262,55 @@ groups:
         labels: {severity: warning}
         annotations: {summary: "Checkpoints are signed with a local key (WORKER_SIGNER=local)"}
 
+  # LEDGER_BACKEND=tigerbeetle (DESIGN.md §15): the leader's recovery loop settles the
+  # reservations of requests that died between the posting protocol's steps. With
+  # LEDGER_BACKEND=postgres none of these series exist and every rule stays quiet.
+  - name: payment-tigerbeetle
+    rules:
+      - alert: TigerBeetleRecoveryStale
+        # A pass every TIGERBEETLE_RECOVERY_INTERVAL_SECS (default 2 s). Without one, a payment
+        # whose post was lost shows in the journal but not yet in balances; past half of
+        # TIGERBEETLE_PENDING_TIMEOUT_SECS its reservation expires and recovery must re-post it.
+        expr: time() - max(tigerbeetle_recovery_last_success_timestamp_seconds and on (instance) (worker_leader == 1)) > 60
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No successful TigerBeetle recovery pass for {{ $value | humanizeDuration }}"
+          description: "Abandoned reservations are not being settled. Is the cluster reachable from payment-workers (TIGERBEETLE_ADDRESSES)? See `tigerbeetle_recovery_errors_total` and `docker compose logs payment-workers tigerbeetle`."
+
+      - alert: TigerBeetleForcedRepost
+        # A committed transaction outlived its reservation (recovery was down for longer than
+        # TIGERBEETLE_PENDING_TIMEOUT_SECS / 2) and was posted again as plain transfers: the
+        # funds were unprotected meanwhile. If that re-post had failed, TigerBeetleProtocolError
+        # fires instead and the transaction needs repair by hand.
+        expr: sum(increase(tigerbeetle_recovered_total{outcome="forced"}[30m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} committed transaction(s) re-posted after their reservation expired"
+          description: "Recovery was down for longer than half the pending timeout. Find out why (TigerBeetleRecoveryStale, worker logs: 'expired reservation re-posted') and check reconciliation."
+
+      - alert: TigerBeetleProtocolError
+        # TigerBeetle answered something the protocol rules out: an invariant is broken.
+        expr: (sum(increase(tigerbeetle_recovery_errors_total{kind="protocol"}[10m])) or vector(0)) + (sum(increase(tigerbeetle_request_errors_total{kind="protocol"}[10m])) or vector(0)) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "TigerBeetle protocol violation ({{ $value | printf \"%.0f\" }} in 10 min)"
+          description: "A post, void or recovery met a result the protocol rules out (e.g. a committed transaction that could not be re-posted). Money may need repair by hand: preserve logs ('tigerbeetle protocol violation'), stop money movement, reconcile."
+
+      - alert: TigerBeetleUnavailable
+        # Requests answered 503 retry_later because the cluster did not answer within
+        # TIGERBEETLE_REQUEST_TIMEOUT_MS (nothing is lost: recovery settles what they left).
+        expr: sum(rate(tigerbeetle_request_errors_total{kind="unavailable"}[5m])) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Money requests are failing with TigerBeetle unavailable ({{ $value | printf \"%.2f\" }}/s)"
+          description: "Is the cluster up and reachable (`docker compose ps tigerbeetle`, replica logs)?"
+
   - name: payment-backups
     rules:
       - alert: BackupStale
