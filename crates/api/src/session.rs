@@ -154,8 +154,16 @@ pub async fn register(
     }
 
     let password_hash = hash_password_async(req.password).await?;
+    let tjs = state.ledger.lookup_currency("TJS").await?;
     let user_id = Uuid::new_v4();
 
+    // User, TJS wallet and first session commit together: a failure leaves no wallet-less user.
+    let mut tx = state
+        .ledger
+        .pool()
+        .begin()
+        .await
+        .map_err(StorageError::from)?;
     let inserted = sqlx::query(
         "INSERT INTO users (id, phone, password_hash)
          VALUES ($1, $2, $3)
@@ -164,31 +172,22 @@ pub async fn register(
     .bind(user_id)
     .bind(&phone)
     .bind(&password_hash)
-    .execute(state.ledger.pool())
+    .execute(&mut *tx)
     .await
     .map_err(StorageError::from)?;
-
     if inserted.rows_affected() == 0 {
         return Err(ApiError::Conflict("phone already registered".to_string()));
     }
-
-    let wallet = async {
-        let tjs = state.ledger.lookup_currency("TJS").await?;
-        state
-            .ledger
-            .open_account_owned(
-                &Account::new(AccountId::new(), AccountType::UserWallet, tjs),
-                Some(user_id),
-            )
-            .await
-            .map_err(ApiError::from)
-    }
-    .await;
-    if let Err(e) = wallet {
-        tracing::warn!(user = %user_id, error = %e, "could not auto-create TJS wallet at registration");
-    }
-
-    let tokens = issue_tokens(&state, user_id).await?;
+    state
+        .ledger
+        .open_account_owned_on(
+            &mut tx,
+            &Account::new(AccountId::new(), AccountType::UserWallet, tjs),
+            Some(user_id),
+        )
+        .await?;
+    let (tokens, _) = issue_tokens_on(&mut tx, &state, user_id, false).await?;
+    tx.commit().await.map_err(StorageError::from)?;
     Ok((StatusCode::CREATED, Json(tokens)))
 }
 

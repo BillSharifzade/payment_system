@@ -136,6 +136,27 @@ pub async fn get_kyc_status(
     }))
 }
 
+// Reviewing your own submission is refused; anything else that did not update is not pending.
+async fn unreviewable(
+    tx: &mut sqlx::PgConnection,
+    submission_id: Uuid,
+    admin_id: Uuid,
+) -> ApiResult<ApiError> {
+    let own: Option<bool> = sqlx::query_scalar(
+        "SELECT user_id = $2 FROM kyc_submissions WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(submission_id)
+    .bind(admin_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(StorageError::from)?;
+    Ok(if own == Some(true) {
+        ApiError::DualControlRequired("admins cannot review their own KYC submission".to_string())
+    } else {
+        ApiError::NotFound("no pending KYC submission with that id".to_string())
+    })
+}
+
 pub async fn approve_kyc(
     AdminUser(admin_id): AdminUser,
     State(state): State<AppState>,
@@ -151,7 +172,7 @@ pub async fn approve_kyc(
     let row = sqlx::query(
         "UPDATE kyc_submissions
          SET status = 'approved', reviewed_by = $2, reviewed_at = now()
-         WHERE id = $1 AND status = 'pending'
+         WHERE id = $1 AND status = 'pending' AND user_id <> $2
          RETURNING user_id, requested_level",
     )
     .bind(submission_id)
@@ -161,9 +182,7 @@ pub async fn approve_kyc(
     .map_err(StorageError::from)?;
 
     let Some(row) = row else {
-        return Err(ApiError::NotFound(
-            "no pending KYC submission with that id".to_string(),
-        ));
+        return Err(unreviewable(&mut tx, submission_id, admin_id).await?);
     };
     let user_id: Uuid = row.try_get("user_id").map_err(StorageError::from)?;
     let requested_level: i16 = row.try_get("requested_level").map_err(StorageError::from)?;
@@ -211,7 +230,7 @@ pub async fn reject_kyc(
     let row = sqlx::query(
         "UPDATE kyc_submissions
          SET status = 'rejected', reviewed_by = $2, reviewed_at = now(), rejection_reason = $3
-         WHERE id = $1 AND status = 'pending'
+         WHERE id = $1 AND status = 'pending' AND user_id <> $2
          RETURNING user_id, requested_level",
     )
     .bind(submission_id)
@@ -222,9 +241,7 @@ pub async fn reject_kyc(
     .map_err(StorageError::from)?;
 
     let Some(row) = row else {
-        return Err(ApiError::NotFound(
-            "no pending KYC submission with that id".to_string(),
-        ));
+        return Err(unreviewable(&mut tx, submission_id, admin_id).await?);
     };
     let user_id: Uuid = row.try_get("user_id").map_err(StorageError::from)?;
     let requested_level: i16 = row.try_get("requested_level").map_err(StorageError::from)?;

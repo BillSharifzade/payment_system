@@ -29,6 +29,18 @@ pub fn env_or_file(key: &str) -> Result<Option<String>, String> {
     }
 }
 
+pub fn env_bool(key: &str, default: bool) -> Result<bool, String> {
+    match std::env::var(key) {
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(format!("{key}: {e}")),
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(format!("{key}={raw:?} must be true or false")),
+        },
+    }
+}
+
 pub fn env_flag(key: &str) -> bool {
     std::env::var(key)
         .map(|v| {
