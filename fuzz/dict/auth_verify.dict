@@ -1,0 +1,12 @@
+# JWT segments: base64url headers/claims, separators, base64url alphabet edges.
+h_hs256_typ="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+h_hs256="eyJhbGciOiJIUzI1NiJ9"
+h_none="eyJhbGciOiJub25lIn0"
+h_hs512="eyJhbGciOiJIUzUxMiJ9"
+c_valid="eyJzdWIiOiIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDEiLCJleHAiOjk5OTk5OTk5OTksImlhdCI6MH0"
+c_expired="eyJleHAiOjEsImlhdCI6MCwic3ViIjoieCJ9"
+dot="."
+dots=".."
+pad="="
+dash="-"
+underscore="_"

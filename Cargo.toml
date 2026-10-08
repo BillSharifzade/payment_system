@@ -10,6 +10,8 @@ members = [
     "crates/api",
     "crates/biometric",
 ]
+# cargo-fuzz targets: nightly-only, own lockfile; run by .github/workflows/fuzz.yml.
+exclude = ["fuzz"]
 
 # Fatter release optimization: thin LTO + a single codegen unit typically buys
 # 5-15% on this kind of hash/serde/async-heavy workload, for slower builds.

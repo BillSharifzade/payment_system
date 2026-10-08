@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use uuid::Uuid;
@@ -50,6 +51,10 @@ pub enum Decision {
     Ambiguous { best: Uuid, runner_up: Uuid },
 }
 
+fn at_least(x: f64, bar: f64) -> bool {
+    x.partial_cmp(&bar).is_some_and(Ordering::is_ge)
+}
+
 pub fn decide(candidates: &[Candidate], policy: MatchPolicy) -> Decision {
     let mut best_per_subject: HashMap<Uuid, f64> = HashMap::new();
     for c in candidates {
@@ -69,11 +74,15 @@ pub fn decide(candidates: &[Candidate], policy: MatchPolicy) -> Decision {
     let Some(&(best, best_score)) = ranked.first() else {
         return Decision::NoMatch;
     };
-    if best_score < policy.threshold {
+    // `at_least` is false whenever a NaN is involved, so a NaN threshold refuses and a NaN
+    // margin is ambiguous. An exact tie between two people is ambiguous even at margin 0.
+    if !at_least(best_score, policy.threshold) {
         return Decision::NoMatch;
     }
     if let Some(&(runner_up, second)) = ranked.get(1) {
-        if second >= policy.threshold && best_score - second < policy.margin {
+        if at_least(second, policy.threshold)
+            && (second == best_score || !at_least(best_score - second, policy.margin))
+        {
             return Decision::Ambiguous { best, runner_up };
         }
     }
@@ -193,6 +202,48 @@ mod tests {
             Decision::Match {
                 subject: a,
                 score: 55.0
+            }
+        );
+    }
+
+    // `best < threshold` and `gap < margin` are false for NaN, so a NaN threshold matched
+    // anyone (found by fuzz/biometric_policy) and a NaN margin hid every runner-up; and with a
+    // zero margin an exact tie went to whichever UUID sorts first.
+    #[test]
+    fn nan_policies_and_ties_never_match() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let nan_threshold = MatchPolicy {
+            threshold: f64::NAN,
+            margin: 10.0,
+        };
+        assert_eq!(decide(&[c(a, 99.0)], nan_threshold), Decision::NoMatch);
+        let nan_margin = MatchPolicy {
+            threshold: 40.0,
+            margin: f64::NAN,
+        };
+        assert_eq!(
+            decide(&[c(a, 90.0), c(b, 45.0)], nan_margin),
+            Decision::Ambiguous {
+                best: a,
+                runner_up: b
+            }
+        );
+        let no_margin = MatchPolicy {
+            threshold: 40.0,
+            margin: 0.0,
+        };
+        assert_eq!(
+            decide(&[c(b, 50.0), c(a, 50.0)], no_margin),
+            Decision::Ambiguous {
+                best: a,
+                runner_up: b
+            }
+        );
+        assert_eq!(
+            decide(&[c(b, 50.0), c(a, 50.5)], no_margin),
+            Decision::Match {
+                subject: a,
+                score: 50.5
             }
         );
     }
