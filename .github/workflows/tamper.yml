@@ -1,0 +1,164 @@
+# Tamper evidence beyond the signing key (DESIGN.md §6.4, §12.8): external
+# anchoring of checkpoint hashes (RFC 3161 timestamp authorities,
+# OpenTimestamps) and external checkpoint signers (Vault transit, PKCS#11).
+#
+# The anchor tests run against an in-test TSA (its own CA, real tokens) and
+# mock OpenTimestamps calendars, on scratch databases; the Vault tests against
+# a `vault server -dev` service container set up by deploy/vault/bootstrap.sh;
+# the PKCS#11 test against SoftHSM2. TAMPER_REQUIRE_EXTERNAL=1 turns a missing
+# service into a failure (elsewhere those tests skip). The live public
+# witnesses (freetsa.org, the OpenTimestamps pools) run weekly, non-blocking.
+# Actions are pinned to commit SHAs and images by digest, as in ci.yml.
+name: Tamper evidence
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tamper-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The CLI bootstrap.sh drives; same version as the service image.
+  VAULT_VERSION: 2.1.1
+  VAULT_ZIP_SHA256: 8aa90f9cea46f541fc7baa3d0ec692fc06afde9a248cc1f2dcac46a567c6f56b
+
+jobs:
+  tamper:
+    name: Anchors, Vault transit, PKCS#11 (SoftHSM2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    services:
+      postgres:
+        image: postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+        env:
+          POSTGRES_USER: payment
+          POSTGRES_PASSWORD: payment_dev_pw
+          POSTGRES_DB: payment
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U payment -d payment"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+      vault:
+        # The image's default command is `server -dev`.
+        image: hashicorp/vault:2.1.1@sha256:47f14a6acb98f48d798a07df7c83f23a6e636e1cf724c5f8ff165cb32667a1e2
+        env:
+          VAULT_DEV_ROOT_TOKEN_ID: ci-root
+          VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+          VAULT_ADDR: http://127.0.0.1:8200
+        ports:
+          - 8200:8200
+        options: >-
+          --cap-add IPC_LOCK
+          --health-cmd "vault status"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: postgres://payment:payment_dev_pw@localhost:5432/payment
+      VAULT_ADDR: http://127.0.0.1:8200
+      VAULT_TOKEN: ci-root
+      PKCS11_TEST_MODULE: /usr/lib/softhsm/libsofthsm2.so
+      TAMPER_REQUIRE_EXTERNAL: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust (rust-toolchain.toml pins 1.98)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09
+        with:
+          toolchain: "1.98"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Vault CLI (checksum-verified), SoftHSM2, jq
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq softhsm2 jq
+          zip="$RUNNER_TEMP/vault.zip"
+          curl -fsSL -o "$zip" "https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_amd64.zip"
+          echo "${VAULT_ZIP_SHA256}  $zip" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          unzip -q -o "$zip" -d "$RUNNER_TEMP/bin"
+          rm "$zip"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/vault" version
+          softhsm2-util --version
+
+      - name: Unit tests — tokens, proofs, backends against the in-test TSA, mock calendars, mock Vault
+        run: cargo test -p crypto -p workers --lib --test anchors --test signers --test pkcs11
+
+      - name: Anchors on a database — re-signed history is caught, verify-chain, the worker end to end
+        run: cargo test -p workers --test anchors -- --ignored --test-threads=1 --skip real_
+
+      - name: Vault transit — bootstrap.sh's sign-only AppRole, pinning, rotation, the worker end to end
+        run: cargo test -p workers --test signers -- --ignored --test-threads=1
+
+      - name: PKCS#11 — an Ed25519 key inside SoftHSM2
+        run: cargo test -p workers --test pkcs11 -- --ignored
+
+      # ci.yml parses every documented compose combination; this one is new.
+      - name: Vault overlay — compose config (no local signing key mounted or on disk)
+        run: |
+          set -euo pipefail
+          cd deploy
+          printf '%s\n' 'ADMIN_ALLOW_CIDR=203.0.113.7/32' 'LAN_BIND_ADDRESS=192.168.1.156' \
+            'GRAFANA_PASSWORD=ci' 'ALERT_WEBHOOK_URL=http://example/ci' 'ALERT_HEARTBEAT_URL=http://example/hb' > .env
+          mkdir -p secrets
+          for s in postgres_password pg_owner_password pg_app_password pg_backup_password pg_monitor_password \
+                   database_url migration_database_url jwt_secret worker_trusted_public_keys \
+                   biometric_template_key redis_acl redis_url nats_auth.conf nats_url backup_recipients \
+                   backup_rclone_conf pgbackrest.conf vault_role_id vault_secret_id; do echo ci > "secrets/$s"; done
+          cp app.env.example app.env
+          for combo in docker-compose.prod.yml:docker-compose.vault.yml \
+                       docker-compose.lan.yml:docker-compose.vault.yml \
+                       docker-compose.prod.yml:docker-compose.monitoring.yml:docker-compose.vault.yml; do
+            echo "compose config: $combo"
+            COMPOSE_FILE=$combo docker compose config -q
+          done
+          COMPOSE_FILE=docker-compose.prod.yml:docker-compose.monitoring.yml:docker-compose.vault.yml \
+            docker compose config --format json > "$RUNNER_TEMP/vault-compose.json"
+          jq -e '.services["payment-workers"].environment | has("WORKER_SIGNING_KEY_FILE") | not' "$RUNNER_TEMP/vault-compose.json"
+          jq -e '[.services["payment-workers"].secrets[].source] | index("worker_signing_key") == null' "$RUNNER_TEMP/vault-compose.json"
+          jq -e '.services.vault.networks | keys == ["vault"]' "$RUNNER_TEMP/vault-compose.json"
+          jq -e '.networks.vault.internal == true' "$RUNNER_TEMP/vault-compose.json"
+          jq -e '[.services | to_entries[] | select(.value.ports) | .key] | sort == ["caddy", "grafana"]' "$RUNNER_TEMP/vault-compose.json"
+          rm -rf secrets .env app.env
+
+  live:
+    name: Live public witnesses (freetsa.org, OpenTimestamps pools)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Their uptime is not ours: a failure here is a signal, not a red build.
+    continue-on-error: true
+    env:
+      TAMPER_LIVE_ENDPOINTS: "1"
+      TAMPER_REQUIRE_EXTERNAL: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust (rust-toolchain.toml pins 1.98)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09
+        with:
+          toolchain: "1.98"
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Stamp with freetsa.org and the OpenTimestamps pools
+        run: cargo test -p workers --test anchors real_ -- --ignored --test-threads=1

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Background workers: the checkpoint sealer (tamper-evidence) and the continuous reconciliation job."
+description = "Background workers: the checkpoint sealer (tamper-evidence) with external anchoring and signers, and the continuous reconciliation job."
 
 [lib]
 path = "src/lib.rs"
@@ -29,8 +29,15 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
+reqwest = { workspace = true }
+base64 = { workspace = true }
+rand_core = { workspace = true }
+# PKCS#11 HSM signer: the module (.so) is loaded at runtime, nothing links here.
+cryptoki = "0.12"
 
 [dev-dependencies]
+crypto = { workspace = true, features = ["test-tsa"] }
+axum = { workspace = true }
 storage = { workspace = true }
 ledger = { workspace = true }
 money = { workspace = true }

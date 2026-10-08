@@ -5,13 +5,29 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Cryptographic primitives for tamper-evidence: SHA-256 Merkle trees and Ed25519 checkpoint signing. Pure — no database."
+description = "Cryptographic primitives for tamper-evidence: SHA-256 Merkle trees, Ed25519 checkpoint signing, RFC 3161 timestamp tokens and OpenTimestamps proofs. Pure — no database, no network."
+
+[features]
+# An in-process RFC 3161 timestamp authority (CA + TSA certificate, real
+# tokens) for other crates' tests. Never enabled by a binary.
+test-tsa = []
 
 [dependencies]
 sha2 = { workspace = true }
+sha1 = "0.10"
+ripemd = "0.1"
 hex = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 thiserror.workspace = true
+der = { version = "0.7", features = ["alloc", "derive", "oid", "pem"] }
+spki = "0.7"
+x509-cert = { version = "0.2.5", default-features = false, features = ["pem", "std"] }
+cms = "0.2.3"
+x509-tsp = "0.1"
+cmpv2 = "0.2"
+rsa = { version = "0.9", features = ["sha2"] }
+p256 = { workspace = true }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 
 [dev-dependencies]

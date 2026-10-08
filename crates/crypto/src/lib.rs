@@ -1,5 +1,7 @@
 mod hash;
 mod merkle;
+pub mod ots;
+pub mod rfc3161;
 mod signing;
 
 pub use hash::{sha256, Hash};
