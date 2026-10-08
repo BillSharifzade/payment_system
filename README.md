@@ -47,26 +47,30 @@ NATS_URL=nats://localhost:4222 cargo run -p workers --bin payment-workers
 ```bash
 BASE=http://localhost:8080
 J='content-type: application/json'
+PSQL='docker compose exec -T postgres psql -U payment -d payment -qtAc'
+reg() { curl -s -XPOST $BASE/v1/auth/register -H "$J" -d "{\"phone\":\"$1\",\"password\":\"password123\"}"; }
 
-# Register two users. Every customer gets a TJS wallet at registration.
-ALICE=$(curl -s -XPOST $BASE/v1/auth/register -H "$J" -d '{"phone":"+992900000001","password":"password123"}')
-BOB=$(curl -s -XPOST   $BASE/v1/auth/register -H "$J" -d '{"phone":"+992900000002","password":"password123"}')
-A_TOK=$(echo "$ALICE" | jq -r .access_token); B_TOK=$(echo "$BOB" | jq -r .access_token)
+# Two customers and two operators. Every customer gets a TJS wallet at registration.
+ALICE=$(reg +992900000001); BOB=$(reg +992900000002)
+OPS1=$(reg +992900000091);  OPS2=$(reg +992900000092)
+tok() { echo "$1" | jq -r .access_token; }
+A_TOK=$(tok "$ALICE"); B_TOK=$(tok "$BOB"); O1_TOK=$(tok "$OPS1"); O2_TOK=$(tok "$OPS2")
 A_WALLET=$(curl -s $BASE/v1/wallets -H "Authorization: Bearer $A_TOK" | jq -r '.[0].id')
 B_WALLET=$(curl -s $BASE/v1/wallets -H "Authorization: Bearer $B_TOK" | jq -r '.[0].id')
 
-# Deposits are admin-only (funds entering from the partner bank). Promote Alice
-# and mark her KYC-verified, as the admin console / a reviewer would:
-docker compose exec -T postgres psql -U payment -d payment -c \
-  "UPDATE users SET is_admin=true, kyc_level=1 WHERE phone='992900000001'"
+# Operators are flipped by SQL; customers become KYC level 1 as a reviewer would.
+$PSQL "UPDATE users SET is_admin=true WHERE phone IN ('992900000091','992900000092')"
+$PSQL "UPDATE users SET kyc_level=1 WHERE phone IN ('992900000001','992900000002')"
 
-# Deposit 100.00 TJS to Alice, then transfer 35.00 to Bob. Every money-moving
-# call needs an Idempotency-Key (a UUID) — it becomes the transaction id, so a
-# retry can never post twice.
-curl -s -XPOST $BASE/v1/deposits -H "$J" -H "Authorization: Bearer $A_TOK" \
-  -H "Idempotency-Key: $(uuidgen)" \
-  -d "{\"user_account\":\"$A_WALLET\",\"amount_minor\":10000,\"currency\":\"TJS\"}"
+# Deposits are dual-control: one operator requests (202 pending_approval), a
+# DIFFERENT operator approves, and only then is the ledger posted. The
+# Idempotency-Key (a UUID) is the deposit id and the eventual transaction id.
+DEP=$(uuidgen)
+curl -s -XPOST $BASE/v1/deposits -H "$J" -H "Authorization: Bearer $O1_TOK" -H "Idempotency-Key: $DEP" \
+  -d "{\"user_account\":\"$A_WALLET\",\"amount_minor\":10000,\"currency\":\"TJS\"}"   # → pending_approval
+curl -s -XPOST $BASE/v1/admin/deposits/$DEP/approve -H "Authorization: Bearer $O2_TOK"           # → posted
 
+# Transfer 35.00 TJS to Bob. A retry with the same key can never post twice.
 curl -s -XPOST $BASE/v1/transfers -H "$J" -H "Authorization: Bearer $A_TOK" \
   -H "Idempotency-Key: $(uuidgen)" \
   -d "{\"from_account\":\"$A_WALLET\",\"to_account\":\"$B_WALLET\",\"amount_minor\":3500,\"currency\":\"TJS\"}"
@@ -74,17 +78,25 @@ curl -s -XPOST $BASE/v1/transfers -H "$J" -H "Authorization: Bearer $A_TOK" \
 curl -s $BASE/v1/accounts/$A_WALLET/balance -H "Authorization: Bearer $A_TOK"   # → 65.00 TJS
 curl -s $BASE/ready                                                              # → {"status":"ready"}
 
+# Gave up on an unsettled payment? Void its key first — afterwards it can never post.
+curl -s -XPOST $BASE/v1/transactions/$(uuidgen)/void -H "Authorization: Bearer $A_TOK"   # → voided
+
 # Fingerprint payment (DESIGN.md §20). Bob enrols a finger once (template from the
-# scanner SDK, base64); Alice — the merchant — opens a 2.00 TJS check and Bob pays
-# it by putting his finger on Alice's scanner. Dev mode matches templates exactly.
+# scanner SDK, base64). An operator registers Alice's checkout terminal (its key is
+# shown once). Alice opens a 2.00 TJS check; Bob pays it with his finger, the cashier
+# keying in his phone number (1:1 verification). Dev mode matches templates exactly.
 FP=$(head -c 64 /dev/urandom | base64 -w0)
 curl -s -XPOST $BASE/v1/biometric/fingerprints -H "$J" -H "Authorization: Bearer $B_TOK" \
   -d "{\"finger\":2,\"format\":\"raw\",\"template\":\"$FP\",\"consent\":true}"
+A_ID=$(echo "$ALICE" | jq -r .user_id)
+TKEY=$(curl -s -XPOST $BASE/v1/admin/terminals -H "$J" -H "Authorization: Bearer $O1_TOK" \
+  -d "{\"merchant_user_id\":\"$A_ID\",\"label\":\"till 1\"}" | jq -r .api_key)
 CHECK=$(uuidgen)
 curl -s -XPOST $BASE/v1/checks -H "$J" -H "Authorization: Bearer $A_TOK" -H "Idempotency-Key: $CHECK" \
   -d "{\"account\":\"$A_WALLET\",\"amount_minor\":200,\"description\":\"bread\"}"
 curl -s -XPOST $BASE/v1/checks/$CHECK/pay/fingerprint -H "$J" -H "Authorization: Bearer $A_TOK" \
-  -H "Idempotency-Key: $(uuidgen)" -d "{\"format\":\"raw\",\"template\":\"$FP\"}"   # → posted
+  -H "X-Terminal-Key: $TKEY" -H "Idempotency-Key: $(uuidgen)" \
+  -d "{\"format\":\"raw\",\"template\":\"$FP\",\"payer_phone\":\"+992900000002\"}"   # → posted
 ```
 
 Amounts are always **integer minor units** (diram for TJS): `10000` = 100.00 TJS.

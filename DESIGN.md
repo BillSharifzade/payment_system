@@ -1,8 +1,7 @@
 # Payment System — Backend Design & Architecture
 
-> Status: **DRAFT FOR REVIEW.** Nothing here is implemented yet. This document is for us to argue over and refine before a single line of code is written.
+> Status: **IMPLEMENTED — living design record.** It began as the pre-code design review; the backend, clients and ops stack it describes now exist. §17 carries the live build status, and "As built" notes mark where the implementation refined the original plan.
 >
-> Author pass: review & hardening of the initial architecture sketch.
 > Target: a domestic (and eventually Central-Asia regional) payment system backend in Rust — fast, secure, correct, and operationally resilient.
 
 ---
@@ -176,6 +175,12 @@ If you want externally-verifiable, "nobody can claim we rewrote history" guarant
 
 **Net:** full tamper-evidence, no throughput penalty, optional public verifiability. This is strictly better than the first draft's design.
 
+### 6.5 As built — what makes the chain trustworthy
+- **Pinned keys.** The verifier never trusts the `public_key` stored next to a signature — that would let anyone with write access re-sign rewritten history with their own key. A checkpoint verifies only under a key in `WORKER_TRUSTED_PUBLIC_KEYS` (plus the current signing key's public half); anything else is `ChainBroken("untrusted signing key")`. Rotation keeps retired public keys in the list.
+- **History is re-verified, not just the tip.** Every interval the worker verifies new checkpoints and re-checks the last verified one (an altered or deleted checkpoint is caught); at startup and every `VERIFY_FULL_EVERY_SECS` (6 h) it re-verifies the whole chain in bounded pages (64 checkpoints / 10k transactions per page). Sealed transactions not covered by any checkpoint are reported.
+- **`payment-workers verify-chain`** runs a full verification against any database (the restore drill uses it) and prints a JSON report; exit 0 intact, 1 broken, 2 error.
+- **Remaining gap — §6.4 anchoring.** Whoever holds the signing key itself can still re-sign history (e.g. drop and reseal the newest checkpoints across a worker restart). Publishing checkpoint roots outside the system closes that; until then the signing key must live off the database host (HSM/Vault per §12.8).
+
 ---
 
 ## 7. System architecture (components)
@@ -310,6 +315,7 @@ Notes:
 - `entries` and `transactions` are **append-only**. No `UPDATE`/`DELETE`. Corrections are new reversing transactions.
 - Partition `entries` and `audit_log` by time (monthly) for manageable size and fast pruning/archival.
 - `CHECK` constraints and a deferred constraint trigger enforce the "entries sum to zero" invariant at the DB level as a backstop, even if app code has a bug.
+- **As built (migration 0025):** triggers reject UPDATE/DELETE/TRUNCATE on `entries`, `checkpoints`, `admin_actions`, `screening_events`, `biometric_events` and `voided_transactions`; `transactions` rows are insert-only except `sealed_seq` NULL → value. The balance invariant is a statement-level `AFTER INSERT … REFERENCING NEW TABLE` trigger (cheaper than a per-row deferred one) that re-sums every touched transaction per currency — so a transaction's entries must be written in one INSERT, which `PostgresLedger` does. Cost ≈ +20–28 µs of DB CPU per post, within noise end to end. Only a superuser or the table owner can bypass the triggers; the runtime role `payment_app` is neither (§11).
 
 ---
 
@@ -477,6 +483,8 @@ Your "every stat possible" goal maps cleanly to three pillars + analytics:
 - **Structured logs (Loki):** JSON logs, correlation IDs, no PII in logs.
 - **Business analytics:** a read-replica / separate analytics store feeds reporting (volumes, active users, fraud rates, settlement reports for the regulator). Kept off the transactional primary so analytics never slows payments.
 - **Continuous reconciliation:** a background job constantly re-derives balances from `entries` and asserts they equal the materialized `balances`, and that all entries sum to zero. Any drift pages an engineer immediately. **This is your early-warning system for correctness bugs.**
+  - *As built:* incremental passes are O(new transactions), not O(history). `reconciled_sums` holds each account's entry sum through a `sealed_seq` watermark; a pass checks `balance = reconciled sum + entries sealed after the watermark or unsealed` in one REPEATABLE READ snapshot, checks those transactions net to zero, then folds the newly sealed range in (a hot account with 515k entries: 730–880 ms → 13–20 ms). A resumable full pass (`RECONCILE_FULL_EVERY_SECS`, daily) walks accounts in bounded chunks and also re-checks `reconciled_sums` against the entries. Mismatches are reported, never auto-repaired.
+  - *Workers are replica-safe:* sealing, verification, reconciliation and retention run only on the leader (Postgres advisory lock on a dedicated connection, TCP keepalives so a dead leader releases it); the outbox relay runs everywhere (`FOR UPDATE SKIP LOCKED` + `Nats-Msg-Id` dedup — consumers must tolerate cross-replica reordering). Metrics: `worker_leader`, `ledger_chain_verified`, `ledger_chain_full_verified_timestamp_seconds`, `reconciliation_healthy`, `reconciliation_full_timestamp_seconds`.
 
 ---
 
@@ -508,7 +516,7 @@ So:
 1. **Phase 1: `PostgresLedger`** — double-entry, row-locked, in the Postgres we already need. One fewer datastore to operate while we prove correctness and ship the product. Comfortably handles thousands of TPS — far beyond early Tajik volume.
 2. **Phase 2: `TigerBeetleLedger`** — swap the hot accounting path to a TigerBeetle cluster once real load (or load tests) justify the extra operational surface. Postgres stays for everything non-accounting.
 
-Because all business logic talks to the **trait**, this swap is a *configuration/wiring change, not a rewrite*. We get "ship correct soon" **and** "extremely fast at scale" without betting the launch on operating two consensus systems before we have users. The trait is designed from day one with TigerBeetle's model in mind (integer amounts, debit/credit transfers, pending/posted two-phase transfers) so the Postgres implementation doesn't paint us into a corner.
+*As built, this claim needs a correction:* money endpoints call `PostgresLedger::post_on` directly, and the rules that must hold *inside* the posting lock — the per-user AML window, single-use check/deposit-request transitions, audit rows — run as `PostHook`s on the same Postgres transaction. That co-location is exactly what makes them exact under concurrency, but it means a TigerBeetle move is a real port (those guards become two-phase pending/post transfers plus Postgres-side reservations), not a wiring change. The pure `LedgerEngine`/`InMemoryLedger` remains the reference model: a differential test (`crates/storage/tests/differential.rs`) replays random operation sequences against both and requires identical results and balances. Originally: because all business logic talks to the **trait**, this swap is a *configuration/wiring change, not a rewrite*. We get "ship correct soon" **and** "extremely fast at scale" without betting the launch on operating two consensus systems before we have users. The trait is designed from day one with TigerBeetle's model in mind (integer amounts, debit/credit transfers, pending/posted two-phase transfers) so the Postgres implementation doesn't paint us into a corner.
 
 ---
 
@@ -657,9 +665,12 @@ customer (once)      POST /v1/biometric/fingerprints  {finger, format, template,
 merchant terminal    POST /v1/checks   Idempotency-Key = check id   {account, amount_minor, description?}
                      → check {id, status:"open", expires_at}    (TTL 300 s default, 30 s … 1 h)
 
-customer's finger    POST /v1/checks/{id}/pay/fingerprint   Idempotency-Key   {format, template}
-                     1. check belongs to caller, is open, not expired, amount ≤ biometric cap
-                     2. identify: matcher → candidates → decision policy (§20.4)
+customer's finger    POST /v1/checks/{id}/pay/fingerprint   Idempotency-Key, X-Terminal-Key
+                     {format, template, payer_phone}
+                     1. check belongs to caller, is open, not expired, amount ≤ biometric cap;
+                        terminal key active for this merchant; probe not a replay; attempts left
+                     2. verify 1:1 against payer_phone's enrolments (or, opt-in, identify 1:N
+                        with the gallery-scaled threshold) → decision policy (§20.4, §20.8)
                      3. payer ≠ merchant; payer's best wallet in the check currency; balance ≥ amount
                      4. payer active, KYC ≥ 1, neither party blocklisted, per-tx AML limit
                      5. post_on: debit payer / credit merchant (− fee) / credit fee shard, with the
@@ -704,6 +715,7 @@ ambiguous_match` and the cashier asks for another finger. The exact matcher scor
 | `PUT /v1/templates/{enrollment_id}` | `{subject, format, template(base64)}` | 2xx |
 | `DELETE /v1/templates/{enrollment_id}` | — | 2xx or 404 |
 | `POST /v1/identify` | `{format, template(base64), limit}` | `{hits:[{enrollment_id, score}]}` |
+| `POST /v1/verify` | `{format, template(base64), enrollment_ids:[…]}` | `{hits:[{enrollment_id, score}]}` |
 | `GET /health` | — | 2xx |
 
 The sidecar owns the in-memory gallery; the database stays the source of truth (hits
@@ -716,8 +728,9 @@ wrong person). Enrolment pushes before commit; a 5xx / timeout is `503 retry_lat
 `BIOMETRIC_MATCHER` = `exact` | `http`, `BIOMETRIC_MATCHER_URL`,
 `BIOMETRIC_MATCHER_TIMEOUT_MS` (2000), `BIOMETRIC_MATCH_THRESHOLD` (40),
 `BIOMETRIC_MATCH_MARGIN` (10), `BIOMETRIC_MAX_MINOR` (200000), `CHECK_TTL_SECS` (300),
-`CHECK_MAX_TTL_SECS` (3600). `GET /v1/config` exposes `biometric_max_minor` and
-`check_ttl_secs` to terminals.
+`CHECK_MAX_TTL_SECS` (3600), `BIOMETRIC_IDENTIFY` (false), `BIOMETRIC_IDENTIFY_SCALE` (10),
+`BIOMETRIC_MAX_ATTEMPTS` (5). `GET /v1/config` exposes `biometric_max_minor`,
+`check_ttl_secs` and `biometric_identify` to terminals.
 
 ### 20.7 What is deliberately not built yet
 
@@ -725,14 +738,75 @@ wrong person). Enrolment pushes before commit; a 5xx / timeout is `503 retry_lat
   scanner-agnostic (template in, ISO/ANSI/raw).
 - **Matcher sidecar** — SourceAFIS (Java) behind §20.5 is the default plan; run it next
   to the API, one instance per site is enough for tens of thousands of templates.
-- **Terminal identity** — terminals authenticate as the merchant user today; a
-  `terminals` table with per-device API keys and a merchant role comes with the first
-  real merchant.
-- **Console** — enrolment / check / event views for support and disputes.
+- ~~Terminal identity~~ — built, see §20.8.
+- **Console** — enrolment / check / event views for support and disputes (terminal
+  registration and revocation are built).
 - Key rotation for `BIOMETRIC_TEMPLATE_KEY` (re-seal in place; the AAD makes rows
   self-describing), liveness / anti-spoof (scanner-dependent), a second factor above a
   configurable amount.
 
+### 20.8 As built — hardening (migration 0024)
+
+The first cut identified the payer 1:N at SourceAFIS's threshold 40, which is the
+**1:1** operating point (FMR ≈ 0.01 %). Searched against N templates the false-match
+rate compounds to ≈ 1 − (1 − 10⁻⁴)ᴺ — about 63 % at N = 10 000, i.e. an unenrolled
+finger usually "matches" somebody and that person pays. And any KYC'd user could act
+as a terminal and replay a captured template. Fixed as follows:
+
+- **1:1 by default.** `POST /v1/checks/{id}/pay/fingerprint` takes `payer_phone`; the
+  probe is compared only with that person's enrolments (`/v1/verify` on the sidecar)
+  at the normal threshold.
+- **1:N only by opt-in** (`BIOMETRIC_IDENTIFY=true`), with a gallery-scaled threshold
+  `BIOMETRIC_MATCH_THRESHOLD + BIOMETRIC_IDENTIFY_SCALE · log10(active enrolments)`
+  (scale 10: SourceAFIS scores ≈ −10·log10 FMR, so the *system-wide* false-match rate
+  stays at the 1:1 operating point).
+- **Terminal identity.** Admin-registered `terminals` per merchant; `X-Terminal-Key`
+  (32 random bytes, stored as SHA-256, constant-time compare, `last_used_at`) is
+  required on top of the merchant's bearer token; revocable from the console.
+- **Replay refusal.** In http mode a probe byte-identical to any earlier probe is refused
+  (`409 probe_replayed`) — a real scanner never produces the same bytes twice, so
+  terminals must rescan per attempt.
+- **Lockout.** After `BIOMETRIC_MAX_ATTEMPTS` (5) failed attempts the check is cancelled
+  (`409 check_locked`); an attempt slot is reserved before the matcher runs, so
+  concurrent probes can't exceed the budget (a request killed mid-attempt keeps its slot,
+  which only makes that check stricter until it expires).
+- **Less disclosure.** `payer_name` is masked ("Bilal S.") everywhere a merchant sees it.
+- `BIOMETRIC_MATCHER=exact` refuses to boot outside dev; enrolment no longer calls the
+  matcher while holding the user's row lock (payments lock that row for AML).
+
+Still open: liveness/anti-spoof (scanner-dependent), template-key rotation, the
+terminal app itself.
+
 ---
 
-*End of draft. Let's review §18 together, settle the open questions, and only then start Phase 0.*
+## 21. Money creation, AML and voids — added in the hardening pass
+
+- **Dual control on deposits (migration 0023).** `POST /v1/deposits` creates a
+  `deposit_requests` row (`202 pending_approval`); a *different* admin approves
+  (`POST /v1/admin/deposits/{id}/approve`) and only then is the ledger transaction
+  posted, with the request's status flip inside the posting lock (single use under
+  concurrency). The approver can be neither the requester nor the wallet owner
+  (`403 dual_control_required`); no admin can fund their own wallet; per-deposit cap
+  `DEPOSIT_MAX_MINOR`; every step lands in `admin_actions`. `DEPOSIT_DUAL_CONTROL=false`
+  is accepted only in dev. KYC review follows the same rule: nobody reviews their own
+  submission.
+- **AML per person, not per wallet.** The rolling 24 h amount and hourly velocity sum
+  every wallet the user owns (converted to TJS at the current rate; a wallet with
+  recent debits and no rate fails closed). Exactness under concurrency: inside the
+  posting transaction, after wallet locks, the guard takes the user's row
+  `FOR NO KEY UPDATE`. Lock order is wallets (sorted) → one user row → system shards,
+  so it cannot deadlock. One wallet per currency per user (`POST /v1/wallets` returns
+  the existing one).
+- **Recipients** whose user status is not `active` cannot be paid
+  (`403 recipient_unavailable`). Registration creates user, wallet and session in one
+  transaction.
+- **Voids.** `POST /v1/transactions/{id}/void` claims an unused idempotency key as
+  voided (a `transactions` row with no entries + `voided_transactions`); any later
+  money request with that key gets `409 voided`, and if the key had already posted the
+  call returns the posted transaction instead. Clients void before discarding an
+  unsettled payment, so "discard then pay again" can never double-pay. Status lookups
+  use `GET /v1/transactions/{id}` (only the caller's own entries are shown).
+
+---
+
+*Originally the end of the pre-code draft; the sections above record what was built.*
