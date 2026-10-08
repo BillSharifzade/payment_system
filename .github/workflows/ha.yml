@@ -55,9 +55,12 @@ jobs:
           prom() { docker run --rm -v "$PWD/deploy:/d:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" "$@"; }
           prom check rules /d/ha/prometheus-rules.yml
           prom test rules /d/ha/tests/prometheus-rules.test.yml
-          # monitoring/prometheus.yml + the scrape_config_files line the HA monitoring overlay needs.
+          # monitoring/prometheus.yml with its scrape_config_files glob pointed at the HA jobs
+          # (the HA monitoring overlay mounts them at /etc/prometheus/scrape/).
           mkdir -p "$RUNNER_TEMP/prom"
-          { cat deploy/monitoring/prometheus.yml; printf '\nscrape_config_files:\n  - /d/ha/prometheus-scrape.yml\n'; } > "$RUNNER_TEMP/prom/prometheus.yml"
+          sed 's#/etc/prometheus/scrape/\*\.yml#/d/ha/prometheus-scrape.yml#' deploy/monitoring/prometheus.yml \
+            > "$RUNNER_TEMP/prom/prometheus.yml"
+          grep -q '/d/ha/prometheus-scrape.yml' "$RUNNER_TEMP/prom/prometheus.yml"
           docker run --rm -v "$PWD/deploy:/d:ro" -v "$RUNNER_TEMP/prom:/p:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" check config /p/prometheus.yml
 
   drill:
