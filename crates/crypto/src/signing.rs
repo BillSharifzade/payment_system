@@ -10,6 +10,8 @@ pub enum SigningError {
     InvalidSignature,
     #[error("signature verification failed")]
     VerificationFailed,
+    #[error("signed by a key that is not trusted")]
+    UntrustedKey,
 }
 
 pub struct Sealer {
@@ -53,6 +55,78 @@ pub fn verify_hash(
         .map_err(|_| SigningError::VerificationFailed)
 }
 
+/// The verifying keys an auditor accepts. A signature is only meaningful if the
+/// key that made it is trusted out of band: a key stored next to the data it
+/// signs proves nothing, since whoever can rewrite the data can re-sign it.
+/// Rotation keeps retired keys here so history they signed still verifies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustedKeys {
+    keys: Vec<[u8; 32]>,
+}
+
+impl TrustedKeys {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Comma- (or whitespace-) separated hex Ed25519 public keys.
+    pub fn from_hex_list(list: &str) -> Result<Self, SigningError> {
+        let mut keys = Self::new();
+        for item in list.split(|c: char| c == ',' || c.is_whitespace()) {
+            if item.is_empty() {
+                continue;
+            }
+            let bytes: [u8; 32] = hex::decode(item)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .ok_or(SigningError::InvalidPublicKey)?;
+            keys.insert(bytes)?;
+        }
+        Ok(keys)
+    }
+
+    pub fn insert(&mut self, key: [u8; 32]) -> Result<(), SigningError> {
+        VerifyingKey::from_bytes(&key).map_err(|_| SigningError::InvalidPublicKey)?;
+        if !self.keys.contains(&key) {
+            self.keys.push(key);
+        }
+        Ok(())
+    }
+
+    pub fn with(mut self, key: [u8; 32]) -> Result<Self, SigningError> {
+        self.insert(key)?;
+        Ok(self)
+    }
+
+    pub fn is_trusted(&self, key: &[u8; 32]) -> bool {
+        self.keys.contains(key)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn to_hex(&self) -> Vec<String> {
+        self.keys.iter().map(hex::encode).collect()
+    }
+
+    pub fn verify(
+        &self,
+        signer: &[u8; 32],
+        hash: &Hash,
+        signature: &[u8; 64],
+    ) -> Result<(), SigningError> {
+        if !self.is_trusted(signer) {
+            return Err(SigningError::UntrustedKey);
+        }
+        verify_hash(signer, hash, signature)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +154,35 @@ mod tests {
         let h = sha256(b"x");
         let sig = sealer.sign_hash(&h);
         assert!(verify_hash(&other.public_key_bytes(), &h, &sig).is_err());
+    }
+
+    #[test]
+    fn only_trusted_keys_verify() {
+        let current = Sealer::generate();
+        let retired = Sealer::generate();
+        let attacker = Sealer::generate();
+        let list = format!(" {}, \n", retired.public_key_hex());
+        let trusted = TrustedKeys::from_hex_list(&list)
+            .unwrap()
+            .with(current.public_key_bytes())
+            .unwrap();
+        assert_eq!(trusted.len(), 2);
+        let h = sha256(b"cp");
+        for s in [&current, &retired] {
+            assert!(trusted
+                .verify(&s.public_key_bytes(), &h, &s.sign_hash(&h))
+                .is_ok());
+        }
+        assert!(matches!(
+            trusted.verify(&attacker.public_key_bytes(), &h, &attacker.sign_hash(&h)),
+            Err(SigningError::UntrustedKey)
+        ));
+        assert!(matches!(
+            trusted.verify(&current.public_key_bytes(), &h, &attacker.sign_hash(&h)),
+            Err(SigningError::VerificationFailed)
+        ));
+        assert!(TrustedKeys::from_hex_list("abcd").is_err());
+        assert!(TrustedKeys::from_hex_list("").unwrap().is_empty());
     }
 
     #[test]
