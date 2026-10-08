@@ -141,7 +141,145 @@ mod tests {
         assert!(ledger.is_conserved());
     }
 
+    struct MultiCurrency {
+        ledger: InMemoryLedger,
+        usd: Currency,
+        settlement: [AccountId; 2],
+        fx: [AccountId; 2],
+        fee: AccountId,
+        wallets: [Vec<AccountId>; 2],
+    }
+
+    fn multi_currency() -> MultiCurrency {
+        let usd = Currency::new("USD", 2).unwrap();
+        let mut ledger = InMemoryLedger::new();
+        let mut open = |ty, currency| {
+            let id = AccountId::new();
+            ledger.open_account(Account::new(id, ty, currency)).unwrap();
+            id
+        };
+        let settlement = [
+            open(AccountType::SystemSettlement, tjs()),
+            open(AccountType::SystemSettlement, usd),
+        ];
+        let fx = [
+            open(AccountType::SystemFxGainLoss, tjs()),
+            open(AccountType::SystemFxGainLoss, usd),
+        ];
+        let fee = open(AccountType::SystemFeeRevenue, tjs());
+        let wallets = [
+            (0..3)
+                .map(|_| open(AccountType::UserWallet, tjs()))
+                .collect(),
+            (0..3).map(|_| open(AccountType::UserWallet, usd)).collect(),
+        ];
+        MultiCurrency {
+            ledger,
+            usd,
+            settlement,
+            fx,
+            fee,
+            wallets,
+        }
+    }
+
     proptest! {
+        #[test]
+        fn money_is_conserved_across_currencies_fees_and_fx(
+            ops in prop::collection::vec(
+                (0u8..5, 0usize..3, 0usize..3, 1i128..100_000i128, any::<bool>()),
+                0..200,
+            )
+        ) {
+            let mut book = multi_currency();
+            let currencies = [tjs(), book.usd];
+            let mut deposited = [0i128; 2];
+            let mut fees = 0i128;
+            let every: Vec<AccountId> = book
+                .settlement
+                .iter()
+                .chain(&book.fx)
+                .chain([&book.fee])
+                .chain(book.wallets.iter().flatten())
+                .copied()
+                .collect();
+
+            for (kind, a, b, amount, usd_side) in ops {
+                let c = usd_side as usize;
+                let cur = currencies[c];
+                let money = |minor, currency| Money::from_minor(minor, currency);
+                let txn = match kind {
+                    0 => Transaction::with_entries(vec![
+                        Entry::debit(book.settlement[c], money(amount, cur)),
+                        Entry::credit(book.wallets[c][a], money(amount, cur)),
+                    ]),
+                    1 => Transaction::with_entries(vec![
+                        Entry::debit(book.wallets[c][a], money(amount, cur)),
+                        Entry::credit(book.wallets[c][b], money(amount, cur)),
+                    ]),
+                    2 => {
+                        let fee = (amount / 100).max(1);
+                        Transaction::with_entries(vec![
+                            Entry::debit(book.wallets[0][a], money(amount + fee, tjs())),
+                            Entry::credit(book.wallets[0][b], money(amount, tjs())),
+                            Entry::credit(book.fee, money(fee, tjs())),
+                        ])
+                    }
+                    3 => {
+                        // Two legs, each balanced in its own currency.
+                        let other = 1 - c;
+                        let converted = (amount * 3 / 7).max(1);
+                        Transaction::with_entries(vec![
+                            Entry::debit(book.wallets[c][a], money(amount, cur)),
+                            Entry::credit(book.fx[c], money(amount, cur)),
+                            Entry::debit(book.fx[other], money(converted, currencies[other])),
+                            Entry::credit(book.wallets[other][b], money(converted, currencies[other])),
+                        ])
+                    }
+                    _ => Transaction::with_entries(vec![
+                        Entry::debit(book.wallets[c][a], money(amount, cur)),
+                        Entry::credit(book.wallets[1 - c][b], money(amount, currencies[1 - c])),
+                    ]),
+                };
+
+                let before: Vec<i128> = every
+                    .iter()
+                    .map(|id| book.ledger.balance(*id).unwrap().minor_units())
+                    .collect();
+                match book.ledger.post(&txn) {
+                    Ok(()) => {
+                        prop_assert!(kind != 4, "a cross-currency transfer must not post");
+                        if kind == 0 {
+                            deposited[c] += amount;
+                        }
+                        if kind == 2 {
+                            fees += (amount / 100).max(1);
+                        }
+                    }
+                    Err(_) => {
+                        let after: Vec<i128> = every
+                            .iter()
+                            .map(|id| book.ledger.balance(*id).unwrap().minor_units())
+                            .collect();
+                        prop_assert_eq!(before, after, "a rejected transaction changes nothing");
+                    }
+                }
+
+                prop_assert!(book.ledger.is_conserved());
+                for (i, currency) in currencies.iter().enumerate() {
+                    prop_assert_eq!(book.ledger.net_minor_units(*currency), 0);
+                    prop_assert_eq!(
+                        book.ledger.balance(book.settlement[i]).unwrap().minor_units(),
+                        deposited[i]
+                    );
+                    for w in &book.wallets[i] {
+                        prop_assert!(book.ledger.balance(*w).unwrap().minor_units() >= 0);
+                    }
+                }
+                prop_assert_eq!(book.ledger.balance(book.fee).unwrap().minor_units(), fees);
+            }
+        }
+
         #[test]
         fn money_is_always_conserved(
             ops in prop::collection::vec(

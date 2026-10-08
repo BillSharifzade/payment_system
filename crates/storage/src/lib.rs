@@ -65,11 +65,6 @@ struct LockedWallet {
     raw_minor: i64,
 }
 
-struct SystemAccount {
-    account_type: AccountType,
-    currency: Currency,
-}
-
 fn parse_account_type(type_str: &str) -> Result<AccountType> {
     AccountType::from_db_str(type_str)
         .ok_or_else(|| StorageError::DataIntegrity(format!("account_type={type_str}")))
@@ -322,7 +317,7 @@ impl PostgresLedger {
             .copied()
             .filter(|id| !wallets.contains_key(id))
             .collect();
-        let mut system: HashMap<Uuid, SystemAccount> = HashMap::with_capacity(system_ids.len());
+        let mut system: HashMap<Uuid, Currency> = HashMap::with_capacity(system_ids.len());
         if !system_ids.is_empty() {
             let rows = sqlx::query(
                 "SELECT a.id, a.account_type, a.currency, c.exponent
@@ -343,13 +338,7 @@ impl PostgresLedger {
                         "account {id} is {type_str} but was not lockable as a wallet"
                     )));
                 }
-                system.insert(
-                    id,
-                    SystemAccount {
-                        account_type,
-                        currency: parse_currency(&code, exponent)?,
-                    },
-                );
+                system.insert(id, parse_currency(&code, exponent)?);
             }
             if let Some(missing) = system_ids.iter().find(|id| !system.contains_key(id)) {
                 return Err(LedgerError::UnknownAccount(AccountId(*missing)).into());
@@ -372,8 +361,8 @@ impl PostgresLedger {
             let signed = Self::to_i64(entry.signed_amount()?.minor_units())?;
             let (account_currency, slot) = if let Some(w) = wallets.get(&id) {
                 (w.currency, proposed.get_mut(&id))
-            } else if let Some(s) = system.get(&id) {
-                (s.currency, deltas.get_mut(&id))
+            } else if let Some(currency) = system.get(&id) {
+                (*currency, deltas.get_mut(&id))
             } else {
                 return Err(LedgerError::UnknownAccount(entry.account_id).into());
             };
@@ -477,7 +466,6 @@ impl PostgresLedger {
             if delta == 0 {
                 continue;
             }
-            let _ = system[&id].account_type;
             let updated = sqlx::query(
                 "UPDATE balances
                  SET raw_minor = raw_minor + $2, version = version + 1, updated_at = now()
