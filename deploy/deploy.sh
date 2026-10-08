@@ -49,10 +49,11 @@ chmod 600 .env app.env
 # the base file and overlays. An explicit COMPOSE_FILE from the caller wins.
 COMPOSE_FILE=$(setting COMPOSE_FILE)
 export COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
-lan=0; monitoring=0; walarchive=0
+lan=0; monitoring=0; walarchive=0; ha=0
 [[ ":$COMPOSE_FILE:" == *":docker-compose.lan.yml:"* ]] && lan=1
 [[ ":$COMPOSE_FILE:" == *":docker-compose.monitoring.yml:"* ]] && monitoring=1
 [[ ":$COMPOSE_FILE:" == *":docker-compose.wal-archive.yml:"* ]] && walarchive=1
+[[ ":$COMPOSE_FILE:" == *":ha/docker-compose.ha.yml:"* ]] && ha=1
 
 # ---- 2. Preflight: refuse unsafe or unconverted configurations --------------
 problems=()
@@ -91,6 +92,18 @@ if [[ $monitoring -eq 1 ]]; then
 fi
 if [[ $walarchive -eq 1 && ! -s secrets/pgbackrest.conf ]]; then
   problems+=("WAL overlay: create secrets/pgbackrest.conf from pgbackrest/pgbackrest.conf.example")
+fi
+if [[ $ha -eq 1 ]]; then
+  [[ $walarchive -eq 0 ]] \
+    || problems+=("ha/docker-compose.ha.yml archives WAL itself: remove docker-compose.wal-archive.yml from COMPOSE_FILE")
+  [[ -s secrets/pgbackrest.conf ]] \
+    || problems+=("HA overlay: create secrets/pgbackrest.conf from ha/pgbackrest.conf.example (WAL archiving is part of the HA stack)")
+  # A single-node volume means a ledger that may not have been moved into the
+  # cluster yet: deploying would start the app on an EMPTY database.
+  if volume_exists pgdata && [[ ! -f secrets/.ha-v1 ]]; then
+    problems+=("HA overlay: the single-node database (volume pgdata) has not been moved into the cluster yet.
+     Follow deploy/README.md \"Moving to the HA cluster\" (final dump, restore into the leader), then: touch secrets/.ha-v1")
+  fi
 fi
 
 encryption=$(setting BACKUP_ENCRYPTION)
@@ -160,6 +173,7 @@ say "IMAGE_TAG=$IMAGE_TAG  COMPOSE_FILE=$COMPOSE_FILE"
 # ---- 5. Build (or check the shipped images) ---------------------------------
 images=(payment-system payment-console payment-backup)
 [[ $walarchive -eq 1 ]] && images+=(payment-postgres)
+[[ $ha -eq 1 ]] && images+=(payment-patroni)
 if [[ $BUILD -eq 1 ]]; then
   say "building images (cargo-chef caches the dependency layer)..."
   docker compose build
@@ -186,10 +200,15 @@ export API_REPLICAS API_UPSTREAMS
 # ---- 8. Data tier, roles, pre-deploy dump -----------------------------------
 say "starting postgres, redis, nats..."
 docker compose up -d --wait --wait-timeout 180 postgres redis nats
-say "database roles (postgres/10-roles.sh)..."
-docker compose exec -T postgres bash /docker-entrypoint-initdb.d/10-roles.sh
+# With the HA overlay `postgres` is HAProxy: superuser work runs on the leading member.
+dbsvc=postgres
+if [[ $ha -eq 1 ]]; then
+  dbsvc=$(ha/ha-leader.sh) || die "no database member is leading (docker compose exec pg-1 patronictl list)"
+fi
+say "database roles (postgres/10-roles.sh on $dbsvc)..."
+docker compose exec -T "$dbsvc" bash /docker-entrypoint-initdb.d/10-roles.sh
 
-psql_su() { docker compose exec -T postgres psql -X -qtA -v ON_ERROR_STOP=1 -U payment -d payment "$@"; }
+psql_su() { docker compose exec -T "$dbsvc" psql -X -qtA -v ON_ERROR_STOP=1 -U payment -d payment "$@"; }
 # (assigned first: a failing query must stop the deploy, not read as "empty")
 has_schema=$(psql_su -c "SELECT to_regclass('public._sqlx_migrations') IS NOT NULL") \
   || die "cannot query the database (docker compose logs postgres)"

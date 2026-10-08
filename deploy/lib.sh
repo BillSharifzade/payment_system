@@ -124,6 +124,13 @@ generate_secrets() {
     say "generated secrets/nats_auth.conf + secrets/nats_url"
   fi
 
+  # HA overlay (ha/docker-compose.ha.yml): replication, Patroni REST API and
+  # etcd credentials (generated always; unused without the overlay).
+  gen_secret pg_replication_password 24
+  gen_secret patroni_api_password    24
+  gen_secret etcd_root_password      24
+  gen_secret etcd_patroni_password   24
+
   # Optional off-box copy target for the backup sidecars (rclone config). An
   # empty placeholder keeps compose happy when no target is configured.
   [[ -f secrets/backup_rclone_conf ]] || write_secret backup_rclone_conf ""

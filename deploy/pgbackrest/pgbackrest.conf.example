@@ -47,3 +47,5 @@ compress-level=3
 pg1-path=/var/lib/postgresql/data
 pg1-port=5432
 pg1-socket-path=/var/run/postgresql
+# The cluster's superuser (there is no `postgres` role: POSTGRES_USER=payment).
+pg1-user=payment

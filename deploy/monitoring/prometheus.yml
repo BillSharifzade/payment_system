@@ -9,6 +9,11 @@ global:
 rule_files:
   - /etc/prometheus/rules/*.yml
 
+# Scrape jobs dropped in by overlays (ha/docker-compose.ha-monitoring.yml mounts
+# ha/prometheus-scrape.yml here: Patroni, etcd, HAProxy). No file, no jobs.
+scrape_config_files:
+  - /etc/prometheus/scrape/*.yml
+
 alerting:
   alertmanagers:
     - static_configs:
