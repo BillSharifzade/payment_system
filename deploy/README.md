@@ -188,7 +188,7 @@ version the database already has. The pre-deploy dump in
   rate limits, fees, AML tiers, deposits — `DEPOSIT_DUAL_CONTROL`,
   `DEPOSIT_MAX_MINOR` —, biometrics — `BIOMETRIC_MATCHER(_URL)`,
   `BIOMETRIC_IDENTIFY`, `BIOMETRIC_IDENTIFY_SCALE`, `BIOMETRIC_MAX_ATTEMPTS` —,
-  device binding — `DEVICE_BINDING`, `DEVICE_MAX_PER_USER` —, worker cadences
+  device binding — `DEVICE_BINDING`, `DEVICE_MAX_ACTIVE` —, worker cadences
   incl. `VERIFY_FULL_EVERY_SECS`, retention). **Every numeric value is parsed
   strictly**: a typo refuses to boot rather than silently reverting a
   compliance limit. **No secrets or URLs here**: a plain `DATABASE_URL`,

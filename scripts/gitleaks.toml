@@ -13,4 +13,6 @@ regexes = [
   # The old deploy/app.env.example placeholder for BIOMETRIC_TEMPLATE_KEY. The
   # key is now a generated secret file; the placeholder survives in history.
   '''replace-with-64-hex-chars''',
+  # Fake terminal API key used as a fixture in the console's Terminals test.
+  '''tk_live_5f3c9a1e7b2d4c6f8a0b1c2d3e4f5a6b''',
 ]

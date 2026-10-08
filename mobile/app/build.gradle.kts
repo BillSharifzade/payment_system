@@ -1,4 +1,7 @@
+import java.net.URI
+import java.net.URISyntaxException
 import java.text.SimpleDateFormat
+import java.util.Base64
 import java.util.Date
 import java.util.Properties
 
@@ -53,7 +56,7 @@ fun validatedPins(raw: String, source: String): String {
     for (pin in pins) {
         if (!pin.startsWith("sha256/")) throw GradleException("$source: certificate pin must start with sha256/: $pin")
         val hash = try {
-            java.util.Base64.getDecoder().decode(pin.removePrefix("sha256/"))
+            Base64.getDecoder().decode(pin.removePrefix("sha256/"))
         } catch (e: IllegalArgumentException) {
             throw GradleException("$source: certificate pin is not valid base64: $pin")
         }
@@ -77,9 +80,9 @@ val stagingCertPins = validatedPins(gradleOrEnv("paymentCertPinsStaging", "PAYME
 // see generateStaging*NetworkSecurityConfig below) — not to every host.
 val stagingBaseUrl: String = (project.findProperty("API_BASE_URL") as String?)
     ?.trim()?.takeIf { it.isNotEmpty() } ?: "http://192.168.1.156:8099"
-val stagingUri: java.net.URI = try {
-    java.net.URI(stagingBaseUrl)
-} catch (e: java.net.URISyntaxException) {
+val stagingUri: URI = try {
+    URI(stagingBaseUrl)
+} catch (e: URISyntaxException) {
     throw GradleException("API_BASE_URL is not a valid URL: '$stagingBaseUrl'", e)
 }
 val stagingHost: String = stagingUri.host
