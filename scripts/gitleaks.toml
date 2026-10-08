@@ -1,0 +1,18 @@
+# Secret-scanning rules for CI (the `secrets` job in .github/workflows/ci.yml).
+# Extends the scanner's default rule set; the allowlist below covers known,
+# non-secret placeholders only. Never allowlist a real credential: rotate it,
+# then purge it from history.
+title = "payment_system"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "documented placeholders (not secrets)"
+regexes = [
+  # The old deploy/app.env.example placeholder for BIOMETRIC_TEMPLATE_KEY. The
+  # key is now a generated secret file; the placeholder survives in history.
+  '''replace-with-64-hex-chars''',
+  # Fake terminal API key used as a fixture in the console's Terminals test.
+  '''tk_live_5f3c9a1e7b2d4c6f8a0b1c2d3e4f5a6b''',
+]

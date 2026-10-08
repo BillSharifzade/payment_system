@@ -1,0 +1,102 @@
+# OPT-IN overlay: checkpoints are signed by HashiCorp Vault's transit engine
+# (a non-exportable ed25519 key) instead of a key in the workers' memory —
+# DESIGN.md §12.8. Layered on the prod (or lan) file; needs Compose >= v2.24.4
+# (`!override`). First time:
+#
+#   1. COMPOSE_FILE=docker-compose.prod.yml:docker-compose.vault.yml   (deploy/.env;
+#      keep :docker-compose.monitoring.yml etc. if you use them)
+#   2. docker compose up -d vault
+#      docker compose exec vault vault operator init -key-shares=5 -key-threshold=3
+#        -> keep the unseal keys and the root token OFFLINE, apart from each other
+#      docker compose exec vault vault operator unseal       (3 times; after every Vault restart)
+#   3. VAULT_TOKEN=<root> VAULT_CMD="docker compose exec -T -e VAULT_TOKEN vault vault" vault/bootstrap.sh
+#        -> secrets/vault_role_id, secrets/vault_secret_id, and the key's public half
+#   4. append that public key to secrets/worker_trusted_public_keys (comma-separated;
+#      KEEP the old local key's: it signed the history so far)
+#   5. ./deploy.sh — the workers sign through Vault from their next checkpoint
+#   6. revoke the root token (vault token revoke <root>) and shred
+#      secrets/worker_signing_key: until it is destroyed, whoever has the file
+#      can still sign checkpoints the verifier accepts
+#
+# While Vault is sealed or down, sealing pauses (UnsealedBacklogAging,
+# CheckpointSignerUnavailable alerts); the API and the outbox relay keep
+# running. Back up the vaultdata volume (`vault operator raft snapshot save`):
+# losing it loses the key — history stays verifiable (its public key is
+# pinned), but new checkpoints need a new key.
+name: payment
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+      labels: "com.docker.compose.service,com.docker.compose.project"
+
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+
+services:
+  vault:
+    image: hashicorp/vault:2.1.1@sha256:47f14a6acb98f48d798a07df7c83f23a6e636e1cf724c5f8ff165cb32667a1e2
+    restart: unless-stopped
+    <<: [*logging, *hardening]
+    # The image's vault user from the start: no root entrypoint phase, so no
+    # chown/setcap (hence disable_mlock in vault.hcl) and every capability dropped.
+    user: "100:1000"
+    command: ["server"]
+    environment:
+      SKIP_CHOWN: "true"
+      SKIP_SETCAP: "true"
+      # For `docker compose exec vault vault ...` and the healthcheck.
+      VAULT_ADDR: http://127.0.0.1:8200
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - ./vault/vault.hcl:/vault/config/vault.hcl:ro
+      - vaultdata:/vault/file
+    networks: [vault]
+    healthcheck:
+      # `vault status` exits 2 while sealed: a sealed Vault is unhealthy.
+      test: ["CMD", "vault", "status"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 256
+
+  payment-workers:
+    environment:
+      WORKER_SIGNER: vault
+      VAULT_ADDR: http://vault:8200
+      VAULT_ROLE_ID_FILE: /run/secrets/vault_role_id
+      VAULT_SECRET_ID_FILE: /run/secrets/vault_secret_id
+      VAULT_TRANSIT_KEY: checkpoint-signing
+      WORKER_SIGNING_KEY_FILE: !reset null
+    # The local signing key is no longer mounted (the workers refuse to start
+    # with WORKER_SIGNER=vault and a WORKER_SIGNING_KEY present).
+    secrets: !override [database_url, worker_trusted_public_keys, nats_url, vault_role_id, vault_secret_id]
+    networks: [backend, vault]
+    # Started, not healthy: a sealed Vault must not stop the outbox relay.
+    depends_on:
+      vault: { condition: service_started }
+
+networks:
+  # Only the workers and Vault; no egress.
+  vault:
+    internal: true
+
+secrets:
+  vault_role_id:
+    file: ./secrets/vault_role_id
+  vault_secret_id:
+    file: ./secrets/vault_secret_id
+
+volumes:
+  vaultdata:

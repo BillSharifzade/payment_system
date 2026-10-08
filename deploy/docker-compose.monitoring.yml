@@ -1,18 +1,25 @@
 # Optional monitoring overlay: logs (promtail -> Loki), metrics (Prometheus
-# scraping the two app binaries), alerting (Loki ruler + Prometheus rules ->
-# Alertmanager -> your webhook) and Grafana dashboards. Layer it on the core
-# stack by listing both files in deploy/.env:
+# scraping the two app binaries, the host and Postgres), alerting (Loki ruler +
+# Prometheus rules -> Alertmanager -> your webhook, plus an outbound
+# dead man's switch) and Grafana. Layer it on the core stack in deploy/.env:
 #
 #   COMPOSE_FILE=docker-compose.prod.yml:docker-compose.monitoring.yml
 #   GRAFANA_PASSWORD=...            required, no default
 #   ALERT_WEBHOOK_URL=https://...   required: where alerts are POSTed
 #                                   (Slack/Mattermost/Telegram bridge, PagerDuty
 #                                   events API, ntfy, ...)
+#   ALERT_HEARTBEAT_URL=https://... required: pinged every minute by the
+#                                   always-firing Watchdog alert. An EXTERNAL
+#                                   service (healthchecks.io, Cronitor, ...)
+#                                   must page you when the pings stop: it is
+#                                   the only alert that survives the whole box
+#                                   going down.
 #
 # Grafana binds to 127.0.0.1 only — reach it via SSH tunnel:
 #   ssh -L 3000:localhost:3000 user@server   then open http://localhost:3000
-# Nothing else publishes a port; Prometheus/Loki/Alertmanager are reachable
-# only on the internal network (Grafana, or `docker compose exec`).
+# Nothing else publishes a port. The `monitoring` network is internal (no
+# egress); only Alertmanager (webhooks) and Grafana (its loopback port) are
+# also attached to `egress`.
 name: payment
 
 x-logging: &logging
@@ -28,8 +35,14 @@ x-hardening: &hardening
   cap_drop: [ALL]
 
 services:
+  # The scrape targets join the monitoring network (in addition to their own).
+  payment-server:
+    networks: [edge, backend, monitoring]
+  payment-workers:
+    networks: [backend, monitoring]
+
   loki:
-    image: grafana/loki:3.7.8
+    image: grafana/loki:3.7.8@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193
     restart: unless-stopped
     <<: [*logging, *hardening]
     command: ["-config.file=/etc/loki/loki.yml"]
@@ -40,9 +53,14 @@ services:
       # Ruler rules: <dir>/<tenant>/<file>. Single-tenant mode = tenant "fake".
       - ./monitoring/loki-rules:/etc/loki/rules:ro
       - lokidata:/loki
-    expose: ["3100"]
-    # No healthcheck: the image is distroless (no shell or wget). promtail and
-    # Grafana simply retry until it answers.
+    networks: [monitoring]
+    # The image is distroless (no shell, no wget); the binary has its own probe.
+    healthcheck:
+      test: ["CMD", "/usr/bin/loki", "-health", "-health.url=http://127.0.0.1:3100/ready"]
+      interval: 15s
+      timeout: 6s
+      retries: 5
+      start_period: 60s
     stop_grace_period: 30s
     deploy:
       resources:
@@ -51,7 +69,7 @@ services:
           pids: 256
 
   promtail:
-    image: grafana/promtail:3.6.11
+    image: grafana/promtail:3.6.11@sha256:a761cb834cfaeee29745440d4884d6748f0a08d8f68928db1d707018c1dcfbe9
     restart: unless-stopped
     <<: [*logging, *hardening]
     command: ["-config.file=/etc/promtail/config.yml"]
@@ -64,7 +82,9 @@ services:
       # Caddy's JSON access log lives on the caddydata volume.
       - caddydata:/caddy-data:ro
       - promtailpos:/tmp
-    depends_on: [loki]
+    networks: [monitoring]
+    depends_on:
+      loki: { condition: service_healthy }
     deploy:
       resources:
         limits:
@@ -72,7 +92,7 @@ services:
           pids: 128
 
   prometheus:
-    image: prom/prometheus:v3.14.0
+    image: prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
     restart: unless-stopped
     <<: [*logging, *hardening]
     command:
@@ -87,7 +107,7 @@ services:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/prometheus-rules.yml:/etc/prometheus/rules/payment.yml:ro
       - promdata:/prometheus
-    expose: ["9090"]
+    networks: [monitoring]
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
       interval: 15s
@@ -102,25 +122,29 @@ services:
           pids: 256
 
   alertmanager:
-    image: prom/alertmanager:v0.34.1
+    image: prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
     restart: unless-stopped
     <<: [*logging, *hardening]
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
       - --storage.path=/alertmanager
       - --web.listen-address=0.0.0.0:9093
+      # Single instance: no gossip port.
+      - --cluster.listen-address=
     read_only: true
     tmpfs: [/tmp]
     volumes:
       - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
       - amdata:/alertmanager
-    # The webhook URL comes from the environment (ALERT_WEBHOOK_URL in .env) via
-    # an inline compose config -> file -> `url_file` in alertmanager.yml, so the
-    # URL (often a bearer secret) never sits in a committed file.
+    # The webhook and heartbeat URLs come from deploy/.env through inline
+    # compose configs -> files -> `url_file` in alertmanager.yml, so the URLs
+    # (often bearer secrets) never sit in a committed file.
     configs:
       - source: alert_webhook_url
         target: /etc/alertmanager/webhook_url
-    expose: ["9093"]
+      - source: alert_heartbeat_url
+        target: /etc/alertmanager/heartbeat_url
+    networks: [monitoring, egress]
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9093/-/ready"]
       interval: 15s
@@ -134,7 +158,7 @@ services:
           pids: 128
 
   grafana:
-    image: grafana/grafana:13.2.2
+    image: grafana/grafana:13.2.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0
     restart: unless-stopped
     <<: [*logging, *hardening]
     environment:
@@ -151,7 +175,12 @@ services:
       - grafanadata:/var/lib/grafana
     ports:
       - "127.0.0.1:3000:3000"
-    depends_on: [loki, prometheus]
+    # egress only so the loopback port can be published (an internal network
+    # cannot publish ports).
+    networks: [monitoring, egress]
+    depends_on:
+      loki: { condition: service_healthy }
+      prometheus: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
       interval: 15s
@@ -164,9 +193,73 @@ services:
           memory: 256M
           pids: 256
 
+  # Host metrics: disk space of the filesystem the database and the backups
+  # live on, memory, load — and the backup sidecars' last-success timestamps
+  # through the textfile collector (backupmetrics volume).
+  node-exporter:
+    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    restart: unless-stopped
+    <<: [*logging, *hardening]
+    command:
+      - --path.rootfs=/host
+      - --collector.textfile.directory=/textfile
+      - --web.listen-address=0.0.0.0:9100
+    read_only: true
+    volumes:
+      - /:/host:ro,rslave
+      - backupmetrics:/textfile:ro
+    networks: [monitoring]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9100/metrics"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          pids: 64
+
+  # Postgres metrics as the pg_monitor role payment_monitor (+ the deposit
+  # query in monitoring/postgres-exporter-queries.yml). WAL-archiver metrics
+  # (pg_stat_archiver_*) feed the WAL-archive alerts when that overlay is on.
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.20.1@sha256:ac5ec343104fae0e2d84a27bb8d69b38430a11910c5382cad85d478d2bab713e
+    restart: unless-stopped
+    <<: [*logging, *hardening]
+    group_add: ["${SECRETS_GID:-10500}"]
+    environment:
+      DATA_SOURCE_URI: postgres:5432/payment?sslmode=disable
+      DATA_SOURCE_USER: payment_monitor
+      DATA_SOURCE_PASS_FILE: /run/secrets/pg_monitor_password
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
+    secrets: [pg_monitor_password]
+    read_only: true
+    volumes:
+      - ./monitoring/postgres-exporter-queries.yml:/etc/postgres-exporter/queries.yml:ro
+    networks: [backend, monitoring]
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9187/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          pids: 64
+
+networks:
+  monitoring:
+    internal: true
+
 configs:
   alert_webhook_url:
     content: ${ALERT_WEBHOOK_URL:?set ALERT_WEBHOOK_URL in deploy/.env (alerts are POSTed there)}
+  alert_heartbeat_url:
+    content: ${ALERT_HEARTBEAT_URL:?set ALERT_HEARTBEAT_URL in deploy/.env (external dead man's switch, pinged every minute)}
 
 volumes:
   lokidata:
@@ -174,5 +267,6 @@ volumes:
   promdata:
   amdata:
   grafanadata:
-  # Declared in the core file; repeated here so promtail can tail the access log.
+  # Declared in the core file; repeated here so the overlay stands on its own.
   caddydata:
+  backupmetrics:

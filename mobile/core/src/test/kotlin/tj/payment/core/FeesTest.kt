@@ -43,4 +43,12 @@ class FeesTest {
         // Overflow -> null, never a wrapped number.
         assertEquals(null, rate.convert(Long.MAX_VALUE))
     }
+
+    @Test
+    fun `the fee preview is TJS only, like the backend`() {
+        assertEquals(10_00L, transferFeePreviewMinor(2_000_00, "TJS", 50))
+        assertEquals(null, transferFeePreviewMinor(2_000_00, "USD", 50))
+        assertEquals(null, transferFeePreviewMinor(2_000_00, "TJS", null))
+        assertEquals(0L, transferFeePreviewMinor(2_000_00, "TJS", 0))
+    }
 }

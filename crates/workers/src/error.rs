@@ -6,6 +6,15 @@ pub enum WorkerError {
     #[error("signing error: {0}")]
     Signing(#[from] crypto::SigningError),
 
+    #[error("checkpoint signer: {0}")]
+    Signer(#[from] crate::signer::SignerError),
+
+    #[error("anchoring: {0}")]
+    Anchor(#[from] crate::anchor::AnchorError),
+
+    #[error("tigerbeetle: {0}")]
+    TigerBeetle(#[from] ledger_tigerbeetle::TbError),
+
     #[error("checkpoint chain broken at seq {seq}: {reason}")]
     ChainBroken { seq: i64, reason: String },
 

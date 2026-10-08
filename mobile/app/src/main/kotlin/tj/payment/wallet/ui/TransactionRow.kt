@@ -21,28 +21,31 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import tj.payment.core.StatementEntryDto
 import tj.payment.wallet.ui.theme.PositiveGreen
+import tj.payment.wallet.R
 
 /** What a statement row calls the movement, from this wallet's point of view. */
 fun StatementEntryDto.title(): String = when (kind) {
     "transfer" -> counterpartyName
         ?: counterpartyPhone?.let { "+$it" }
-        ?: if (isCredit) "Received" else "Sent"
-    "deposit" -> "Top-up"
-    "withdrawal" -> "Withdrawal"
-    "fx" -> "Currency exchange"
-    "fee" -> "Fee"
-    else -> if (isCredit) "Received" else "Sent"
+        ?: Copy.text(if (isCredit) R.string.tx_received else R.string.tx_sent)
+    "deposit" -> Copy.text(R.string.tx_title_topup)
+    "withdrawal" -> Copy.text(R.string.tx_withdrawal)
+    "fx" -> Copy.text(R.string.tx_title_fx)
+    "fee" -> Copy.text(R.string.tx_title_fee)
+    else -> Copy.text(if (isCredit) R.string.tx_received else R.string.tx_sent)
 }
 
 fun StatementEntryDto.subtitle(): String {
-    val what = when (kind) {
-        "transfer" -> if (isCredit) "Received" else "Sent"
-        "deposit" -> "Deposit"
-        "withdrawal" -> "Withdrawal"
-        "fx" -> if (isCredit) "Bought" else "Sold"
-        "fee" -> "Service fee"
-        else -> "Transaction"
-    }
+    val what = Copy.text(
+        when (kind) {
+            "transfer" -> if (isCredit) R.string.tx_received else R.string.tx_sent
+            "deposit" -> R.string.tx_deposit
+            "withdrawal" -> R.string.tx_withdrawal
+            "fx" -> if (isCredit) R.string.tx_bought else R.string.tx_sold
+            "fee" -> R.string.tx_service_fee
+            else -> R.string.tx_other
+        },
+    )
     return "$what · ${timeOfDay()}"
 }
 
@@ -58,8 +61,8 @@ fun StatementEntryDto.timeOfDay(): String =
 
 /** "Today", "Yesterday", "12 August" (+ year when not this year). */
 fun dayHeading(date: LocalDate, today: LocalDate = LocalDate.now()): String = when (date) {
-    today -> "Today"
-    today.minusDays(1) -> "Yesterday"
+    today -> Copy.text(R.string.day_today)
+    today.minusDays(1) -> Copy.text(R.string.day_yesterday)
     else -> if (date.year == today.year) DAY.format(date) else DAY_YEAR.format(date)
 }
 

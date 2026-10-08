@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- staging flavor only: a LAN test build. The backend is plain HTTP on a bare
-     LAN IP (srv-dchr01, or a developer box via -PAPI_BASE_URL), and a bare IP
-     cannot carry a public TLS certificate, so cleartext is permitted for this
-     flavor as a whole. prod keeps cleartext denied and pins its certificate. -->
-<network-security-config>
-    <base-config cleartextTrafficPermitted="true" />
-</network-security-config>

@@ -30,6 +30,8 @@ import tj.payment.wallet.ui.dayHeading
 import tj.payment.wallet.ui.localDate
 import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.Rust
+import androidx.compose.ui.res.stringResource
+import tj.payment.wallet.R
 
 @Composable
 fun HistoryScreen(
@@ -56,7 +58,7 @@ fun HistoryScreen(
             .fillMaxSize()
             .padding(horizontal = 20.dp),
     ) {
-        ScreenHeader(title = "History", onBack = onBack)
+        ScreenHeader(title = stringResource(R.string.history_title), onBack = onBack)
 
         when {
             state.loading -> Box(
@@ -71,13 +73,13 @@ fun HistoryScreen(
             state.entries.isEmpty() -> Column {
                 Spacer(Modifier.height(40.dp))
                 Text(
-                    "Nothing here yet",
+                    stringResource(R.string.history_empty_title),
                     style = MaterialTheme.typography.titleLarge,
                     color = MaterialTheme.colorScheme.onSurface,
                 )
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "Your transfers and top-ups will appear here.",
+                    stringResource(R.string.history_empty_body),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -109,11 +111,11 @@ fun HistoryScreen(
                             horizontalAlignment = Alignment.CenterHorizontally,
                         ) {
                             Text(
-                                "Couldn't load older transactions. $message",
+                                stringResource(R.string.history_load_more_failed, message),
                                 color = NegativeRed,
                                 style = MaterialTheme.typography.bodyMedium,
                             )
-                            TextButton(onClick = viewModel::retryLoadMore) { Text("Retry", color = Rust) }
+                            TextButton(onClick = viewModel::retryLoadMore) { Text(stringResource(R.string.action_retry), color = Rust) }
                         }
                     }
                 }

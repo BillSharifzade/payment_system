@@ -2,7 +2,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use ledger::{Account, AccountId, AccountType, LedgerError};
-use money::{Currency, Money};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use storage::StorageError;
@@ -32,18 +31,55 @@ pub async fn create_wallet(
     Json(req): Json<CreateWalletRequest>,
 ) -> ApiResult<(StatusCode, Json<AccountResponse>)> {
     let currency = state.ledger.lookup_currency(&req.currency).await?;
-    let id = AccountId::new();
-    state
+    // One wallet per currency per user. Creations serialise on the user's row; the lookup is a
+    // separate statement so its snapshot is taken after the lock and sees a racing creation.
+    let mut tx = state
         .ledger
-        .open_account_owned(
-            &Account::new(id, AccountType::UserWallet, currency),
-            Some(user_id),
-        )
-        .await?;
+        .pool()
+        .begin()
+        .await
+        .map_err(StorageError::from)?;
+    let user: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(StorageError::from)?;
+    if user.is_none() {
+        return Err(ApiError::Unauthorized("unknown user".to_string()));
+    }
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM accounts
+         WHERE owner_user_id = $1 AND currency = $2 AND account_type = 'user_wallet'
+         ORDER BY created_at, id LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(currency.code())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(StorageError::from)?;
+    let (status, id) = match existing {
+        Some(id) => (StatusCode::OK, id),
+        None => {
+            let id = AccountId::new();
+            state
+                .ledger
+                .open_account_owned_on(
+                    &mut tx,
+                    &Account::new(id, AccountType::UserWallet, currency),
+                    Some(user_id),
+                )
+                .await?;
+            (StatusCode::CREATED, id.as_uuid())
+        }
+    };
+    storage::commit_durable(tx)
+        .await
+        .map_err(StorageError::from)?;
     Ok((
-        StatusCode::CREATED,
+        status,
         Json(AccountResponse {
-            id: id.as_uuid(),
+            id,
             account_type: AccountType::UserWallet.as_db_str().to_string(),
             currency: currency.code().to_string(),
         }),
@@ -85,23 +121,6 @@ pub async fn get_balance(
     }))
 }
 
-pub(crate) async fn ensure_owner(
-    state: &AppState,
-    account: AccountId,
-    user_id: Uuid,
-) -> ApiResult<()> {
-    match state.ledger.account_owner(account).await {
-        Ok(Some(owner)) if owner == user_id => Ok(()),
-        Ok(_) => Err(ApiError::Forbidden(
-            "you do not own this account".to_string(),
-        )),
-        Err(StorageError::Ledger(LedgerError::UnknownAccount(_))) => {
-            Err(ApiError::NotFound("account not found".to_string()))
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
 #[derive(Serialize)]
 pub struct WalletResponse {
     id: Uuid,
@@ -111,35 +130,35 @@ pub struct WalletResponse {
 }
 
 pub(crate) async fn wallets_of(state: &AppState, owner: Uuid) -> ApiResult<Vec<WalletResponse>> {
-    let rows = sqlx::query(
-        "SELECT a.id, a.currency, c.exponent, b.raw_minor
-         FROM accounts a
-         JOIN balances b ON b.account_id = a.id
-         JOIN currencies c ON c.code = a.currency
-         WHERE a.owner_user_id = $1
-         ORDER BY a.created_at",
-    )
-    .bind(owner)
-    .fetch_all(state.ledger.pool())
-    .await
-    .map_err(StorageError::from)?;
-
-    let mut wallets = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id: Uuid = row.try_get("id").map_err(StorageError::from)?;
-        let code: String = row.try_get("currency").map_err(StorageError::from)?;
-        let exponent: i16 = row.try_get("exponent").map_err(StorageError::from)?;
-        let raw_minor: i64 = row.try_get("raw_minor").map_err(StorageError::from)?;
-        let currency = Currency::new(&code, exponent as u8)
-            .map_err(|e| StorageError::DataIntegrity(e.to_string()))?;
-        wallets.push(WalletResponse {
-            id,
-            currency: code,
-            balance_minor: raw_minor,
-            display: Money::from_minor(raw_minor as i128, currency).to_string(),
-        });
-    }
-    Ok(wallets)
+    let mut conn = state
+        .ledger
+        .pool()
+        .acquire()
+        .await
+        .map_err(StorageError::from)?;
+    let ids: Vec<AccountId> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE owner_user_id = $1 ORDER BY created_at")
+            .bind(owner)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(StorageError::from)?
+            .into_iter()
+            .map(AccountId)
+            .collect();
+    let balances = state.ledger.balances(&mut *conn, &ids).await?;
+    balances
+        .into_iter()
+        .map(|b| {
+            let balance_minor = i64::try_from(b.posted.minor_units())
+                .map_err(|_| StorageError::AmountTooLarge(b.posted.minor_units()))?;
+            Ok(WalletResponse {
+                id: b.account.as_uuid(),
+                currency: b.posted.currency().code().to_string(),
+                balance_minor,
+                display: b.posted.to_string(),
+            })
+        })
+        .collect()
 }
 
 pub async fn list_wallets(
@@ -154,6 +173,7 @@ pub struct ClientConfigResponse {
     transfer_fee_bps: u32,
     biometric_max_minor: i64,
     check_ttl_secs: i64,
+    biometric_identify: bool,
 }
 
 pub async fn client_config(
@@ -164,6 +184,7 @@ pub async fn client_config(
         transfer_fee_bps: state.fees.transfer_bps,
         biometric_max_minor: state.biometric.max_minor,
         check_ttl_secs: state.biometric.check_ttl_secs,
+        biometric_identify: state.biometric.identify,
     }))
 }
 
@@ -298,7 +319,6 @@ pub async fn list_account_transactions(
     Path(id): Path<Uuid>,
     Query(params): Query<StatementParams>,
 ) -> ApiResult<Json<StatementResponse>> {
-    ensure_owner(&state, AccountId(id), user_id).await?;
     let limit = params.limit.unwrap_or(50).clamp(1, 100);
     let cursor = match &params.cursor {
         None => None,
@@ -306,7 +326,7 @@ pub async fn list_account_transactions(
     };
 
     let base = "SELECT e.id, e.transaction_id, e.direction, e.amount_minor, e.currency,
-                       e.created_at::text AS ts,
+                       e.created_at, e.created_at::text AS ts,
                        (EXTRACT(EPOCH FROM e.created_at) * 1000)::BIGINT AS ms,
                        cp.account_type AS cp_type,
                        cp.owner_user_id AS cp_owner,
@@ -330,35 +350,57 @@ pub async fn list_account_transactions(
                     LIMIT 1
                 ) cp ON TRUE
                 WHERE e.account_id = $1";
+    // The ownership check rides in the same round trip: no row = no such account, one row
+    // with no entry = the owner's empty page or someone else's account.
+    let page = |after: &str| {
+        format!(
+            "SELECT a.owner_user_id AS owner, p.*
+             FROM accounts a
+             LEFT JOIN LATERAL ({base} AND a.owner_user_id = $3 {after}
+                                ORDER BY e.created_at DESC, e.id DESC LIMIT $2) p ON TRUE
+             WHERE a.id = $1
+             ORDER BY p.created_at DESC, p.id DESC"
+        )
+    };
     let rows = match &cursor {
         None => {
-            sqlx::query(&format!(
-                "{base} ORDER BY e.created_at DESC, e.id DESC LIMIT $2"
-            ))
-            .bind(id)
-            .bind(limit)
-            .fetch_all(state.ledger.pool())
-            .await
+            sqlx::query(&page(""))
+                .bind(id)
+                .bind(limit)
+                .bind(user_id)
+                .fetch_all(state.ledger.pool())
+                .await
         }
         Some((ts, eid)) => {
-            sqlx::query(&format!(
-                "{base} AND (e.created_at, e.id) < ($3::timestamptz, $4)
-                 ORDER BY e.created_at DESC, e.id DESC LIMIT $2"
-            ))
-            .bind(id)
-            .bind(limit)
-            .bind(ts)
-            .bind(eid)
-            .fetch_all(state.ledger.pool())
-            .await
+            sqlx::query(&page("AND (e.created_at, e.id) < ($4::timestamptz, $5)"))
+                .bind(id)
+                .bind(limit)
+                .bind(user_id)
+                .bind(ts)
+                .bind(eid)
+                .fetch_all(state.ledger.pool())
+                .await
         }
     }
     .map_err(cursor_db_error)?;
 
+    let owner: Option<Uuid> = rows
+        .first()
+        .ok_or_else(|| ApiError::NotFound("account not found".to_string()))?
+        .try_get("owner")
+        .map_err(StorageError::from)?;
+    if owner != Some(user_id) {
+        return Err(ApiError::Forbidden(
+            "you do not own this account".to_string(),
+        ));
+    }
     let mut entries = Vec::with_capacity(rows.len());
     let mut last: Option<(String, Uuid)> = None;
     for row in rows {
-        let entry_id: Uuid = row.try_get("id").map_err(StorageError::from)?;
+        let entry_id: Option<Uuid> = row.try_get("id").map_err(StorageError::from)?;
+        let Some(entry_id) = entry_id else {
+            continue;
+        };
         let ts: String = row.try_get("ts").map_err(StorageError::from)?;
         let direction: String = row.try_get("direction").map_err(StorageError::from)?;
         let cp_type: Option<String> = row.try_get("cp_type").map_err(StorageError::from)?;

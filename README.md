@@ -11,7 +11,10 @@ for the clients, and [`deploy/README.md`](./deploy/README.md) to run it in produ
 |---|---|
 | `crates/money` | Currency-safe integer money. No floats, ever. *(pure)* |
 | `crates/ledger` | Double-entry core: accounts, transactions, balancing and conservation invariants. *(pure)* |
-| `crates/storage` | `PostgresLedger` — durable, row-locked, concurrency-safe posting (five round trips per transfer). |
+| `crates/storage` | `PostgresLedger` — durable, row-locked, concurrency-safe posting (BEGIN, claim, guard, wallet locks, one write statement, COMMIT). |
+| `crates/ledger-tigerbeetle` | `LEDGER_BACKEND=tigerbeetle` (opt-in): balances in TigerBeetle, guards + journal in Postgres (reserve → commit → post), crash recovery, cut-over/rollback, the in-process cluster model, benchmark `tb-bench`. |
+| `crates/loadtest` | `payment-loadtest`: load generator (HTTP or in process) with post-run ledger verification; A/B runner `matrix.sh`. |
+| `fuzz/` | 14 property-checking cargo-fuzz targets (nightly; `fuzz/run.sh`). |
 | `crates/auth` | Argon2id passwords, JWT access tokens, hashed rotating refresh tokens. *(pure)* |
 | `crates/crypto` | SHA-256 Merkle trees + Ed25519 for tamper-evident checkpoints. *(pure)* |
 | `crates/biometric` | Fingerprint payments: template validation, AES-GCM sealing, match-decision policy, HTTP adapter to a matching engine. *(pure)* |
@@ -47,26 +50,30 @@ NATS_URL=nats://localhost:4222 cargo run -p workers --bin payment-workers
 ```bash
 BASE=http://localhost:8080
 J='content-type: application/json'
+PSQL='docker compose exec -T postgres psql -U payment -d payment -qtAc'
+reg() { curl -s -XPOST $BASE/v1/auth/register -H "$J" -d "{\"phone\":\"$1\",\"password\":\"password123\"}"; }
 
-# Register two users. Every customer gets a TJS wallet at registration.
-ALICE=$(curl -s -XPOST $BASE/v1/auth/register -H "$J" -d '{"phone":"+992900000001","password":"password123"}')
-BOB=$(curl -s -XPOST   $BASE/v1/auth/register -H "$J" -d '{"phone":"+992900000002","password":"password123"}')
-A_TOK=$(echo "$ALICE" | jq -r .access_token); B_TOK=$(echo "$BOB" | jq -r .access_token)
+# Two customers and two operators. Every customer gets a TJS wallet at registration.
+ALICE=$(reg +992900000001); BOB=$(reg +992900000002)
+OPS1=$(reg +992900000091);  OPS2=$(reg +992900000092)
+tok() { echo "$1" | jq -r .access_token; }
+A_TOK=$(tok "$ALICE"); B_TOK=$(tok "$BOB"); O1_TOK=$(tok "$OPS1"); O2_TOK=$(tok "$OPS2")
 A_WALLET=$(curl -s $BASE/v1/wallets -H "Authorization: Bearer $A_TOK" | jq -r '.[0].id')
 B_WALLET=$(curl -s $BASE/v1/wallets -H "Authorization: Bearer $B_TOK" | jq -r '.[0].id')
 
-# Deposits are admin-only (funds entering from the partner bank). Promote Alice
-# and mark her KYC-verified, as the admin console / a reviewer would:
-docker compose exec -T postgres psql -U payment -d payment -c \
-  "UPDATE users SET is_admin=true, kyc_level=1 WHERE phone='992900000001'"
+# Operators are flipped by SQL; customers become KYC level 1 as a reviewer would.
+$PSQL "UPDATE users SET is_admin=true WHERE phone IN ('992900000091','992900000092')"
+$PSQL "UPDATE users SET kyc_level=1 WHERE phone IN ('992900000001','992900000002')"
 
-# Deposit 100.00 TJS to Alice, then transfer 35.00 to Bob. Every money-moving
-# call needs an Idempotency-Key (a UUID) — it becomes the transaction id, so a
-# retry can never post twice.
-curl -s -XPOST $BASE/v1/deposits -H "$J" -H "Authorization: Bearer $A_TOK" \
-  -H "Idempotency-Key: $(uuidgen)" \
-  -d "{\"user_account\":\"$A_WALLET\",\"amount_minor\":10000,\"currency\":\"TJS\"}"
+# Deposits are dual-control: one operator requests (202 pending_approval), a
+# DIFFERENT operator approves, and only then is the ledger posted. The
+# Idempotency-Key (a UUID) is the deposit id and the eventual transaction id.
+DEP=$(uuidgen)
+curl -s -XPOST $BASE/v1/deposits -H "$J" -H "Authorization: Bearer $O1_TOK" -H "Idempotency-Key: $DEP" \
+  -d "{\"user_account\":\"$A_WALLET\",\"amount_minor\":10000,\"currency\":\"TJS\"}"   # → pending_approval
+curl -s -XPOST $BASE/v1/admin/deposits/$DEP/approve -H "Authorization: Bearer $O2_TOK"           # → posted
 
+# Transfer 35.00 TJS to Bob. A retry with the same key can never post twice.
 curl -s -XPOST $BASE/v1/transfers -H "$J" -H "Authorization: Bearer $A_TOK" \
   -H "Idempotency-Key: $(uuidgen)" \
   -d "{\"from_account\":\"$A_WALLET\",\"to_account\":\"$B_WALLET\",\"amount_minor\":3500,\"currency\":\"TJS\"}"
@@ -74,17 +81,25 @@ curl -s -XPOST $BASE/v1/transfers -H "$J" -H "Authorization: Bearer $A_TOK" \
 curl -s $BASE/v1/accounts/$A_WALLET/balance -H "Authorization: Bearer $A_TOK"   # → 65.00 TJS
 curl -s $BASE/ready                                                              # → {"status":"ready"}
 
+# Gave up on an unsettled payment? Void its key first — afterwards it can never post.
+curl -s -XPOST $BASE/v1/transactions/$(uuidgen)/void -H "Authorization: Bearer $A_TOK"   # → voided
+
 # Fingerprint payment (DESIGN.md §20). Bob enrols a finger once (template from the
-# scanner SDK, base64); Alice — the merchant — opens a 2.00 TJS check and Bob pays
-# it by putting his finger on Alice's scanner. Dev mode matches templates exactly.
+# scanner SDK, base64). An operator registers Alice's checkout terminal (its key is
+# shown once). Alice opens a 2.00 TJS check; Bob pays it with his finger, the cashier
+# keying in his phone number (1:1 verification). Dev mode matches templates exactly.
 FP=$(head -c 64 /dev/urandom | base64 -w0)
 curl -s -XPOST $BASE/v1/biometric/fingerprints -H "$J" -H "Authorization: Bearer $B_TOK" \
   -d "{\"finger\":2,\"format\":\"raw\",\"template\":\"$FP\",\"consent\":true}"
+A_ID=$(echo "$ALICE" | jq -r .user_id)
+TKEY=$(curl -s -XPOST $BASE/v1/admin/terminals -H "$J" -H "Authorization: Bearer $O1_TOK" \
+  -d "{\"merchant_user_id\":\"$A_ID\",\"label\":\"till 1\"}" | jq -r .api_key)
 CHECK=$(uuidgen)
 curl -s -XPOST $BASE/v1/checks -H "$J" -H "Authorization: Bearer $A_TOK" -H "Idempotency-Key: $CHECK" \
   -d "{\"account\":\"$A_WALLET\",\"amount_minor\":200,\"description\":\"bread\"}"
 curl -s -XPOST $BASE/v1/checks/$CHECK/pay/fingerprint -H "$J" -H "Authorization: Bearer $A_TOK" \
-  -H "Idempotency-Key: $(uuidgen)" -d "{\"format\":\"raw\",\"template\":\"$FP\"}"   # → posted
+  -H "X-Terminal-Key: $TKEY" -H "Idempotency-Key: $(uuidgen)" \
+  -d "{\"format\":\"raw\",\"template\":\"$FP\",\"payer_phone\":\"+992900000002\"}"   # → posted
 ```
 
 Amounts are always **integer minor units** (diram for TJS): `10000` = 100.00 TJS.
@@ -105,7 +120,12 @@ cargo test -p storage -- --ignored
 cargo test -p api -- --ignored
 cargo test -p workers -- --ignored --test-threads=1
 
-# Lint gate used in CI.
+# Load test with post-run ledger verification (crates/loadtest/README.md).
+cargo build --release -p api -p loadtest && target/release/payment-loadtest \
+  --database-url "$DATABASE_URL" --server-bin target/release/payment-server --workload mixed --duration 30s
+
+# Lint gate used in CI. --all-features includes TigerBeetle's native client:
+# it needs Zig 0.14.1 (ZIG_PATH=/path/to/zig) and libclang (see below).
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -113,6 +133,59 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 (cd console && npm ci && npm run lint && npm test && npm run build)
 (cd mobile && ./gradlew :core:test :app:testDevDebugUnitTest)
 ```
+
+### The TigerBeetle backend (`LEDGER_BACKEND=tigerbeetle`, DESIGN.md §15)
+
+The default build has no TigerBeetle client and refuses `LEDGER_BACKEND=tigerbeetle`; the
+hybrid protocol itself is always compiled and tested against an in-process cluster model.
+`--features tigerbeetle` (crates `api`, `workers`, `loadtest`; `native-client` on
+`ledger-tigerbeetle`) builds TigerBeetle's client, which needs **Zig 0.14.1** (`ZIG_PATH`; the
+build otherwise tries to download one) and **libclang** (`apt install libclang-dev`, or
+`LIBCLANG_PATH`). Every suite runs against Postgres (above), the model, and a live replica —
+one cluster and one database per lane, as in production (a cluster belongs to one database):
+
+```bash
+# One single-replica cluster per lane (release 0.17.9, github.com/tigerbeetle/tigerbeetle/releases).
+for c in 0 1 2; do
+  tigerbeetle format --cluster=$c --replica=0 --replica-count=1 --development $c.tigerbeetle
+  tigerbeetle start --addresses=127.0.0.1:300$c --development $c.tigerbeetle &
+done
+
+# The crate's suites: the model, then the live cluster (serially: recovery settles everything).
+DATABASE_URL=.../payment_tb_crate cargo test -p ledger-tigerbeetle -- --ignored
+TIGERBEETLE_ADDRESSES=127.0.0.1:3000 TIGERBEETLE_CLUSTER_ID=0 DATABASE_URL=.../payment_tb_crate \
+  cargo test -p ledger-tigerbeetle --features native-client,testkit --test live -- --ignored --test-threads=1
+
+# Every api suite through the TigerBeetle backend: the model, then a live cluster.
+TEST_LEDGER_BACKEND=tigerbeetle-sim DATABASE_URL=.../payment_tb_model cargo test -p api -- --ignored
+TEST_LEDGER_BACKEND=tigerbeetle TIGERBEETLE_ADDRESSES=127.0.0.1:3001 TIGERBEETLE_CLUSTER_ID=1 \
+  DATABASE_URL=.../payment_tb_api cargo test -p api --features tigerbeetle -- --ignored
+
+# Every workers suite against a live cluster of its own.
+TEST_LEDGER_BACKEND=tigerbeetle TIGERBEETLE_ADDRESSES=127.0.0.1:3002 TIGERBEETLE_CLUSTER_ID=2 \
+  DATABASE_URL=.../payment_tb_workers cargo test -p workers --features tigerbeetle -- --ignored --test-threads=1
+```
+
+`.github/workflows/tigerbeetle.yml` runs exactly these lanes. Configuration (strictly parsed; a
+bad value refuses to boot), for `payment-server` and `payment-workers`:
+
+| Variable | Default | |
+|---|---|---|
+| `LEDGER_BACKEND` | `postgres` | `postgres` or `tigerbeetle` (needs a `--features tigerbeetle` build) |
+| `TIGERBEETLE_CLUSTER_ID` | — (required) | the u128 the data file was formatted with |
+| `TIGERBEETLE_ADDRESSES` | — (required) | replicas, comma-separated: `port`, `ipv4:port` or `[ipv6]:port` (no host names: the client does not resolve them) |
+| `TIGERBEETLE_REQUEST_TIMEOUT_MS` | 5000 | an unanswered request fails as `503 retry_later` (100–60000) |
+| `TIGERBEETLE_PENDING_TIMEOUT_SECS` | 120 | reservations the cluster voids by itself if recovery is down (0 = never, else 10–86400) |
+| `TIGERBEETLE_RECOVERY_GRACE_SECS` | 10 | recovery leaves younger reservations to their request (1–600, below half the pending timeout) |
+| `TIGERBEETLE_HOLD_WAIT_MS` | 2000 | a post refused only for other requests' holds waits this long for them, then `503` (0–30000) |
+| `TIGERBEETLE_SESSIONS` | 1 | client sessions per process (1–16) |
+| `TIGERBEETLE_RECOVERY_INTERVAL_SECS` | 2 | workers: the leader's recovery pass (1–60) |
+
+Fuzzing needs nightly: `rustup toolchain install nightly-2026-10-08 && cargo install cargo-fuzz --locked --version 0.13.2`,
+then `FUZZ_TOOLCHAIN=nightly-2026-10-08 fuzz/run.sh 60` (every target, 60 s each) or
+`fuzz/run.sh 600 ledger_ops`. A failure leaves its reproducer in `fuzz/artifacts/<target>/`;
+replay it with `cargo +nightly fuzz run -a <target> <file>`. CI: `.github/workflows/fuzz.yml`
+(75 s per target on PRs, 10 min nightly, plus Miri).
 
 CI (`.github/workflows/ci.yml`) runs all of the above plus `cargo deny`,
 `npm audit` and both container image builds — it needs the repository pushed to
@@ -124,5 +197,37 @@ GitHub to execute.
 and starts the hardened Compose stack — Caddy (TLS, `/admin`, `/ready` health
 checks), the two binaries, Postgres, Redis, NATS JetStream, backup sidecars,
 optional monitoring (Loki/Prometheus/Alertmanager/Grafana) and optional WAL
-archiving. Secrets are files, config typos refuse to boot, every service is
+archiving or a 3-member Patroni cluster. Secrets are files, config typos refuse to boot, every service is
 health-checked, capability-dropped and log-rotated.
+
+Since the hardening pass:
+
+- **`ADMIN_ALLOW_CIDR` is required.** Caddy applies it to every admin-capable
+  path (`/admin`, `/v1/admin/*`, `/v1/deposits*`, KYC approve/reject);
+  `0.0.0.0/0 ::/0` is the explicit, loudly-warned "anyone" setting.
+- **Least-privilege database.** `payment_owner` owns the schema and runs
+  migrations (`MIGRATION_DATABASE_URL_FILE`); the server and workers run as
+  `payment_app`, which can neither bypass the append-only triggers nor
+  UPDATE/DELETE ledger history; `payment_backup` dumps read-only.
+- **Segmented networks;** Redis and NATS require passwords; Postgres runs
+  without capabilities. Images are pinned by digest (`scripts/image-digest.sh`).
+- **Encrypted backups** (age or GPG, optional off-box copy via rclone), a
+  pre-deploy dump before every rollout, freshness alerts, and a restore drill
+  that verifies the signed checkpoint chain — exercised in CI on every push.
+- **Postgres HA (optional overlay `deploy/ha/`)**: three Patroni members with
+  quorum-synchronous replication behind HAProxy and etcd; a leader crash,
+  freeze or switchover loses no acknowledged transaction and recovers on its
+  own (~20 s, ~4 s planned), proven under load by `scripts/ha-failover-drill.sh`
+  in CI (`.github/workflows/ha.yml`).
+- **Tamper-evidence beyond the key holder (optional overlays)**: checkpoint
+  hashes anchored with RFC 3161 TSAs and OpenTimestamps
+  (`docker-compose.anchor.yml`), and the signing key in Vault transit or an HSM
+  (`docker-compose.vault.yml`, `WORKER_SIGNER=pkcs11`).
+- **TigerBeetle ledger (optional overlay `docker-compose.tigerbeetle.yml`)**:
+  balances and the no-overdraft rule in a TigerBeetle replica, everything else
+  in Postgres; the image is built with its client only then. Cut-over with
+  `payment-server tigerbeetle-import`, back with `tigerbeetle-rollback`
+  (deploy/README.md, "TigerBeetle").
+- **Existing installs** upgrade once with `deploy/upgrade-hardening.sh`
+  (idempotent; moves secrets into files, creates the roles, transfers
+  ownership), then `deploy/deploy.sh`.

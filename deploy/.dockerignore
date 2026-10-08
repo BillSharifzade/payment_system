@@ -1,0 +1,4 @@
+# Build context of Dockerfile.postgres (the WAL-archive overlay builds with
+# context deploy/). That Dockerfile copies nothing, so nothing is sent — above
+# all not secrets/, .env or app.env.
+*

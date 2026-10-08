@@ -1,7 +1,7 @@
 mod currency;
 mod error;
 
-pub use currency::{Currency, CurrencyCode};
+pub use currency::{Currency, CurrencyCode, MAX_EXPONENT};
 pub use error::{MoneyError, Result};
 
 use core::cmp::Ordering;
@@ -192,6 +192,48 @@ mod tests {
         assert!(Currency::new("T1S", 2).is_err());
         assert!(Currency::new("tj", 2).is_err());
         assert_eq!(Currency::new("usd", 2).unwrap().code(), "USD");
+    }
+
+    // Found writing fuzz/money: an exponent of 39 or more overflowed 10^exponent — a panic
+    // with overflow checks, otherwise a wrapped scale (zero from 128 up: Display divided by it).
+    #[test]
+    fn exponent_is_bounded_so_the_scale_is_exact() {
+        assert_eq!(
+            Currency::new("XXX", MAX_EXPONENT + 1),
+            Err(MoneyError::InvalidExponent(MAX_EXPONENT + 1))
+        );
+        assert!(Currency::new("XXX", u8::MAX).is_err());
+        let widest = Currency::new("XXX", MAX_EXPONENT).unwrap();
+        let m = Money::from_major_minor(i64::MIN, u32::MAX, widest).unwrap();
+        assert_eq!(
+            m.minor_units(),
+            i64::MIN as i128 * 10i128.pow(MAX_EXPONENT as u32) - u32::MAX as i128
+        );
+        assert_eq!(m.to_string(), "-9223372036854775808.000000004294967295 XXX");
+        assert_eq!(
+            Money::from_minor(i128::MIN, widest).to_string(),
+            "-170141183460469231731.687303715884105728 XXX"
+        );
+    }
+
+    // A derived Deserialize skipped `Currency::new`: non-ASCII code bytes then panicked in
+    // `code()`/Debug, and any exponent was accepted.
+    #[test]
+    fn deserialisation_validates_like_new() {
+        let usd = Currency::new("USD", 2).unwrap();
+        let json = serde_json::to_string(&usd).unwrap();
+        assert_eq!(json, r#"{"code":[85,83,68],"exponent":2}"#);
+        assert_eq!(serde_json::from_str::<Currency>(&json).unwrap(), usd);
+        for bad in [
+            r#"{"code":[255,0,0],"exponent":2}"#,
+            r#"{"code":[117,115,100],"exponent":2}"#,
+            r#"{"code":[85,83,68],"exponent":19}"#,
+        ] {
+            assert!(serde_json::from_str::<Currency>(bad).is_err(), "{bad}");
+        }
+        let money = Money::from_minor(-5, usd);
+        let back: Money = serde_json::from_str(&serde_json::to_string(&money).unwrap()).unwrap();
+        assert_eq!(back, money);
     }
 
     #[test]

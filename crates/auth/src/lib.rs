@@ -1,7 +1,7 @@
 use argon2::password_hash::rand_core::{OsRng, RngCore};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,7 +15,12 @@ pub enum AuthError {
     InvalidToken,
     #[error("system clock is before the unix epoch")]
     Clock,
+    #[error("access token lifetime of {0} s overflows the clock")]
+    Lifetime(u64),
 }
+
+/// How long after `exp` a token is still accepted: clock skew between API replicas.
+pub const ACCESS_TOKEN_LEEWAY_SECS: u64 = 60;
 
 pub fn hash_password(password: &str) -> Result<String, AuthError> {
     let salt = SaltString::generate(&mut OsRng);
@@ -37,14 +42,14 @@ pub fn verify_password(password: &str, phc_hash: &str) -> bool {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
-    pub exp: usize,
-    pub iat: usize,
+    pub exp: u64,
+    pub iat: u64,
 }
 
-fn now_secs() -> Result<usize, AuthError> {
+fn now_secs() -> Result<u64, AuthError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as usize)
+        .map(|d| d.as_secs())
         .map_err(|_| AuthError::Clock)
 }
 
@@ -53,7 +58,9 @@ pub fn issue_access_token(user_id: Uuid, secret: &str, ttl_secs: u64) -> Result<
     let claims = Claims {
         sub: user_id.to_string(),
         iat,
-        exp: iat + ttl_secs as usize,
+        exp: iat
+            .checked_add(ttl_secs)
+            .ok_or(AuthError::Lifetime(ttl_secs))?,
     };
     encode(
         &Header::default(),
@@ -64,10 +71,14 @@ pub fn issue_access_token(user_id: Uuid, secret: &str, ttl_secs: u64) -> Result<
 }
 
 pub fn verify_access_token(token: &str, secret: &str) -> Result<Uuid, AuthError> {
+    // Spelled out rather than `Validation::default()`, so a library upgrade cannot change
+    // what is accepted: HS256 only, `exp` required and enforced.
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.leeway = ACCESS_TOKEN_LEEWAY_SECS;
     let data = decode::<Claims>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),
-        &Validation::default(),
+        &validation,
     )
     .map_err(|_| AuthError::InvalidToken)?;
     Uuid::parse_str(&data.claims.sub).map_err(|_| AuthError::InvalidToken)
@@ -136,6 +147,50 @@ mod tests {
         )
         .unwrap();
         assert!(verify_access_token(&token, "s").is_err());
+    }
+
+    fn signed(claims: &Claims, secret: &str) -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    // Found by fuzz/auth_token: `iat + ttl as usize` overflowed (a panic with overflow
+    // checks, otherwise a wrapped `exp` in the past).
+    #[test]
+    fn a_lifetime_past_the_clock_is_an_error() {
+        let uid = Uuid::new_v4();
+        assert!(matches!(
+            issue_access_token(uid, "s", u64::MAX),
+            Err(AuthError::Lifetime(u64::MAX))
+        ));
+        let far = u64::MAX - now_secs().unwrap() - 10;
+        let token = issue_access_token(uid, "s", far).unwrap();
+        assert_eq!(verify_access_token(&token, "s").unwrap(), uid);
+    }
+
+    #[test]
+    fn exp_is_enforced_with_the_documented_leeway() {
+        let now = now_secs().unwrap();
+        let sub = Uuid::new_v4();
+        let at = |exp| Claims {
+            sub: sub.to_string(),
+            iat: now - 1_000,
+            exp,
+        };
+        let grace = ACCESS_TOKEN_LEEWAY_SECS;
+        assert!(verify_access_token(&signed(&at(now - grace + 5), "s"), "s").is_ok());
+        assert!(verify_access_token(&signed(&at(now - grace - 5), "s"), "s").is_err());
+        let other_alg = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS512),
+            &at(now + 600),
+            &jsonwebtoken::EncodingKey::from_secret(b"s"),
+        )
+        .unwrap();
+        assert!(verify_access_token(&other_alg, "s").is_err());
     }
 
     #[test]

@@ -20,6 +20,8 @@ import KycQueue from "./pages/KycQueue";
 import Users from "./pages/Users";
 import FxRates from "./pages/FxRates";
 import Funding from "./pages/Funding";
+import Deposits from "./pages/Deposits";
+import Terminals from "./pages/Terminals";
 
 /** Layout route: everything beneath it needs a signed-in admin. */
 function AuthGate() {
@@ -92,6 +94,8 @@ export const routes: RouteObject[] = [
               { path: "users", element: <Users /> },
               { path: "fx", element: <FxRates /> },
               { path: "funding", element: <Funding /> },
+              { path: "deposits", element: <Deposits /> },
+              { path: "terminals", element: <Terminals /> },
             ],
           },
         ],

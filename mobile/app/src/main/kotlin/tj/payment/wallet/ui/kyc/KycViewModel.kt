@@ -10,6 +10,8 @@ import tj.payment.core.ApiOutcome
 import tj.payment.wallet.data.WalletRepository
 import tj.payment.wallet.ui.OFFLINE_MESSAGE
 import tj.payment.wallet.ui.userMessage
+import tj.payment.wallet.R
+import tj.payment.wallet.ui.Copy
 
 data class KycUiState(
     val loading: Boolean = true,
@@ -132,6 +134,6 @@ class KycViewModel(private val repo: WalletRepository) : ViewModel() {
     companion object {
         /** The server's upload cap; checked BEFORE the file is read into memory. */
         const val MAX_DOCUMENT_BYTES = 5 * 1024 * 1024
-        const val DOCUMENT_TOO_LARGE = "The file is over 5 MB. Pick a smaller one."
+        val DOCUMENT_TOO_LARGE: String get() = Copy.text(R.string.kyc_error_too_large)
     }
 }

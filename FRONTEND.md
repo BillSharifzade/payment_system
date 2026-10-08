@@ -80,6 +80,21 @@ draft ──(user taps Send)──> submitting(key=UUID, persisted) ──> post
 - On app restart, any persisted `submitting` payment is resolved by retrying its
   key — the answer is authoritative because the backend replays before
   screening.
+- *As built (hardening pass):*
+  - Pending records are **per user** (owner id stored; another account on the
+    same phone never sees or is blocked by them) and are surfaced on Home at
+    startup and on refresh — first a read-only `GET /v1/transactions/{id}`, then
+    "Finish" (same key) or "Discard".
+  - **Discard = void.** `POST /v1/transactions/{id}/void` makes the key unusable
+    forever: `voided` ⇒ safe to drop; `posted` ⇒ show it as sent; no answer ⇒ keep
+    the record. A refused retry is voided too, so "rejected" is a guarantee.
+    `409 voided` is final; `duplicate_transaction` triggers a lookup, never a
+    "rejected". No statement scanning.
+  - FX, transfers and pay-by-QR all go through the same persisted-key
+    `PaymentSubmitter`; the Request screen keeps one check key per (wallet,
+    amount, currency, description) and drops it after a definitive answer.
+  - The admin console's deposits follow the same rule server-side: the request id
+    is the key and unknown outcomes resolve via `GET /v1/admin/deposits/{id}`.
 
 ### 2.3 Token lifecycle
 
@@ -92,6 +107,21 @@ draft ──(user taps Send)──> submitting(key=UUID, persisted) ──> post
   session, force password login, tell the user why ("you were signed out for
   security").
 - App-lock layer (PIN + biometric) gates the UI independently of tokens.
+- *As built:*
+  - **App:** app lock via device authentication at launch and after 2 min in the
+    background (no separate PIN). Every money move is authorized by a Keystore
+    EC P-256 key created with `setUserAuthenticationRequired(true)`, signing the
+    exact payment through `BiometricPrompt.CryptoObject`; the signature is stored
+    with the pending record and resent on retries. Each secure store has its own
+    master key and a non-destructive recovery policy (transient Keystore faults
+    retry; a typed storage error, never a crash). Rotated refresh tokens are
+    written with `commit()` before use.
+  - **Console:** both tokens in memory only (a reload signs out); idle sign-out
+    after 15 min without input (`VITE_IDLE_TIMEOUT_MINUTES`, 1–240) with a 60 s
+    warning; background polls neither count as activity nor renew tokens without
+    fresh input; only a 401/403 from refresh ends the session (5xx/429/network
+    retry with backoff); a 403 `forbidden` is confirmed against the admin gate
+    before signing out.
 
 ### 2.4 Errors are the API's machine codes, not its messages
 
@@ -100,6 +130,16 @@ The API guarantees stable `error.code` values (`insufficient_funds`,
 client maps **codes** to localized, human explanations and actions (e.g.
 `kyc_required` → route to the KYC flow). Server `message` strings are for logs,
 never for screens — they are English and unstable.
+
+The complete code list (both clients pin it in a test; the app's `ErrorCopy` has
+no `else` branch, so a new code doesn't compile without copy):
+`bad_request, not_found, unauthorized, forbidden, conflict, idempotency_conflict,
+kyc_required, account_blocked, limit_exceeded, insufficient_funds, no_match,
+ambiguous_match, rate_limited, retry_later, timeout, internal_error,
+invalid_transaction, currency_mismatch, unknown_account, duplicate_transaction,
+invalid_amount, unknown_currency, amount_too_large, rejected, voided,
+dual_control_required, recipient_unavailable, terminal_unauthorized,
+probe_replayed, check_locked, device_signature_required, device_signature_invalid`.
 
 ---
 
@@ -132,6 +172,14 @@ login           KYC banner if level 0   history (paged statement)
 - **Security hardening:** `FLAG_SECURE` on balance/send screens (no
   screenshots/recents preview), certificate pinning against the API host with
   a remote-config escape hatch, R8 obfuscation, no amounts/PII in client logs.
+  *As built:* OkHttp `CertificatePinner` from build-time pins
+  (`-PpaymentCertPins` / `PAYMENT_CERT_PINS` for prod, `paymentCertPinsStaging`);
+  at least two distinct `sha256/` pins are validated at build time and a prod
+  release refuses to package or start without them. The remote-config escape
+  hatch is not built — the offline backup pin is the rotation plan. Staging
+  cleartext is limited to the one host in `API_BASE_URL`. UI copy lives in
+  `values/strings.xml` with a full `values-ru` translation; Tajik awaits a native
+  translator.
 
 ### App architecture (Kotlin + Jetpack Compose)
 
@@ -177,6 +225,24 @@ app/
 
 Admin logins are ordinary users flipped via SQL (unchanged by design); the
 console is IP-allowlisted at Caddy in addition to auth.
+
+*As built (hardening pass):*
+- **Funding is maker–checker.** Funding creates a request (`202
+  pending_approval`) behind a confirmation dialog (customer phone, verified name,
+  KYC level, wallet + balance, amount in large major units, a large-amount
+  warning, a delayed confirm button; Enter never posts; quick chips *add*). A
+  *different* admin approves or rejects (with a reason) on **Approvals**
+  (pending queue with keyset paging, posted/rejected history, track by id);
+  your own requests can only be withdrawn. Pending count shows as a nav badge
+  (`pending_deposits` from `/v1/admin/metrics`).
+- **Terminals** page: register a fingerprint terminal for a merchant (API key
+  shown once, copy + "I've stored it"), list with `last_used_at`, revoke.
+- **KYC:** your own submission can't be decided (`dual_control_required`).
+- **FX rates** are entered and kept as exact fractions (`a/b` accepted; rounded
+  displays marked "≈").
+- `formatMinor` takes grouping and decimal mark from the same locale (tests pin
+  en/de/tr/ru); idempotency keys come only from `crypto.randomUUID` /
+  `getRandomValues` (no `Math.random` fallback). 95 Vitest tests.
 
 ---
 
