@@ -1,12 +1,14 @@
 //! Checkpoint signatures under trusted keys:
-//! - `TrustedKeys::from_hex_list` accepts exactly lists of valid 32-byte hex Ed25519 keys,
-//!   de-duplicates them in order and round-trips through `to_hex`;
+//! - `TrustedKeys::from_hex_list` accepts exactly lists of valid, non-weak 32-byte hex Ed25519
+//!   keys, each optionally `@<seq>` (retired after checkpoint seq ≥ 1), with the same error
+//!   precedence as an independent model; it de-duplicates in order, refuses a key listed with
+//!   two different retirements, and round-trips through `to_hex`;
 //! - `Hash::from_hex` accepts exactly 64 hex digits and round-trips;
-//! - a sealer's signature verifies under its trusted key; a flipped signature or digest bit,
-//!   an untrusted signer or another key's signature never does;
-//! - nothing verifies that strict Ed25519 verification would refuse — except under a weak
-//!   (small-order) trusted key, which `TrustedKeys` still admits (known gap, see the report;
-//!   the target accepts either admitting or refusing weak keys, so the fix needs no change).
+//! - a sealer's signature verifies under its trusted key at any checkpoint seq; a retired key
+//!   only up to its last seq; a flipped signature or digest bit, an untrusted signer or another
+//!   key's signature never does;
+//! - weak (small-order) keys are never trusted, and nothing verifies that strict Ed25519
+//!   verification would refuse.
 #![no_main]
 
 use arbitrary::Arbitrary;
@@ -27,39 +29,71 @@ struct Input<'a> {
     raw_key: [u8; 32],
     raw_sig: [u8; 64],
     torsion: Option<(u8, u8)>,
+    seq: u16,
+    last: u16,
 }
 
-/// A decodable Ed25519 point, and whether it is weak (small order).
-fn parse_key(item: &str) -> Option<([u8; 32], bool)> {
-    let bytes: [u8; 32] = hex::decode(item).ok()?.try_into().ok()?;
-    let key = VerifyingKey::from_bytes(&bytes).ok()?;
-    Some((bytes, key.is_weak()))
+enum Want {
+    Keys(Vec<([u8; 32], Option<i64>)>),
+    BadKey,
+    BadEntry,
+}
+
+/// An independent reading of the trust-list syntax: per item, a malformed `@seq` is reported
+/// before the key; an undecodable or weak key is `InvalidPublicKey`; a key listed again with a
+/// different retirement is `InvalidTrustEntry`; the first bad item decides.
+fn model(list: &str) -> Want {
+    let mut keys: Vec<([u8; 32], Option<i64>)> = Vec::new();
+    for item in list.split(|c: char| c == ',' || c.is_whitespace()) {
+        if item.is_empty() {
+            continue;
+        }
+        let (key, last) = match item.split_once('@') {
+            None => (item, None),
+            Some((key, seq)) => match seq.parse::<i64>() {
+                Ok(n) if n >= 1 => (key, Some(n)),
+                _ => return Want::BadEntry,
+            },
+        };
+        let Some(bytes) = hex::decode(key)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        else {
+            return Want::BadKey;
+        };
+        if VerifyingKey::from_bytes(&bytes).map_or(true, |k| k.is_weak()) {
+            return Want::BadKey;
+        }
+        match keys.iter().find(|(k, _)| *k == bytes) {
+            None => keys.push((bytes, last)),
+            Some((_, l)) if *l == last => {}
+            Some(_) => return Want::BadEntry,
+        }
+    }
+    Want::Keys(keys)
 }
 
 fn check_list(list: &str) {
-    let items: Vec<&str> = list
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let parsed: Option<Vec<([u8; 32], bool)>> = items.iter().map(|i| parse_key(i)).collect();
-    match (TrustedKeys::from_hex_list(list), parsed) {
-        (Ok(t), Some(keys)) => {
-            let mut distinct: Vec<[u8; 32]> = Vec::new();
-            for (k, _) in keys {
-                assert!(t.is_trusted(&k));
-                if !distinct.contains(&k) {
-                    distinct.push(k);
-                }
+    match (TrustedKeys::from_hex_list(list), model(list)) {
+        (Ok(t), Want::Keys(keys)) => {
+            for (k, last) in &keys {
+                assert!(t.is_trusted(k));
+                assert_eq!(t.is_current(k), last.is_none());
             }
-            let hexes: Vec<String> = distinct.iter().map(hex::encode).collect();
+            let hexes: Vec<String> = keys
+                .iter()
+                .map(|(k, last)| match last {
+                    None => hex::encode(k),
+                    Some(seq) => format!("{}@{seq}", hex::encode(k)),
+                })
+                .collect();
             assert_eq!(t.to_hex(), hexes);
-            assert_eq!(t.len(), distinct.len());
+            assert_eq!(t.len(), keys.len());
             assert_eq!(TrustedKeys::from_hex_list(&hexes.join(",")).unwrap(), t);
         }
-        (Err(SigningError::InvalidPublicKey), None) => {}
-        (Err(SigningError::InvalidPublicKey), Some(keys)) if keys.iter().any(|(_, weak)| *weak) => {
-        }
-        (got, want) => panic!("from_hex_list({list:?}) = {got:?}, expected keys {want:?}"),
+        (Err(SigningError::InvalidPublicKey), Want::BadKey) => {}
+        (Err(SigningError::InvalidTrustEntry(_)), Want::BadEntry) => {}
+        (got, _) => panic!("from_hex_list({list:?}) = {got:?} disagrees with the model"),
     }
 }
 
@@ -87,21 +121,31 @@ fn check_signatures(input: &Input) {
     let pk = sealer.public_key_bytes();
     let h = Hash::from_bytes(input.digest);
     let sig = sealer.sign_hash(&h);
+    let seq = i64::from(input.seq);
     let trusted = TrustedKeys::new().with(pk).unwrap();
     assert!(verify_hash(&pk, &h, &sig).is_ok());
-    assert!(trusted.verify(&pk, &h, &sig).is_ok());
+    assert!(trusted.verify(seq, &pk, &h, &sig).is_ok());
     assert_eq!(hex::decode(sealer.public_key_hex()).unwrap(), pk);
+
+    // A retired key verifies exactly the checkpoints up to the last one it signed.
+    let last = 1 + i64::from(input.last);
+    let retired = TrustedKeys::new().with_retired(pk, last).unwrap();
+    match retired.verify(seq, &pk, &h, &sig) {
+        Ok(()) => assert!(seq <= last),
+        Err(SigningError::RetiredKey(l)) => assert!(l == last && seq > last),
+        Err(e) => panic!("retired key: {e:?}"),
+    }
 
     if let Some(bad) = flip(sig, input.sig_flip) {
         assert!(
-            trusted.verify(&pk, &h, &bad).is_err(),
+            trusted.verify(seq, &pk, &h, &bad).is_err(),
             "flipped signature verified"
         );
     }
     if let Some(bad) = flip(input.digest, input.digest_flip) {
         let bad = Hash::from_bytes(bad);
         assert!(
-            trusted.verify(&pk, &bad, &sig).is_err(),
+            trusted.verify(seq, &pk, &bad, &sig).is_err(),
             "signature moved to another digest"
         );
     }
@@ -111,11 +155,11 @@ fn check_signatures(input: &Input) {
     if other_pk != pk {
         let other_sig = other.sign_hash(&h);
         assert!(matches!(
-            trusted.verify(&other_pk, &h, &other_sig),
+            trusted.verify(seq, &other_pk, &h, &other_sig),
             Err(SigningError::UntrustedKey)
         ));
         assert!(matches!(
-            trusted.verify(&pk, &h, &other_sig),
+            trusted.verify(seq, &pk, &h, &other_sig),
             Err(SigningError::VerificationFailed)
         ));
     }
@@ -133,17 +177,16 @@ fn check_arbitrary(input: &Input) {
     };
     let h = Hash::from_bytes(input.digest);
     let Ok(trusted) = TrustedKeys::new().with(key) else {
-        assert!(!VerifyingKey::from_bytes(&key).is_ok_and(|k| !k.is_weak()));
+        assert!(VerifyingKey::from_bytes(&key).map_or(true, |k| k.is_weak()));
         return;
     };
-    if trusted.verify(&key, &h, &sig).is_ok() {
-        let vk = VerifyingKey::from_bytes(&key).unwrap();
+    let vk = VerifyingKey::from_bytes(&key).unwrap();
+    assert!(!vk.is_weak(), "a weak key was trusted");
+    if trusted.verify(i64::from(input.seq), &key, &h, &sig).is_ok() {
         assert!(
-            vk.is_weak()
-                || vk
-                    .verify_strict(h.as_bytes(), &Signature::from_bytes(&sig))
-                    .is_ok(),
-            "accepted a signature strict verification refuses under a non-weak key"
+            vk.verify_strict(h.as_bytes(), &Signature::from_bytes(&sig))
+                .is_ok(),
+            "accepted a signature strict verification refuses"
         );
     }
 }

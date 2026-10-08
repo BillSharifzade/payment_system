@@ -2,14 +2,17 @@
 //! per level and its direction bits spell the leaf's index; a different leaf, another leaf's
 //! proof, a mutated sibling, root or proof length never verify.
 //!
-//! Known gap, asserted narrowly: an odd level pairs its last node with itself, so flipping the
-//! direction bit of that step still verifies — `verify_proof` does not bind the index (nor
-//! `merkle_root` the leaf count: [a, b, c] and [a, b, c, c] share a root). The target checks
-//! that a flip verifies only at such a self-paired step; see the fuzz report for the patch.
+//! `verify_proof` has a known gap, asserted narrowly: an odd level pairs its last node with
+//! itself, so flipping the direction bit of that step still verifies (and `merkle_root` does not
+//! bind the leaf count: [a, b, c] and [a, b, c, c] share a root). The target checks that such a
+//! flip verifies only at a self-paired step, and that `verify_proof_at` — which derives every
+//! direction from the index — accepts each honest proof and refuses every flip.
 #![no_main]
 
 use arbitrary::Arbitrary;
-use crypto::{leaf_hash, merkle_proof, merkle_root, verify_proof, Hash, ProofStep};
+use crypto::{
+    leaf_hash, merkle_proof, merkle_root, verify_proof, verify_proof_at, Hash, ProofStep,
+};
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Arbitrary, Debug)]
@@ -55,6 +58,14 @@ fuzz_target!(|input: Input| {
     let proofs: Vec<Vec<ProofStep>> = (0..n).map(|i| merkle_proof(&leaves, i).unwrap()).collect();
     for (i, proof) in proofs.iter().enumerate() {
         assert!(verify_proof(leaves[i], proof, root), "leaf {i} of {n}");
+        assert!(
+            verify_proof_at(leaves[i], i, n, proof, root),
+            "leaf {i} of {n} at its index"
+        );
+        assert!(
+            !verify_proof_at(leaves[i], (i + 1) % n.max(2), n, proof, root),
+            "leaf {i} at another index"
+        );
         assert_eq!(proof.len(), levels(n));
         let spelled: usize = proof
             .iter()
@@ -93,6 +104,10 @@ fuzz_target!(|input: Input| {
             if let Some(s) = step_at(s) {
                 let mut p = proof.clone();
                 p[s].sibling_is_left ^= true;
+                assert!(
+                    !verify_proof_at(leaf, k, n, &p, root),
+                    "a flipped direction verified at its index"
+                );
                 if verify_proof(leaf, &p, root) {
                     let acc = proof[..s].iter().fold(leaf, |acc, st| {
                         if st.sibling_is_left {

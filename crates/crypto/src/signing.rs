@@ -1,5 +1,5 @@
 use crate::hash::Hash;
-use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
+use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use rand_core::OsRng;
 
 #[derive(Debug, thiserror::Error)]
@@ -55,7 +55,9 @@ pub fn verify_hash(
 ) -> Result<(), SigningError> {
     let vk = VerifyingKey::from_bytes(public_key).map_err(|_| SigningError::InvalidPublicKey)?;
     let sig = Signature::from_bytes(signature);
-    vk.verify(hash.as_bytes(), &sig)
+    // Strict: rejects small-order keys and non-canonical R, under which a forged
+    // signature (R = identity, s = 0) would verify for any message.
+    vk.verify_strict(hash.as_bytes(), &sig)
         .map_err(|_| SigningError::VerificationFailed)
 }
 
@@ -107,7 +109,11 @@ impl TrustedKeys {
     }
 
     fn add(&mut self, key: [u8; 32], last: Option<i64>) -> Result<(), SigningError> {
-        VerifyingKey::from_bytes(&key).map_err(|_| SigningError::InvalidPublicKey)?;
+        let vk = VerifyingKey::from_bytes(&key).map_err(|_| SigningError::InvalidPublicKey)?;
+        // A small-order (weak) key verifies forgeries under non-strict checking; never trust one.
+        if vk.is_weak() {
+            return Err(SigningError::InvalidPublicKey);
+        }
         match self.keys.iter().find(|(k, _)| *k == key) {
             None => self.keys.push((key, last)),
             Some((_, l)) if *l == last => {}
@@ -283,5 +289,22 @@ mod tests {
         let a = Sealer::from_secret_bytes(&bytes);
         let b = Sealer::from_secret_bytes(&bytes);
         assert_eq!(a.public_key_bytes(), b.public_key_bytes());
+    }
+
+    #[test]
+    fn weak_keys_are_never_trusted_and_forgeries_never_verify() {
+        // The identity point: a small-order key under which (R = identity, s = 0)
+        // satisfies the non-strict verification equation for every message.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        assert!(matches!(
+            TrustedKeys::default().with(identity),
+            Err(SigningError::InvalidPublicKey)
+        ));
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+        for msg in [b"checkpoint".as_slice(), b"any other message"] {
+            assert!(verify_hash(&identity, &sha256(msg), &forged).is_err());
+        }
     }
 }
