@@ -1,0 +1,52 @@
+# pgBackRest configuration for the HA overlay (ha/docker-compose.ha.yml). Copy to
+# deploy/secrets/pgbackrest.conf and fill in the CHANGE_ME lines; every member
+# mounts the same file. It holds credentials and the encryption passphrase: a
+# secret — never commit it, and escrow repo1-cipher-pass off the box.
+#
+# Whichever member leads archives WAL into the one stanza `payment`
+# (archive_mode=on in patroni.yml; pgBackRest refuses `always`). A promoted
+# member continues on its new timeline, adds the .history file and the old
+# timeline's .partial segment, and starts a backup at once (ha-on-role-change),
+# so a segment the dying leader never shipped cannot strand point-in-time
+# recovery. Scheduled base backups run on the leader, from the host's crontab:
+#   0 3 * * 0   cd ~/payment_system/deploy && docker compose exec -T "$(ha/ha-leader.sh)" pgbackrest --stanza=payment --type=full backup
+#   0 3 * * 1-6 cd ~/payment_system/deploy && docker compose exec -T "$(ha/ha-leader.sh)" pgbackrest --stanza=payment --type=diff backup
+# post_bootstrap creates the stanza; check it with
+#   docker compose exec "$(ha/ha-leader.sh)" pgbackrest --stanza=payment check
+
+[global]
+repo1-type=s3
+repo1-path=/payment-pgbackrest
+# Off-box, S3-compatible target. Host only, no scheme.
+repo1-s3-endpoint=s3.eu-central-003.backblazeb2.com
+repo1-s3-bucket=CHANGE_ME_bucket
+repo1-s3-region=CHANGE_ME_region
+repo1-s3-key=CHANGE_ME_access_key_id
+repo1-s3-key-secret=CHANGE_ME_secret_access_key
+repo1-s3-uri-style=path
+# Client-side encryption. Generate: openssl rand -hex 32
+# LOSING THIS PASSPHRASE MAKES EVERY BACKUP UNREADABLE.
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=CHANGE_ME_openssl_rand_hex_32
+repo1-retention-full=4
+repo1-retention-diff=14
+repo1-bundle=y
+repo1-block=y
+
+# Synchronous archive-push (no local spool): the members' root filesystems are
+# read-only and a segment only counts as archived once it is in the bucket.
+# archive_command runs in Postgres's archiver process, never in a COMMIT.
+start-fast=y
+log-level-console=info
+log-level-file=off
+process-max=2
+compress-type=zst
+compress-level=3
+
+[payment]
+# Patroni's data directory inside the member containers.
+pg1-path=/var/lib/postgresql/data/pgdata
+pg1-port=5432
+pg1-socket-path=/run/postgresql
+# The cluster's superuser (there is no `postgres` role).
+pg1-user=payment

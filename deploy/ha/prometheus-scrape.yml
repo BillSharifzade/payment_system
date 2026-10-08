@@ -1,0 +1,16 @@
+# Scrape jobs for the HA overlay, loaded by Prometheus through
+# `scrape_config_files` (see ha/docker-compose.ha-monitoring.yml): every
+# Patroni member's REST API (/metrics, no credentials needed for GET), every
+# etcd member's metrics listener and HAProxy's built-in exporter.
+scrape_configs:
+  - job_name: patroni
+    static_configs:
+      - targets: ["pg-1:8008", "pg-2:8008", "pg-3:8008"]
+
+  - job_name: etcd
+    static_configs:
+      - targets: ["etcd-1:2381", "etcd-2:2381", "etcd-3:2381"]
+
+  - job_name: haproxy
+    static_configs:
+      - targets: ["postgres:8404"]

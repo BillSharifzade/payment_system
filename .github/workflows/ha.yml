@@ -1,0 +1,106 @@
+# Postgres HA (deploy/ha): static checks of the Patroni overlay, and the
+# failover drill — crash, planned switchover and freeze of the leader under
+# transfer load through the real payment-server/payment-workers images, with
+# zero acknowledged-transaction loss asserted (scripts/ha-failover-drill.sh).
+#
+# Actions are pinned to the same commit SHAs as ci.yml; tool images by digest.
+name: HA
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "deploy/**"
+      - "scripts/ha-*"
+      - "crates/**"
+      - "migrations/**"
+      - "Cargo.lock"
+      - ".github/workflows/ha.yml"
+  schedule:
+    - cron: "17 4 * * 1"   # weekly, so image/base drift is noticed without a push
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ha-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SHELLCHECK_IMAGE: koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
+  PROMETHEUS_IMAGE: prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+  HAPROXY_IMAGE: haproxy:3.2.23-alpine@sha256:5961c68bc8a81c5124d0a98ab20f81b74717d6afe596e805977d9cf84c126222
+
+jobs:
+  static:
+    name: HA overlay — compose, HAProxy, alert rules, shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: shellcheck
+        run: |
+          docker run --rm -v "$PWD:/mnt:ro" -w /mnt "$SHELLCHECK_IMAGE" -x \
+            scripts/ha-failover-drill.sh scripts/ha-local.sh scripts/ha-compose-check.sh \
+            deploy/ha/entrypoint.sh deploy/ha/post-bootstrap.sh deploy/ha/on-role-change.sh \
+            deploy/ha/init-secrets.sh deploy/ha/ha-leader.sh
+      - name: Python scripts compile
+        run: python3 -m py_compile scripts/ha-load.py deploy/ha/render-config.py deploy/ha/etcd-auth.py
+      - name: Compose combinations, network/port/digest invariants, haproxy.cfg
+        run: scripts/ha-compose-check.sh
+      - name: promtool — HA rules and their unit tests, scrape config
+        run: |
+          prom() { docker run --rm -v "$PWD/deploy:/d:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" "$@"; }
+          prom check rules /d/ha/prometheus-rules.yml
+          prom test rules /d/ha/tests/prometheus-rules.test.yml
+          # monitoring/prometheus.yml + the scrape_config_files line the HA monitoring overlay needs.
+          mkdir -p "$RUNNER_TEMP/prom"
+          { cat deploy/monitoring/prometheus.yml; printf '\nscrape_config_files:\n  - /d/ha/prometheus-scrape.yml\n'; } > "$RUNNER_TEMP/prom/prometheus.yml"
+          docker run --rm -v "$PWD/deploy:/d:ro" -v "$RUNNER_TEMP/prom:/p:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" check config /p/prometheus.yml
+
+  drill:
+    name: Failover drill — crash, switchover, freeze (docker compose)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: payment-system (cargo-chef, distroless) — same cache as ci.yml
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: false
+          load: true
+          tags: payment-system:ci
+          cache-from: type=gha,scope=payment-system
+          cache-to: type=gha,scope=payment-system,mode=max
+      - name: payment-patroni (Postgres 16 + Patroni + pgBackRest)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: deploy/ha
+          push: false
+          load: true
+          tags: payment-patroni:ci
+          cache-from: type=gha,scope=payment-patroni
+          cache-to: type=gha,scope=payment-patroni,mode=max
+      - name: psql client
+        run: command -v psql || { sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends postgresql-client; }
+      - name: Drill (compose mode; exits non-zero on any violation)
+        env:
+          IMAGE_TAG: ci
+          HA_WORKDIR: ${{ runner.temp }}/ha-drill
+          HA_DRILL_OUT: ${{ runner.temp }}/ha-drill-out
+        run: scripts/ha-failover-drill.sh --mode compose --rounds 1
+      - name: Results
+        if: always()
+        run: cat "$RUNNER_TEMP/ha-drill-out/results.jsonl" 2>/dev/null || true
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ha-drill-logs
+          path: ${{ runner.temp }}/ha-drill-out
+          retention-days: 14

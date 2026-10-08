@@ -1,0 +1,30 @@
+# TEST ONLY — used by scripts/ha-failover-drill.sh --mode compose (CI). Never
+# layer this on a real deployment: it publishes every database member, Patroni's
+# REST API, HAProxy and the API on 127.0.0.1 so the drill can watch each member
+# and inject faults, and it stops Docker from restarting a killed member (the
+# drill decides when the "machine" comes back).
+#
+# Same addresses as the drill's local mode: HAProxy 5450 (rw) / 5454 (ro) / 7450 (admin),
+# members 5451-5453 (Postgres) / 8451-8453 (Patroni REST), API 18450.
+services:
+  postgres:
+    ports: ["127.0.0.1:5450:5432", "127.0.0.1:5454:5433", "127.0.0.1:7450:8404"]
+    networks: [backend, ha, drill]
+  pg-1:
+    restart: "no"
+    ports: ["127.0.0.1:5451:5432", "127.0.0.1:8451:8008"]
+    networks: [ha, egress, drill]
+  pg-2:
+    restart: "no"
+    ports: ["127.0.0.1:5452:5432", "127.0.0.1:8452:8008"]
+    networks: [ha, egress, drill]
+  pg-3:
+    restart: "no"
+    ports: ["127.0.0.1:5453:5432", "127.0.0.1:8453:8008"]
+    networks: [ha, egress, drill]
+  payment-server:
+    ports: ["127.0.0.1:18450:8080"]
+
+networks:
+  # Internal networks cannot publish ports; this one exists only to.
+  drill: {}
