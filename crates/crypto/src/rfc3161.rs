@@ -590,14 +590,20 @@ mod tests {
         let tsa = TestTsa::new();
         let trust = TsaTrust::from_pem(tsa.ca_pem().as_bytes()).unwrap();
         let im = imprint(b"checkpoint");
+        let unix_now = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+        };
+        // Bracket the issuance rather than compare with "now" after verifying:
+        // verification is slow under Miri, and the clock keeps running.
+        let before = unix_now();
         let resp = tsa.respond(&timestamp_request(&im, 7));
+        let after = unix_now();
         let v = verify_response(&resp, &im, Some(7), Some(&trust)).unwrap();
         assert!(v.trusted);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        assert!((v.gen_time - now).abs() < 5, "{v:?}");
+        assert!((before - 1..=after + 1).contains(&v.gen_time), "{v:?}");
         assert!(v.signer.contains("Test TSA"), "{v:?}");
         // A stored token re-verifies without the nonce; without anchors only
         // against its own certificate.
