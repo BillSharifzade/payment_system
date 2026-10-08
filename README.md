@@ -126,6 +126,12 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 (cd mobile && ./gradlew :core:test :app:testDevDebugUnitTest)
 ```
 
+Fuzzing needs nightly: `rustup toolchain install nightly-2026-10-08 && cargo install cargo-fuzz --locked --version 0.13.2`,
+then `FUZZ_TOOLCHAIN=nightly-2026-10-08 fuzz/run.sh 60` (every target, 60 s each) or
+`fuzz/run.sh 600 ledger_ops`. A failure leaves its reproducer in `fuzz/artifacts/<target>/`;
+replay it with `cargo +nightly fuzz run -a <target> <file>`. CI: `.github/workflows/fuzz.yml`
+(75 s per target on PRs, 10 min nightly, plus Miri).
+
 CI (`.github/workflows/ci.yml`) runs all of the above plus `cargo deny`,
 `npm audit` and both container image builds — it needs the repository pushed to
 GitHub to execute.
