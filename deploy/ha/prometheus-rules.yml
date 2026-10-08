@@ -1,0 +1,160 @@
+# Prometheus alert rules for the Patroni cluster (deploy/ha). Metrics: Patroni's
+# REST API /metrics (job patroni, labels scope/name), etcd (job etcd) and
+# HAProxy's exporter (job haproxy), scraped per ha/prometheus-scrape.yml.
+# Mounted next to monitoring/prometheus-rules.yml by ha/docker-compose.ha-monitoring.yml.
+# Unit tests: deploy/ha/tests/prometheus-rules.test.yml
+#   (promtool test rules deploy/ha/tests/prometheus-rules.test.yml)
+groups:
+  - name: payment-ha
+    rules:
+      # ---- leadership ---------------------------------------------------------------
+      - alert: PatroniNoLeader
+        # A crash failover takes ~ttl (20 s) + a few seconds; longer than a
+        # minute without a leader is an outage, not a failover.
+        expr: absent(patroni_primary{job="patroni"} == 1)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No Postgres member is leading: the ledger accepts no writes"
+          description: "No Patroni member reports itself primary (or none is scraped). `docker compose exec pg-1 patronictl list`; is etcd healthy (EtcdNoLeader)? Are two members down (PatroniQuorumStandbyMissing)?"
+
+      - alert: PatroniMultipleLeaders
+        # Split brain. HAProxy only routes to the member Patroni confirms, and a
+        # leader without a quorum standby cannot acknowledge a commit, but two
+        # primaries must never last.
+        expr: count(patroni_primary{job="patroni"} == 1) > 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} Postgres members claim to be primary"
+          description: "Possible split brain. `patronictl list` on every member; preserve logs. Do not restart anything before you know which member etcd names leader."
+
+      - alert: PatroniLeaderChanged
+        # Informational page: every failover or switchover deserves a look
+        # (why did the old leader go?). Resolves 15 minutes later.
+        expr: sum(changes(patroni_primary{job="patroni"}[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The Postgres leader changed in the last 15 minutes"
+          description: "Now leading: {{ with query \"patroni_primary{job='patroni'} == 1\" }}{{ . | first | label \"name\" }}{{ end }}. Check the old leader's Patroni log for the reason; it should be back as a streaming replica (PatroniMemberDown otherwise)."
+
+      # ---- synchronous replication (synchronous_mode: quorum, strict) ---------------
+      - alert: PatroniQuorumStandbyMissing
+        # With synchronous_mode_strict no COMMIT is acknowledged without a
+        # quorum standby: this is a write outage.
+        expr: (sum(patroni_quorum_standby{job="patroni"}) + sum(patroni_sync_standby{job="patroni"})) < 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "No synchronous standby: COMMITs are blocked"
+          description: "Both standbys are down, lagging or detached, so the leader cannot acknowledge any transaction (synchronous_mode_strict). Bring a standby back; never disable strict mode to 'fix' this — it would acknowledge money that exists on one machine only."
+
+      - alert: PatroniQuorumDegraded
+        expr: (sum(patroni_quorum_standby{job="patroni"}) + sum(patroni_sync_standby{job="patroni"})) == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Only one standby can acknowledge commits"
+          description: "One more failure stops writes. Which member is missing: `patronictl list`."
+
+      - alert: PatroniReplicationLag
+        # Replayed bytes behind the leader. A quorum standby has flushed every
+        # acknowledged commit; a lagging replay only delays reads from it and
+        # how fast it could take over.
+        expr: |
+          (max(patroni_xlog_location{job="patroni"}) - on() group_right() patroni_xlog_replayed_location{job="patroni"})
+          > 16 * 1024 * 1024
+          and on (instance) patroni_replica{job="patroni"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.name }} replays {{ $value | humanize1024 }}B behind the leader"
+          description: "Disk or CPU starved, or a long query on it holding replay back (max_standby_streaming_delay)."
+
+      # ---- members, DCS, router -------------------------------------------------------
+      - alert: PatroniMemberDown
+        expr: up{job="patroni"} == 0 or patroni_postgres_running{job="patroni"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database member {{ $labels.instance }} is down"
+          description: "The cluster runs with one copy less; one more loss stops writes. `docker compose ps pg-1 pg-2 pg-3`, the member's log."
+
+      - alert: PatroniPaused
+        expr: max(patroni_is_paused{job="patroni"}) == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Patroni is in maintenance mode: no automatic failover"
+          description: "`patronictl resume` when the maintenance is over."
+
+      - alert: PatroniPendingRestart
+        expr: patroni_pending_restart{job="patroni"} == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.name }} needs a restart for a changed parameter"
+          description: "`patronictl restart payment --pending` (replicas first; then a switchover, then the old leader)."
+
+      - alert: PatroniDcsUnreachable
+        # The leader demotes itself when it cannot renew its key within
+        # retry_timeout; a replica cannot be promoted without etcd.
+        expr: time() - patroni_dcs_last_seen{job="patroni"} > 30
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.name }} has not reached etcd for {{ $value | humanizeDuration }}"
+
+      - alert: EtcdNoLeader
+        expr: etcd_server_has_leader{job="etcd"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "etcd member {{ $labels.instance }} has no leader"
+          description: "Without an etcd quorum Patroni demotes the leader (writes stop) and cannot fail over."
+
+      - alert: EtcdMemberDown
+        expr: up{job="etcd"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "etcd member {{ $labels.instance }} is down (quorum survives one loss)"
+
+      - alert: HaproxyNoPrimary
+        expr: haproxy_backend_active_servers{job="haproxy", proxy="primary"} < 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "HAProxy has no Postgres leader in rotation: writes fail"
+          description: "Patroni's GET /primary answers 200 on no member. See PatroniNoLeader; `docker compose logs postgres` for the health-check view."
+
+      - alert: HaMetricsMissing
+        expr: absent(up{job="patroni"}) or absent(up{job="etcd"}) or absent(up{job="haproxy"})
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus scrapes no Patroni, etcd or HAProxy target"
+          description: "monitoring/prometheus.yml needs `scrape_config_files: [\"/etc/prometheus/scrape/*.yml\"]` and the ha-monitoring overlay must be on."
+
+      - alert: HaTargetDown
+        expr: up{job="haproxy"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "HAProxy (the database endpoint) is not answering"
+          description: "Every client reaches Postgres through it. `docker compose ps postgres`."

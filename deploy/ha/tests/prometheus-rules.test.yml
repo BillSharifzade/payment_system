@@ -1,0 +1,206 @@
+# Unit tests for ha/prometheus-rules.yml:
+#   promtool test rules deploy/ha/tests/prometheus-rules.test.yml
+rule_files:
+  - ../prometheus-rules.yml
+
+evaluation_interval: 15s
+
+tests:
+  # A healthy cluster (pg-1 leads, pg-2/pg-3 quorum standbys, no lag) is quiet.
+  - interval: 15s
+    input_series:
+      - series: 'up{job="patroni",instance="pg-1:8008"}'
+        values: '1x80'
+      - series: 'up{job="patroni",instance="pg-2:8008"}'
+        values: '1x80'
+      - series: 'up{job="patroni",instance="pg-3:8008"}'
+        values: '1x80'
+      - series: 'up{job="etcd",instance="etcd-1:2381"}'
+        values: '1x80'
+      - series: 'up{job="haproxy",instance="postgres:8404"}'
+        values: '1x80'
+      - series: 'patroni_primary{job="patroni",instance="pg-1:8008",name="pg-1"}'
+        values: '1x80'
+      - series: 'patroni_primary{job="patroni",instance="pg-2:8008",name="pg-2"}'
+        values: '0x80'
+      - series: 'patroni_primary{job="patroni",instance="pg-3:8008",name="pg-3"}'
+        values: '0x80'
+      - series: 'patroni_replica{job="patroni",instance="pg-2:8008",name="pg-2"}'
+        values: '1x80'
+      - series: 'patroni_replica{job="patroni",instance="pg-3:8008",name="pg-3"}'
+        values: '1x80'
+      - series: 'patroni_quorum_standby{job="patroni",instance="pg-2:8008",name="pg-2"}'
+        values: '1x80'
+      - series: 'patroni_quorum_standby{job="patroni",instance="pg-3:8008",name="pg-3"}'
+        values: '1x80'
+      - series: 'patroni_sync_standby{job="patroni",instance="pg-2:8008",name="pg-2"}'
+        values: '0x80'
+      - series: 'patroni_xlog_location{job="patroni",instance="pg-1:8008",name="pg-1"}'
+        values: '1000000+1000x80'
+      - series: 'patroni_xlog_replayed_location{job="patroni",instance="pg-2:8008",name="pg-2"}'
+        values: '1000000+1000x80'
+      - series: 'patroni_xlog_replayed_location{job="patroni",instance="pg-3:8008",name="pg-3"}'
+        values: '999000+1000x80'
+      - series: 'haproxy_backend_active_servers{job="haproxy",instance="postgres:8404",proxy="primary"}'
+        values: '1x80'
+    alert_rule_test:
+      - eval_time: 19m
+        alertname: PatroniNoLeader
+        exp_alerts: []
+      - eval_time: 19m
+        alertname: PatroniMultipleLeaders
+        exp_alerts: []
+      - eval_time: 19m
+        alertname: PatroniLeaderChanged
+        exp_alerts: []
+      - eval_time: 19m
+        alertname: PatroniQuorumStandbyMissing
+        exp_alerts: []
+      - eval_time: 19m
+        alertname: PatroniQuorumDegraded
+        exp_alerts: []
+      - eval_time: 19m
+        alertname: PatroniReplicationLag
+        exp_alerts: []
+      - eval_time: 19m
+        alertname: PatroniMemberDown
+        exp_alerts: []
+      - eval_time: 19m
+        alertname: HaproxyNoPrimary
+        exp_alerts: []
+      - eval_time: 19m
+        alertname: HaMetricsMissing
+        exp_alerts: []
+
+  # Crash failover: pg-1 dies at 2m (its series go stale), pg-2 is promoted at 2m30s.
+  # 30 s without a leader is a failover, not an outage: no PatroniNoLeader;
+  # the leader change pages as a warning.
+  - interval: 15s
+    input_series:
+      - series: 'patroni_primary{job="patroni",instance="pg-1:8008",name="pg-1"}'
+        values: '1x8 stale'
+      - series: 'patroni_primary{job="patroni",instance="pg-2:8008",name="pg-2"}'
+        values: '0x9 1x30'
+      - series: 'patroni_primary{job="patroni",instance="pg-3:8008",name="pg-3"}'
+        values: '0x40'
+      - series: 'up{job="patroni",instance="pg-1:8008"}'
+        values: '1x8 0x31'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: PatroniNoLeader
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: PatroniLeaderChanged
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "The Postgres leader changed in the last 15 minutes"
+              description: "Now leading: pg-2. Check the old leader's Patroni log for the reason; it should be back as a streaming replica (PatroniMemberDown otherwise)."
+      - eval_time: 4m
+        alertname: PatroniMemberDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: patroni
+              instance: "pg-1:8008"
+            exp_annotations:
+              summary: "Database member pg-1:8008 is down"
+              description: "The cluster runs with one copy less; one more loss stops writes. `docker compose ps pg-1 pg-2 pg-3`, the member's log."
+
+  # No member leads for minutes (etcd lost quorum, or two members down).
+  - interval: 15s
+    input_series:
+      - series: 'patroni_primary{job="patroni",instance="pg-2:8008",name="pg-2"}'
+        values: '0x20'
+      - series: 'patroni_primary{job="patroni",instance="pg-3:8008",name="pg-3"}'
+        values: '0x20'
+      - series: 'haproxy_backend_active_servers{job="haproxy",instance="postgres:8404",proxy="primary"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: PatroniNoLeader
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No Postgres member is leading: the ledger accepts no writes"
+              description: "No Patroni member reports itself primary (or none is scraped). `docker compose exec pg-1 patronictl list`; is etcd healthy (EtcdNoLeader)? Are two members down (PatroniQuorumStandbyMissing)?"
+      - eval_time: 2m
+        alertname: HaproxyNoPrimary
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: haproxy
+              instance: "postgres:8404"
+              proxy: primary
+            exp_annotations:
+              summary: "HAProxy has no Postgres leader in rotation: writes fail"
+              description: "Patroni's GET /primary answers 200 on no member. See PatroniNoLeader; `docker compose logs postgres` for the health-check view."
+
+  # Split brain: two members report primary for a minute.
+  - interval: 15s
+    input_series:
+      - series: 'patroni_primary{job="patroni",instance="pg-1:8008",name="pg-1"}'
+        values: '1x8'
+      - series: 'patroni_primary{job="patroni",instance="pg-2:8008",name="pg-2"}'
+        values: '1x8'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: PatroniMultipleLeaders
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "2 Postgres members claim to be primary"
+              description: "Possible split brain. `patronictl list` on every member; preserve logs. Do not restart anything before you know which member etcd names leader."
+
+  # Both standbys gone: strict synchronous mode blocks every COMMIT.
+  - interval: 15s
+    input_series:
+      - series: 'patroni_quorum_standby{job="patroni",instance="pg-2:8008",name="pg-2"}'
+        values: '1x4 0x20'
+      - series: 'patroni_quorum_standby{job="patroni",instance="pg-3:8008",name="pg-3"}'
+        values: '0x24'
+      - series: 'patroni_sync_standby{job="patroni",instance="pg-2:8008",name="pg-2"}'
+        values: '0x24'
+      - series: 'patroni_sync_standby{job="patroni",instance="pg-3:8008",name="pg-3"}'
+        values: '0x24'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: PatroniQuorumStandbyMissing
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: PatroniQuorumStandbyMissing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No synchronous standby: COMMITs are blocked"
+              description: "Both standbys are down, lagging or detached, so the leader cannot acknowledge any transaction (synchronous_mode_strict). Bring a standby back; never disable strict mode to 'fix' this — it would acknowledge money that exists on one machine only."
+
+  # One standby replays 32 MB behind for 10 minutes; the leader itself never counts.
+  - interval: 1m
+    input_series:
+      - series: 'patroni_xlog_location{job="patroni",instance="pg-1:8008",name="pg-1"}'
+        values: '100000000x12'
+      - series: 'patroni_xlog_replayed_location{job="patroni",instance="pg-1:8008",name="pg-1"}'
+        values: '0x12'
+      - series: 'patroni_xlog_replayed_location{job="patroni",instance="pg-3:8008",name="pg-3"}'
+        values: '66445568x12'
+      - series: 'patroni_replica{job="patroni",instance="pg-3:8008",name="pg-3"}'
+        values: '1x12'
+      - series: 'patroni_replica{job="patroni",instance="pg-1:8008",name="pg-1"}'
+        values: '0x12'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: PatroniReplicationLag
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: patroni
+              instance: "pg-3:8008"
+              name: pg-3
+            exp_annotations:
+              summary: "pg-3 replays 32MiB behind the leader"
+              description: "Disk or CPU starved, or a long query on it holding replay back (max_standby_streaming_delay)."

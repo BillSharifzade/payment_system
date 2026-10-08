@@ -1,0 +1,282 @@
+# HA overlay: replaces the single `postgres` service with a 3-member Patroni
+# cluster (Postgres 16, quorum-synchronous replication, automatic failover)
+# coordinated by 3 etcd members, behind HAProxy. Layer it on the core file in
+# deploy/.env (paths resolve against deploy/, the base file's directory):
+#
+#   COMPOSE_FILE=docker-compose.prod.yml:ha/docker-compose.ha.yml
+#   (+ :docker-compose.monitoring.yml:ha/docker-compose.ha-monitoring.yml)
+#
+# Requires Compose v2.24.4+ (`!override`) and, once, the HA secrets:
+#   ha/init-secrets.sh                 pg_replication_password, patroni_api_password,
+#                                      etcd_root_password, etcd_patroni_password
+#   secrets/pgbackrest.conf            WAL archive repository (from ha/pgbackrest.conf.example)
+#
+# `postgres` keeps its name but becomes HAProxy: every existing client — the
+# app's DATABASE_URL/MIGRATION_DATABASE_URL (postgres:5432), the dump sidecar,
+# postgres-exporter — now reaches whichever member leads, unchanged. HAProxy
+# health-checks Patroni's REST API (GET /primary), cuts every session through a
+# member the moment it stops leading, and is a plain TCP proxy (session state,
+# i.e. the workers' advisory-lock leader election, works as on a direct
+# connection). The members (pg-1..3) and etcd sit on the internal `ha` network:
+# nothing on `backend` can reach Postgres, Patroni or etcd except through
+# HAProxy's port 5432.
+#
+# ONE BOX IS NOT HA. This file runs all three members on one Docker host —
+# right for CI, staging and the failover drill (scripts/ha-failover-drill.sh),
+# but a dead host still takes everything with it. In production run each member
+# (pg-N + etcd-N) on its own machine, in separate failure domains, and HAProxy
+# twice behind a keepalived VIP (DESIGN.md §12.4); the image, patroni.yml and
+# haproxy.cfg carry over unchanged (only the addresses differ).
+#
+# Operate (from deploy/):
+#   docker compose exec pg-1 patronictl list                  members, roles, lag, timeline
+#   docker compose exec pg-1 patronictl switchover --leader pg-1 --candidate pg-2
+#   ha/ha-leader.sh                                           the leading member's service name
+#   docker compose exec "$(ha/ha-leader.sh)" psql -U payment -d payment   (superuser, on the leader)
+name: payment
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+      labels: "com.docker.compose.service,com.docker.compose.project"
+
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+
+x-etcd: &etcd
+  image: gcr.io/etcd-development/etcd:v3.6.15@sha256:5ed4e32061aa061f970d6500629213e8579ef17571dcf9789074966acb9afad1
+  restart: unless-stopped
+  <<: [*logging, *hardening]
+  # The image is distroless (no shell) and runs as root, in its own namespace
+  # with every capability dropped (like NATS); clients must authenticate once
+  # etcd-auth has run.
+  read_only: true
+  networks: [ha]
+  healthcheck:
+    # As the role-less `health` user (public password, created by etcd-auth):
+    # without credentials etcdctl calls an auth-enabled cluster unhealthy;
+    # this user's permission-denied answer still proves consensus. Before auth
+    # is enabled the credentials are simply ignored.
+    test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:2379", "--user=health:health", "--command-timeout=3s", "endpoint", "health"]
+    interval: 5s
+    timeout: 5s
+    retries: 20
+  stop_grace_period: 30s
+  deploy:
+    resources:
+      limits:
+        memory: 256M
+        pids: 256
+
+x-etcd-env: &etcd-env
+  ETCD_DATA_DIR: /var/lib/etcd/data
+  ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+  ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+  # /health and /metrics without credentials, for Prometheus.
+  ETCD_LISTEN_METRICS_URLS: http://0.0.0.0:2381
+  ETCD_INITIAL_CLUSTER: etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+  ETCD_INITIAL_CLUSTER_STATE: new
+  ETCD_INITIAL_CLUSTER_TOKEN: payment-ha
+  ETCD_AUTO_COMPACTION_RETENTION: "1"
+
+x-patroni: &patroni
+  build:
+    context: ./ha
+  image: payment-patroni:${IMAGE_TAG:-latest}
+  restart: unless-stopped
+  <<: [*logging, *hardening]
+  # The image's postgres user (999:999), as the single-node service; the
+  # secrets group reads /run/secrets.
+  user: "999:999"
+  group_add: ["${SECRETS_GID:-10500}"]
+  read_only: true
+  # Rendered Patroni config (0600), sockets and lock files, pgBackRest locks.
+  tmpfs:
+    - /tmp
+    - /run/patroni:uid=999,gid=999,mode=0700
+    - /run/postgresql:uid=999,gid=999,mode=2775
+  shm_size: 256m
+  secrets:
+    - postgres_password
+    - pg_owner_password
+    - pg_app_password
+    - pg_backup_password
+    - pg_monitor_password
+    - pg_replication_password
+    - patroni_api_password
+    - etcd_patroni_password
+    - source: pgbackrest_conf
+      target: /etc/pgbackrest/pgbackrest.conf
+  configs:
+    - source: patroni_yml
+      target: /etc/patroni/patroni.yml
+  # archive-push reaches the off-box bucket over `egress` (as in the
+  # single-node WAL overlay); a posix repository lives on the shared volume.
+  networks: [ha, egress]
+  depends_on:
+    etcd-auth: { condition: service_completed_successfully }
+  healthcheck:
+    # 200 once Postgres runs under Patroni (leader or replica).
+    test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/health', timeout=3)"]
+    interval: 5s
+    timeout: 5s
+    retries: 30
+    start_period: 60s
+  # Patroni stops Postgres in fast mode on SIGTERM; a leader hands over first.
+  stop_grace_period: 60s
+  deploy:
+    resources:
+      limits:
+        memory: 1536M
+        pids: 512
+
+services:
+  # ---- the database endpoint: HAProxy, under the old name -------------------------------
+  postgres: !override
+    image: haproxy:3.2.23-alpine@sha256:5961c68bc8a81c5124d0a98ab20f81b74717d6afe596e805977d9cf84c126222
+    restart: unless-stopped
+    <<: [*logging, *hardening]
+    # The image's haproxy user (uid 99); ports > 1024, no capability needed.
+    read_only: true
+    environment:
+      HA_BIND_RW: ":5432"
+      HA_BIND_RO: ":5433"
+      HA_BIND_ADMIN: ":8404"
+      HA_PG1: pg-1:5432
+      HA_PG2: pg-2:5432
+      HA_PG3: pg-3:5432
+      HA_API1_PORT: "8008"
+      HA_API2_PORT: "8008"
+      HA_API3_PORT: "8008"
+    configs:
+      - source: haproxy_cfg
+        target: /usr/local/etc/haproxy/haproxy.cfg
+    networks: [backend, ha]
+    # Started, not healthy: a dead member must never keep the router down.
+    depends_on:
+      pg-1: { condition: service_started }
+      pg-2: { condition: service_started }
+      pg-3: { condition: service_started }
+    healthcheck:
+      # 200 only while a leader is in rotation, so `depends_on: postgres:
+      # service_healthy` in the base file still means "writes are possible"
+      # at startup. The many retries keep a failover's ~20 s without a leader
+      # from marking the router itself unhealthy.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8404/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 90
+      start_period: 30s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          pids: 256
+
+  # ---- Patroni members --------------------------------------------------------------------
+  pg-1:
+    <<: *patroni
+    environment: { HA_NODE_NAME: pg-1 }
+    volumes:
+      - pgdata-1:/var/lib/postgresql/data
+      # 10-roles.sh for post_bootstrap (and deploy.sh) — the single-node files.
+      - ./postgres:/docker-entrypoint-initdb.d:ro
+      - pgbackrest-repo:/var/lib/pgbackrest
+  pg-2:
+    <<: *patroni
+    environment: { HA_NODE_NAME: pg-2 }
+    volumes:
+      - pgdata-2:/var/lib/postgresql/data
+      - ./postgres:/docker-entrypoint-initdb.d:ro
+      - pgbackrest-repo:/var/lib/pgbackrest
+  pg-3:
+    <<: *patroni
+    environment: { HA_NODE_NAME: pg-3 }
+    volumes:
+      - pgdata-3:/var/lib/postgresql/data
+      - ./postgres:/docker-entrypoint-initdb.d:ro
+      - pgbackrest-repo:/var/lib/pgbackrest
+
+  # ---- etcd: Patroni's leader election and cluster state ------------------------------------
+  etcd-1:
+    <<: *etcd
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd-1
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd-1:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd-1:2380
+    volumes: [etcddata-1:/var/lib/etcd]
+  etcd-2:
+    <<: *etcd
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd-2
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd-2:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd-2:2380
+    volumes: [etcddata-2:/var/lib/etcd]
+  etcd-3:
+    <<: *etcd
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd-3
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd-3:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd-3:2380
+    volumes: [etcddata-3:/var/lib/etcd]
+
+  # One-shot: turns on etcd client authentication (users root + patroni, the
+  # latter limited to /service/); a no-op once on. See ha/etcd-auth.py.
+  etcd-auth:
+    build:
+      context: ./ha
+    image: payment-patroni:${IMAGE_TAG:-latest}
+    <<: [*logging, *hardening]
+    user: "999:999"
+    group_add: ["${SECRETS_GID:-10500}"]
+    read_only: true
+    entrypoint: ["python3", "/usr/local/lib/ha/etcd-auth.py"]
+    secrets: [etcd_root_password, etcd_patroni_password]
+    networks: [ha]
+    restart: "no"
+    depends_on:
+      etcd-1: { condition: service_healthy }
+      etcd-2: { condition: service_healthy }
+      etcd-3: { condition: service_healthy }
+
+networks:
+  # Members, etcd and HAProxy only; no egress.
+  ha:
+    internal: true
+
+configs:
+  patroni_yml:
+    file: ./ha/patroni.yml
+  haproxy_cfg:
+    file: ./ha/haproxy.cfg
+
+secrets:
+  pg_replication_password:
+    file: ./secrets/pg_replication_password
+  patroni_api_password:
+    file: ./secrets/patroni_api_password
+  etcd_root_password:
+    file: ./secrets/etcd_root_password
+  etcd_patroni_password:
+    file: ./secrets/etcd_patroni_password
+  pgbackrest_conf:
+    file: ./secrets/pgbackrest.conf
+
+volumes:
+  pgdata-1:
+  pgdata-2:
+  pgdata-3:
+  etcddata-1:
+  etcddata-2:
+  etcddata-3:
+  # The posix pgBackRest repository of ha/pgbackrest.conf.example's local
+  # variant (CI, the drill). Production archives to S3 instead.
+  pgbackrest-repo:

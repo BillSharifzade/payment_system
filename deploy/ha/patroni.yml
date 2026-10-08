@@ -1,0 +1,152 @@
+# Patroni configuration shared by every database node (deploy/ha). Node
+# identity, addresses and credentials are NOT here: render-config.py adds them
+# from the environment (HA_NODE_NAME, HA_*_CONNECT, ...) and the secret files,
+# writing the effective file to a 0600 tmpfs path. Everything under
+# bootstrap.dcs is written to etcd once, when the cluster is first initialised;
+# change it later with `patronictl edit-config` (the file is not re-read).
+scope: payment
+namespace: /service/
+
+restapi:
+  listen: 0.0.0.0:8008
+  # GET endpoints (/primary, /replica, /health, /metrics: what HAProxy and
+  # Prometheus use) are open; switchover, restart, reload and config changes
+  # require the `patroni` user (secret patroni_api_password).
+
+etcd3:
+  protocol: http
+
+bootstrap:
+  dcs:
+    # Leader key TTL / HA loop / DCS+Postgres retry budget. A dead or frozen
+    # leader is replaced ~ttl seconds after its last heartbeat (Patroni requires
+    # loop_wait + 2 * retry_timeout <= ttl). Lower values fail over faster but
+    # turn an etcd or disk stall on a loaded box into a needless failover.
+    ttl: 20
+    loop_wait: 5
+    retry_timeout: 5
+    # --- the zero-data-loss decision ----------------------------------------
+    # quorum: synchronous_standby_names = 'ANY 1 (<the two standbys>)'. A COMMIT
+    #   returns only once the leader AND at least one standby have flushed it,
+    #   and whichever standby answers first counts — so losing (or freezing) one
+    #   standby does not stall writes for even a second, unlike `on`, which pins
+    #   one named standby and stalls commits until Patroni swaps in the other.
+    # strict: with BOTH standbys gone the leader keeps refusing to acknowledge
+    #   commits (they wait) instead of silently degrading to single-copy
+    #   writes. "A transaction is not acknowledged until it is on two machines"
+    #   (DESIGN §12.4) then holds unconditionally; the price is that losing two
+    #   of three database nodes stops writes (reads continue) until one returns.
+    # Promotion is quorum-checked too: after a leader loss Patroni promotes only
+    #   a standby proven to hold every acknowledged commit, so failover never
+    #   loses one. With 3 nodes this survives any single node loss with writes
+    #   available and RPO = 0.
+    # Clients must never cancel the replication wait of a COMMIT: Postgres
+    #   reports a COMMIT whose wait was cancelled (statement_timeout,
+    #   pg_cancel_backend) as SUCCESS although no standby has it. Code that
+    #   commits money must run its COMMIT with statement_timeout = 0.
+    synchronous_mode: quorum
+    synchronous_mode_strict: true
+    synchronous_node_count: 1
+    # Only consulted for asynchronous candidates (synchronous mode already
+    # restricts promotion to quorum members): never promote one that is more
+    # than 1 MB behind.
+    maximum_lag_on_failover: 1048576
+    check_timeline: true
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      # Same server tuning as the single-node stack (docker-compose.prod.yml);
+      # parameters every node must share live here.
+      parameters:
+        max_connections: 200
+        shared_buffers: 384MB
+        effective_cache_size: 1GB
+        wal_compression: "on"
+        checkpoint_completion_target: 0.9
+        log_min_duration_statement: 250ms
+        log_lock_waits: "on"
+        log_connections: "off"
+        password_encryption: scram-sha-256
+        shared_preload_libraries: pg_stat_statements
+        # A ledger: a COMMIT is durable before the client hears of it. With
+        # synchronous_standby_names (set by Patroni) "on" also means flushed
+        # on a quorum standby. NEVER lower it.
+        synchronous_commit: "on"
+        wal_level: replica
+        hot_standby: "on"
+        wal_log_hints: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        # A member that stays down keeps its slot (and our WAL) for
+        # member_slots_ttl; this caps the WAL a lost member can pin.
+        max_slot_wal_keep_size: 4GB
+        # A frozen or partitioned standby is noticed in seconds, not the
+        # default minute.
+        wal_sender_timeout: 10s
+        wal_receiver_timeout: 10s
+        # Clients that vanish (a dead app host) are dropped within ~25 s, which
+        # also releases a dead worker's leader lock.
+        tcp_keepalives_idle: 10
+        tcp_keepalives_interval: 5
+        tcp_keepalives_count: 3
+        # Continuous WAL archiving into one pgBackRest stanza, from whichever
+        # member leads: a promoted standby continues on its new timeline and
+        # archives the .history file and the old timeline's .partial segment.
+        # `on`, not `always`: pgBackRest refuses backup/check under `always`.
+        # The price: a standby marks the segments it streamed as archived, so
+        # a segment the dying leader had completed but not yet shipped never
+        # reaches the archive — PITR cannot cross that point from an older
+        # base backup. ha-on-role-change therefore starts a backup on every
+        # promotion, so the new timeline has a base of its own at once.
+        # pgBackRest reads /etc/pgbackrest/pgbackrest.conf (or PGBACKREST_CONFIG).
+        archive_mode: "on"
+        archive_command: pgbackrest --stanza=payment archive-push %p
+        archive_timeout: 300
+  initdb:
+    - data-checksums
+    - encoding: UTF8
+    # libc-independent collation: an OS upgrade on one node can never change
+    # text ordering under an index replicated from another.
+    - locale: C.UTF-8
+  # Creates the payment database and the application roles (the same
+  # deploy/postgres/10-roles.sh the single-node stack runs) on the brand-new
+  # primary; replicas get both through replication.
+  post_bootstrap: ha-post-bootstrap
+
+postgresql:
+  listen: 0.0.0.0:5432
+  data_dir: /var/lib/postgresql/data/pgdata
+  bin_dir: /usr/lib/postgresql/16/bin
+  pgpass: /tmp/pgpass
+  use_unix_socket: true
+  # The superuser is the stack's bootstrap superuser `payment` (secret
+  # postgres_password); pg_rewind and Patroni's own checks use it too.
+  # Replication uses `replicator` (secret pg_replication_password).
+  pg_hba:
+    - local all all trust
+    - host replication replicator samenet scram-sha-256
+    - host all all 0.0.0.0/0 scram-sha-256
+    - host all all ::/0 scram-sha-256
+  callbacks:
+    on_role_change: ha-on-role-change
+  create_replica_methods: [basebackup]
+  basebackup:
+    - checkpoint: fast
+  # An old leader that cannot be rewound (or diverged) is re-cloned from the
+  # new leader instead of waiting for a human: anything only it had was never
+  # acknowledged (synchronous quorum), so nothing of value is discarded.
+  remove_data_directory_on_rewind_failure: true
+  remove_data_directory_on_diverged_timelines: true
+
+# Containers have no /dev/watchdog. On bare metal load softdog and set
+# `mode: required`: a hung Patroni on the leader then resets the machine
+# before its leader key can expire (closes the window in which a frozen
+# leader's Postgres could still be running when it thaws).
+watchdog:
+  mode: "off"
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false
