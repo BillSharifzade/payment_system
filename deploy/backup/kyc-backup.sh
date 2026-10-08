@@ -37,9 +37,14 @@ list=$(mktemp /tmp/kyc-list.XXXXXX)
 cleanup() { rm -f "$part" "$list"; [[ -z "${TMP_GNUPGHOME:-}" ]] || rm -rf "$TMP_GNUPGHOME"; }
 trap cleanup EXIT
 
+# Files younger than SETTLE_MINUTES wait for the next run; 0 takes everything
+# (`-mmin +0` would still skip files under a minute old with integer minutes).
+settle=()
+[[ "$SETTLE_MINUTES" -gt 0 ]] && settle=(-mmin +"$SETTLE_MINUTES")
+
 attempt() {
   rm -f "$part"
-  (cd "$SRC" && find . -type f -mmin +"$SETTLE_MINUTES" -print0) > "$list" || return 10
+  (cd "$SRC" && find . -type f "${settle[@]}" -print0) > "$list" || return 10
   items=$(tr -cd '\0' < "$list" | wc -c)
   set +e
   tar --create --file=- --null --no-recursion --directory="$SRC" --files-from="$list" \

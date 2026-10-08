@@ -16,7 +16,7 @@ FROM postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad5
 
 # gosu is only needed to drop root in the server entrypoint, which this image
 # never runs; removing it also removes a Go binary that scanners flag often.
-RUN apk add --no-cache bash age gnupg rclone tar coreutils \
+RUN apk add --no-cache bash age gnupg rclone tar coreutils findutils \
     && rm -f /usr/local/bin/gosu \
     && addgroup -S -g 65532 backup \
     && adduser -S -D -H -u 65532 -G backup -s /sbin/nologin backup \
