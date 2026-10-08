@@ -8,7 +8,9 @@
 # Redis (shared rate-limit counters) — the same three dependencies as production.
 services:
   postgres:
-    image: postgres:16-alpine
+    # Same Postgres release as production (alpine kept: switching libc under an
+    # existing data volume would change text collations).
+    image: postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     container_name: payment_pg_dev
     environment:
       POSTGRES_USER: payment
@@ -46,7 +48,7 @@ services:
 
   # Event bus for the outbox relay (transaction.posted events).
   nats:
-    image: nats:2-alpine
+    image: nats:2.11.17-alpine@sha256:e4bf19f15fd3218814a4e3c9e0064e1334bd8aa20d5984b9f1a0afd084f8cc00
     container_name: payment_nats_dev
     command: ["-js", "-sd", "/data"] # JetStream with a durable store dir
     volumes:
@@ -56,7 +58,7 @@ services:
 
   # Shared store for multi-instance rate limiting (and later: sessions, hot reads).
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.11-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
     container_name: payment_redis_dev
     ports:
       - "6379:6379"

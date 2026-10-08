@@ -1,0 +1,282 @@
+# Unit tests for prometheus-rules.yml:
+#   promtool test rules deploy/monitoring/tests/prometheus-rules.test.yml
+# (CI runs them in the ops-lint job.)
+rule_files:
+  - ../prometheus-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # The dead man's switch fires always.
+  - interval: 1m
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: Watchdog
+        exp_alerts:
+          - exp_labels:
+              severity: none
+            exp_annotations:
+              summary: "Watchdog: the alerting pipeline is alive"
+
+  # An idle ledger (nothing unsealed: age 0) must stay quiet for hours — the
+  # bug the old log-based NoCheckpointsSealed had.
+  - interval: 1m
+    input_series:
+      - series: 'worker_leader{job="payment-workers",instance="w:9101"}'
+        values: '1x300'
+      - series: 'ledger_oldest_unsealed_age_seconds{job="payment-workers",instance="w:9101"}'
+        values: '0x300'
+      - series: 'ledger_unsealed_transactions{job="payment-workers",instance="w:9101"}'
+        values: '0x300'
+    alert_rule_test:
+      - eval_time: 5h
+        alertname: UnsealedBacklogAging
+        exp_alerts: []
+      - eval_time: 5h
+        alertname: LedgerSealingLagging
+        exp_alerts: []
+      - eval_time: 5h
+        alertname: WorkerMetricsMissing
+        exp_alerts: []
+      - eval_time: 5h
+        alertname: WorkerNoLeader
+        exp_alerts: []
+
+  # A stuck sealer: the oldest unsealed transaction ages 60 s per minute. A
+  # second replica that lost leadership long ago still exports a stale, huge
+  # backlog and an unhealthy reconciliation: it must not count.
+  - interval: 1m
+    input_series:
+      - series: 'worker_leader{job="payment-workers",instance="w:9101"}'
+        values: '1x20'
+      - series: 'ledger_oldest_unsealed_age_seconds{job="payment-workers",instance="w:9101"}'
+        values: '0+60x20'
+      - series: 'ledger_unsealed_transactions{job="payment-workers",instance="w:9101"}'
+        values: '1x20'
+      - series: 'reconciliation_healthy{job="payment-workers",instance="w:9101"}'
+        values: '1x20'
+      - series: 'worker_leader{job="payment-workers",instance="w2:9101"}'
+        values: '0x20'
+      - series: 'ledger_oldest_unsealed_age_seconds{job="payment-workers",instance="w2:9101"}'
+        values: '99999x20'
+      - series: 'reconciliation_healthy{job="payment-workers",instance="w2:9101"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: UnsealedBacklogAging
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: UnsealedBacklogAging
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "A transaction has waited more than 2 minutes for its checkpoint seal"
+              description: "Oldest unsealed transaction: 6m 0s; 1 unsealed. The sealer runs every WORKER_INTERVAL_SECS; check `docker compose logs payment-workers`."
+      - eval_time: 7m
+        alertname: LedgerSealingLagging
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Transactions unsealed for more than 5 minutes"
+              description: "The checkpoint sealer is not keeping up or is down (oldest unsealed: 7m 0s). Tamper-evidence coverage is lagging."
+      - eval_time: 10m
+        alertname: ReconciliationUnhealthy
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: WorkerSplitBrain
+        exp_alerts: []
+
+  # Leader election gone wrong: nobody leads, then two replicas lead.
+  - interval: 1m
+    input_series:
+      - series: 'worker_leader{job="payment-workers",instance="w:9101"}'
+        values: '0 0 0 0 0 1 1 1 1 1'
+      - series: 'worker_leader{job="payment-workers",instance="w2:9101"}'
+        values: '0 0 0 0 0 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: WorkerNoLeader
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No payment-workers replica holds the leader lock"
+              description: "Nothing is sealing, verifying or reconciling. `docker compose logs payment-workers` (lost the lock? database unreachable?)."
+      - eval_time: 8m
+        alertname: WorkerSplitBrain
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "2 payment-workers replicas believe they are the leader"
+              description: "Workers' DATABASE_URL must be a direct/session-mode connection (never transaction-mode pgbouncer): concurrent sealers would fork the checkpoint chain."
+
+  # Full chain verification: last run at t=0, every 6 h expected.
+  - interval: 1m
+    input_series:
+      - series: 'ledger_chain_full_verified_timestamp_seconds{job="payment-workers",instance="w:9101"}'
+        values: '0x900'
+    alert_rule_test:
+      - eval_time: 12h
+        alertname: ChainFullVerificationStale
+        exp_alerts: []
+      - eval_time: 14h
+        alertname: ChainFullVerificationStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "No full checkpoint-chain verification for 14h 0m 0s"
+
+  # Backups: fresh -> quiet; 27 h without a success -> page.
+  - interval: 1h
+    input_series:
+      # db succeeded at t=0 and never again; kyc succeeds every hour.
+      - series: 'payment_backup_last_success_timestamp_seconds{kind="db",job="node",instance="n:9100"}'
+        values: '0x30'
+      - series: 'payment_backup_last_success_timestamp_seconds{kind="kyc",job="node",instance="n:9100"}'
+        values: '0+3600x30'
+    alert_rule_test:
+      - eval_time: 25h
+        alertname: BackupStale
+        exp_alerts: []
+      - eval_time: 27h
+        alertname: BackupStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              kind: db
+              job: node
+              instance: n:9100
+            exp_annotations:
+              summary: "No successful db backup for 1d 3h 0m 0s"
+              description: "`docker compose logs postgres-backup`. Until fixed, the newest restore point keeps ageing."
+      - eval_time: 27h
+        alertname: BackupMetricsMissing
+        exp_alerts: []
+
+  # Off-box copy: the newest local backup (t=7200) was never copied.
+  - interval: 1m
+    input_series:
+      - series: 'payment_backup_offsite_enabled{kind="db",job="node",instance="n:9100"}'
+        values: '1x120'
+      - series: 'payment_backup_last_success_timestamp_seconds{kind="db",job="node",instance="n:9100"}'
+        values: '7200x120'
+      - series: 'payment_backup_offsite_last_success_timestamp_seconds{kind="db",job="node",instance="n:9100"}'
+        values: '3600x120'
+      - series: 'payment_backup_offsite_enabled{kind="kyc",job="node",instance="n:9100"}'
+        values: '1x120'
+      - series: 'payment_backup_last_success_timestamp_seconds{kind="kyc",job="node",instance="n:9100"}'
+        values: '7200x120'
+      - series: 'payment_backup_offsite_last_success_timestamp_seconds{kind="kyc",job="node",instance="n:9100"}'
+        values: '7230x120'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: BackupOffsiteBehind
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              kind: db
+              job: node
+              instance: n:9100
+            exp_annotations:
+              summary: "The newest db backup has not reached the off-box target"
+              description: "A backup on the same disk as the database is not a backup. `docker compose logs postgres-backup` (rclone errors), check secrets/backup_rclone_conf."
+
+  # Deposits read from the ledger by postgres-exporter.
+  - interval: 1m
+    input_series:
+      - series: 'payment_deposits_max_minor_15m{job="postgres",instance="p:9187"}'
+        values: '500000 500000 25000000 25000000'
+      - series: 'payment_deposits_sum_minor_15m{job="postgres",instance="p:9187"}'
+        values: '500000 500000 25500000 25500000'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: LargeDeposit
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LargeDeposit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Unusually large deposit: 25000000 minor units in one posting"
+              description: "A single deposit above the alert threshold was posted in the last 15 minutes. Check admin_actions for who requested and who approved it."
+      - eval_time: 3m
+        alertname: DepositVolumeHigh
+        exp_alerts: []
+
+  # Refresh-token replays: a burst of 12 in a few minutes.
+  - interval: 1m
+    input_series:
+      - series: 'auth_refresh_total{job="payment-server",instance="a:9100",outcome="replay"}'
+        values: '0 0 4 8 12 12 12'
+      - series: 'auth_refresh_total{job="payment-server",instance="a:9100",outcome="rotated"}'
+        values: '0+100x6'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: RefreshTokenReuseSpike
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: RefreshTokenReuseSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "12 refresh-token replays in 15 minutes"
+              description: "Revoked refresh tokens are being re-presented (possible token theft). grep 'revoked refresh token replayed' in the payment-server logs for the user ids."
+
+  # WAL archiving failures (only exported when the WAL overlay is on).
+  - interval: 1m
+    input_series:
+      - series: 'pg_stat_archiver_failed_count{job="postgres",instance="p:9187"}'
+        values: '0 0 0 1 2 2'
+      - series: 'pg_stat_archiver_archived_count{job="postgres",instance="p:9187"}'
+        values: '10 11 12 12 12 12'
+      - series: 'pg_stat_archiver_last_archive_age{job="postgres",instance="p:9187"}'
+        values: '30 60 90 120 180 240'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: WalArchiveFailing
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: WalArchiveFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: postgres
+              instance: p:9187
+            exp_annotations:
+              summary: "WAL archiving to the off-box repository is failing"
+              description: "pgBackRest archive-push errors. Point-in-time recovery is degrading and pg_wal grows until the disk fills. `docker compose exec -u postgres postgres pgbackrest --stanza=payment check`."
+
+  # Disk: 10 % free on / for 10 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="node",instance="n:9100",mountpoint="/",fstype="ext4",device="/dev/sda1"}'
+        values: '10x20'
+      - series: 'node_filesystem_size_bytes{job="node",instance="n:9100",mountpoint="/",fstype="ext4",device="/dev/sda1"}'
+        values: '100x20'
+      - series: 'node_filesystem_avail_bytes{job="node",instance="n:9100",mountpoint="/run",fstype="tmpfs",device="tmpfs"}'
+        values: '1x20'
+      - series: 'node_filesystem_size_bytes{job="node",instance="n:9100",mountpoint="/run",fstype="tmpfs",device="tmpfs"}'
+        values: '100x20'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: DiskSpaceLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: node
+              instance: n:9100
+              mountpoint: /
+              fstype: ext4
+              device: /dev/sda1
+            exp_annotations:
+              summary: "/: only 10% free"
+              description: "Postgres, the backups and the logs share this box. Prune old images (docker image prune), check the backups volume and the Loki/Prometheus retention."
+      - eval_time: 12m
+        alertname: DiskSpaceCritical
+        exp_alerts: []
