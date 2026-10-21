@@ -78,13 +78,31 @@ impl NatsPublisher {
         &self.stream
     }
 
+    /// The URL with any `user:pass@` removed, for logs.
+    pub fn redacted(url: &str) -> String {
+        match url.split_once("://") {
+            Some((scheme, rest)) => {
+                format!("{scheme}://{}", rest.rsplit('@').next().unwrap_or(rest))
+            }
+            None => url.rsplit('@').next().unwrap_or(url).to_string(),
+        }
+    }
+
     pub async fn connect(
         url: &str,
         subject_prefix: &str,
     ) -> std::result::Result<Self, PublishError> {
-        let client = async_nats::ConnectOptions::new()
-            .retry_on_initial_connect()
-            .connect(url)
+        let addr: async_nats::ServerAddr = url
+            .parse()
+            .map_err(|e| PublishError(format!("nats url: {e}")))?;
+        let mut opts = async_nats::ConnectOptions::new().retry_on_initial_connect();
+        // async-nats parses `user:pass@` from the URL but never sends it, so hand the
+        // credentials over explicitly (the deploy stack runs NATS with user/password auth).
+        if let (Some(user), Some(pass)) = (addr.username(), addr.password()) {
+            opts = opts.user_and_password(user.to_string(), pass.to_string());
+        }
+        let client = opts
+            .connect(addr)
             .await
             .map_err(|e| PublishError(format!("nats connect: {e}")))?;
         let js = async_nats::jetstream::new(client);
@@ -263,5 +281,18 @@ mod tests {
         assert_eq!(NatsPublisher::stream_name("payments"), "PAYMENTS");
         assert_eq!(NatsPublisher::stream_name("test-abc"), "TEST-ABC");
         assert_eq!(NatsPublisher::stream_name("a.b*c>d e"), "A_B_C_D_E");
+    }
+
+    #[test]
+    fn redacted_drops_credentials() {
+        assert_eq!(
+            NatsPublisher::redacted("nats://payment:s3cr@t@nats:4222"),
+            "nats://nats:4222"
+        );
+        assert_eq!(
+            NatsPublisher::redacted("nats://localhost:4222"),
+            "nats://localhost:4222"
+        );
+        assert_eq!(NatsPublisher::redacted("u:p@host:4222"), "host:4222");
     }
 }

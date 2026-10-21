@@ -3,6 +3,7 @@ package tj.payment.wallet
 import android.app.Activity
 import android.app.Application
 import android.os.Bundle
+import tj.payment.wallet.ui.Copy
 
 class PaymentApp : Application() {
     lateinit var container: AppContainer
@@ -10,6 +11,9 @@ class PaymentApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // Copy built outside composables follows the device language too. With
+        // no args, getString(id) — never a format pass over the template.
+        Copy.install { id, args -> if (args.isEmpty()) resources.getString(id) else resources.getString(id, *args) }
         container = AppContainer(this)
         container.warmUp()
         registerActivityLifecycleCallbacks(ForegroundTracker())

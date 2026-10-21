@@ -1,7 +1,7 @@
 import { Link } from "react-router-dom";
 import { BarChart, MixBar, Sparkline, StackedBars, TrendArea, fmtCompact } from "../charts";
 import { formatMinor } from "../money";
-import { useOps } from "../ops";
+import { pendingLabel, useOps } from "../ops";
 import { Ago, Alert, Icon, Skeleton, StatTile } from "../ui";
 
 const SERIES = {
@@ -37,11 +37,14 @@ export default function Dashboard() {
     metricsUpdatedAt: updatedAt,
     refreshMetrics,
     refreshStatus,
+    pendingDeposits,
+    refreshPendingDeposits,
   } = useOps();
 
   const refresh = () => {
     refreshMetrics();
     refreshStatus();
+    refreshPendingDeposits();
   };
 
   const conserved = status?.conservation.every((c) => c.net_minor === 0) ?? true;
@@ -115,7 +118,7 @@ export default function Dashboard() {
       {!metrics && !error ? (
         <>
           <div className="statgrid">
-            {[0, 1, 2, 3, 4, 5].map((i) => (
+            {[0, 1, 2, 3, 4, 5, 6].map((i) => (
               <div className="stat" key={i}>
                 <Skeleton w={100} h={12} />
                 <div className="gap-10" />
@@ -212,6 +215,21 @@ export default function Dashboard() {
                   <Link to="/kyc">Review the queue →</Link>
                 ) : (
                   "queue is clear"
+                )
+              }
+            />
+            <StatTile
+              label="Deposits awaiting approval"
+              icon="inbox"
+              value={pendingDeposits ? pendingLabel(pendingDeposits) : "—"}
+              tone={(pendingDeposits?.count ?? 0) > 0 ? "warn" : undefined}
+              caption={
+                pendingDeposits && pendingDeposits.count > 0 ? (
+                  <Link to="/deposits">Approve or reject →</Link>
+                ) : pendingDeposits ? (
+                  "nothing waiting"
+                ) : (
+                  "loading…"
                 )
               }
             />

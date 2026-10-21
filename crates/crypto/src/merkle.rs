@@ -70,6 +70,10 @@ pub fn merkle_proof(leaves: &[Hash], index: usize) -> Option<Vec<ProofStep>> {
     Some(proof)
 }
 
+/// Verifies a proof against `root` only. It does not bind the leaf's position: an
+/// odd level pairs its last node with itself, so `merkle_root([a, b, c]) ==
+/// merkle_root([a, b, c, c])` and a self-paired step verifies with either
+/// direction bit. Auditors should use [`verify_proof_at`].
 pub fn verify_proof(leaf: Hash, proof: &[ProofStep], root: Hash) -> bool {
     let mut acc = leaf;
     for step in proof {
@@ -80,6 +84,41 @@ pub fn verify_proof(leaf: Hash, proof: &[ProofStep], root: Hash) -> bool {
         };
     }
     acc == root
+}
+
+/// Verifies that `leaf` is leaf number `index` of a tree of `leaf_count` leaves with
+/// root `root`: every direction bit is derived from `index`, a self-paired step's
+/// sibling must be the running hash itself, and the proof has exactly the tree's height.
+/// `leaf_count` is only as trustworthy as its source: it is not committed in the root.
+pub fn verify_proof_at(
+    leaf: Hash,
+    index: usize,
+    leaf_count: usize,
+    proof: &[ProofStep],
+    root: Hash,
+) -> bool {
+    if index >= leaf_count {
+        return false;
+    }
+    let (mut acc, mut idx, mut len) = (leaf, index, leaf_count);
+    let mut steps = proof.iter();
+    while len > 1 {
+        let Some(step) = steps.next() else {
+            return false;
+        };
+        let self_paired = idx == len - 1 && len % 2 == 1;
+        if step.sibling_is_left != (idx % 2 == 1) || (self_paired && step.sibling != acc) {
+            return false;
+        }
+        acc = if step.sibling_is_left {
+            node_hash(&step.sibling, &acc)
+        } else {
+            node_hash(&acc, &step.sibling)
+        };
+        idx /= 2;
+        len = len.div_ceil(2);
+    }
+    steps.next().is_none() && acc == root
 }
 
 #[cfg(test)]
@@ -132,5 +171,44 @@ mod tests {
         let root = merkle_root(&l).unwrap();
         let proof = merkle_proof(&l, 2).unwrap();
         assert!(!verify_proof(l[5], &proof, root));
+    }
+
+    #[test]
+    fn a_proof_binds_its_index() {
+        for n in 1..=9 {
+            let ls = leaves(n);
+            let root = merkle_root(&ls).unwrap();
+            for k in 0..n {
+                let p = merkle_proof(&ls, k).unwrap();
+                assert!(verify_proof_at(ls[k], k, n, &p, root), "leaf {k} of {n}");
+                for other in (0..n + 2).filter(|&o| o != k) {
+                    assert!(
+                        !verify_proof_at(ls[k], other, n, &p, root),
+                        "{k} as {other} of {n}"
+                    );
+                }
+                for s in 0..p.len() {
+                    let mut flipped = p.clone();
+                    flipped[s].sibling_is_left ^= true;
+                    assert!(
+                        !verify_proof_at(ls[k], k, n, &flipped, root),
+                        "flip {s} of leaf {k}/{n}"
+                    );
+                }
+            }
+        }
+        // The duplicate-last-leaf ambiguity verify_proof cannot see.
+        let ls = leaves(3);
+        let root = merkle_root(&ls).unwrap();
+        let mut dup = ls.clone();
+        dup.push(ls[2]);
+        assert_eq!(merkle_root(&dup).unwrap(), root);
+        let p = merkle_proof(&dup, 3).unwrap();
+        assert!(verify_proof(ls[2], &p, root));
+        assert!(!verify_proof_at(ls[2], 3, 3, &p, root));
+        let mut flipped = merkle_proof(&ls, 2).unwrap();
+        flipped[0].sibling_is_left ^= true;
+        assert!(verify_proof(ls[2], &flipped, root));
+        assert!(!verify_proof_at(ls[2], 2, 3, &flipped, root));
     }
 }

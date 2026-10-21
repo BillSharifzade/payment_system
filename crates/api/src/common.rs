@@ -7,6 +7,14 @@ pub fn default_currency() -> String {
     "TJS".to_string()
 }
 
+pub fn rfc3339(column: &str) -> String {
+    format!(r#"to_char({column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')"#)
+}
+
+pub fn db_err(e: sqlx::Error) -> ApiError {
+    storage::StorageError::from(e).into()
+}
+
 pub fn normalize_phone(raw: &str) -> Option<String> {
     let digits: String = raw
         .chars()

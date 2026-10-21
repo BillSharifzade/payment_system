@@ -1,7 +1,11 @@
 package tj.payment.wallet.data
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import tj.payment.core.ApiOutcome
 import tj.payment.core.ErrorCode
+import tj.payment.core.LocalStorageException
 import tj.payment.core.TokenResponse
 
 /**
@@ -12,14 +16,32 @@ import tj.payment.core.TokenResponse
 class AuthRepository(
     private val api: ApiClient,
     private val session: SecureSession,
+    /** Runs after a successful password sign-in, with the password (device registration). */
+    private val afterSignIn: suspend (password: String) -> Unit = {},
 ) {
     fun hasPersistedSession(): Boolean = session.hasPersistedSession()
 
     suspend fun login(phone: String, password: String): ApiOutcome<Unit> =
-        adopt(api.login(phone, password), phone)
+        adopt(api.login(phone, password), phone).also { if (it is ApiOutcome.Ok) bindDevice(password) }
 
     suspend fun register(phone: String, password: String): ApiOutcome<Unit> =
-        adopt(api.register(phone, password), phone)
+        adopt(api.register(phone, password), phone).also { if (it is ApiOutcome.Ok) bindDevice(password) }
+
+    /**
+     * The password was just proven: register this phone's payment-signing key
+     * now (idempotent server-side), so money moves need no extra step. Best
+     * effort — it never fails the sign-in; the first payment asks for the
+     * password again if it did not happen.
+     */
+    private suspend fun bindDevice(password: String) {
+        try {
+            afterSignIn(password)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // See above: retried from the payment flow.
+        }
+    }
 
     /**
      * Re-establish a session at launch in ONE request: `POST /v1/auth/refresh`
@@ -48,18 +70,34 @@ class AuthRepository(
      * server-side revocation, which may be slow or impossible offline. A
      * revocation that never arrives costs nothing: the refresh token is gone
      * from the device either way, and the server expires it on its own.
+     * The wipe is a synchronous disk write, so it runs on the IO dispatcher.
      */
     suspend fun logout() {
-        val refreshToken = session.refreshToken()
-        session.clear()
+        val refreshToken = withContext(Dispatchers.IO) {
+            val token = try {
+                session.refreshToken()
+            } catch (_: LocalStorageException) {
+                null
+            }
+            session.clear()
+            token
+        }
         if (refreshToken != null) api.logout(refreshToken)
     }
 
-    private fun adopt(outcome: ApiOutcome<TokenResponse>, phone: String): ApiOutcome<Unit> = when (outcome) {
-        is ApiOutcome.Ok -> {
-            api.adoptTokens(outcome.value)
-            session.persistPhone(phone)
-            ApiOutcome.Ok(Unit)
+    /**
+     * Persist the new session synchronously, off the main thread, before the
+     * caller moves on. A storage fault here is reported (typed), never a crash.
+     */
+    private suspend fun adopt(outcome: ApiOutcome<TokenResponse>, phone: String): ApiOutcome<Unit> = when (outcome) {
+        is ApiOutcome.Ok -> withContext(Dispatchers.IO) {
+            try {
+                api.adoptTokens(outcome.value)
+                session.persistPhone(phone)
+                ApiOutcome.Ok(Unit)
+            } catch (e: LocalStorageException) {
+                ApiOutcome.Offline(e)
+            }
         }
         is ApiOutcome.Failed -> outcome
         is ApiOutcome.Offline -> outcome

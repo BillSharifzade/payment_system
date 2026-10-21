@@ -1,21 +1,36 @@
 # Edge: TLS termination, reverse proxy for the API, static admin console.
-# Baked into the payment-console image (deploy/Dockerfile.console); the two
+# Baked into the payment-console image (deploy/Dockerfile.console); the
 # environment variables below are read when Caddy starts, so they live in
-# deploy/.env and need no rebuild.
+# deploy/.env (compose interpolates them) and need no rebuild.
 #
-# SITE_ADDRESS — the site address, three shapes:
+# SITE_ADDRESS — the site address(es), comma-separated if several:
 #   payments.example.com  public domain: automatic HTTPS (Let's Encrypt/ZeroSSL),
 #                         HTTP->HTTPS redirect, HSTS. Needs 80/443 reachable + DNS.
 #   192.168.1.156         bare IP (LAN box): Caddy cannot get a public cert for an
 #                         IP, so it issues one from its own internal CA
 #                         automatically (equivalent to writing `tls internal`).
 #                         Clients must trust that root CA — see deploy/README.md.
-#   :80                   plain HTTP (the default when unset). LAN smoke tests
-#                         only; no HSTS is emitted because @https never matches.
-# ADMIN_ALLOW_CIDR — space-separated IPs/CIDRs allowed to reach /admin. The
-#   compose files default it to "0.0.0.0/0 ::/0" (= everyone); the Caddyfile
-#   default below only covers build-time validation. NOTE: an EMPTY value does
-#   not fall back to the default — leave the variable unset instead.
+#   :80                   plain HTTP (the default when unset). Smoke tests only; no
+#                         HSTS is emitted because @https never matches.
+#   http://:80, http://:8099   the LAN overlay: console + API, plain HTTP, dev only.
+#
+# ADMIN_ALLOW_CIDR — REQUIRED (compose refuses to start without it; deploy.sh
+#   explains). Space-separated IPs/CIDRs that may reach ANY admin-capable path:
+#   the /admin console AND the admin API (/v1/admin/*, /v1/deposits*, KYC
+#   approve/reject). Everyone else gets 403 here, before the request reaches the
+#   app. "0.0.0.0/0 ::/0" is the explicit "anyone" opt-out (deploy.sh warns
+#   loudly). The default below (loopback only) exists for build-time validation.
+#   Admin-capable routes MUST live under these prefixes; a new admin endpoint
+#   elsewhere has to be added to @admin_paths.
+#
+# API_UPSTREAMS — space-separated host:port of EVERY payment-server replica
+#   (deploy.sh derives it from API_REPLICAS: "payment-payment-server-1:8080
+#   payment-payment-server-2:8080"). One upstream per container, so the active
+#   health check probes each replica on its own and a replica whose /ready
+#   fails (e.g. it lost the database) leaves rotation while the others keep
+#   serving. (Caddy's `dynamic` upstreams would follow scaling automatically
+#   but get no active health checks, and the bare service name resolves to a
+#   random replica per probe — neither isolates a sick replica.)
 
 {$SITE_ADDRESS::80} {
 	encode zstd gzip
@@ -46,48 +61,76 @@
 		Permissions-Policy "camera=(), microphone=(), geolocation=()"
 	}
 
-	# ---- Admin console: static SPA at /admin --------------------------------
-	# Auth happens in-app against the same-origin API (no CORS). `handle_path`
-	# strips the /admin prefix, so inside the block paths are /index.html,
-	# /assets/... etc. (the SPA is built with base "/admin/").
-	redir /admin /admin/ 301
-	handle_path /admin/* {
-		# Optional IP allowlist. Caddy is the only proxy hop, so the TCP peer
-		# (remote_ip) IS the client; do not switch to client_ip unless you put
-		# another proxy in front and configure trusted_proxies.
-		@denied not remote_ip {$ADMIN_ALLOW_CIDR:0.0.0.0/0 ::/0}
-		respond @denied 403
-
-		root * /srv/admin
-		try_files {path} /index.html
-
-		# Vite emits content-hashed files under /assets -> cache forever. The
-		# HTML shell that references them must always be revalidated.
-		@assets path /assets/*
-		header @assets Cache-Control "public, max-age=31536000, immutable"
-		@shell not path /assets/*
-		header @shell Cache-Control "no-cache"
-
-		# No 'unsafe-inline': the console has no inline scripts/styles (React
-		# sets style={} through the CSSOM, which CSP does not govern). blob: is
-		# for the KYC document viewer (documents are fetched with the Bearer
-		# token and rendered from object URLs in a sandboxed iframe); data: is
-		# the inline favicon.
-		header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; font-src 'self'; frame-src blob:; connect-src 'self'; form-action 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
-
-		file_server
+	# Every admin-capable path (the console and the admin side of the API) from
+	# an address outside ADMIN_ALLOW_CIDR. Path matching is on Caddy's
+	# normalised path (case-insensitive, dot segments and duplicate slashes
+	# resolved), so encodings cannot sneak past it. Caddy is the only proxy hop,
+	# so the TCP peer (remote_ip) IS the client; do not switch to client_ip
+	# unless another proxy is put in front and trusted_proxies is configured.
+	@admin_denied {
+		path /admin /admin/* /v1/admin /v1/admin/* /v1/deposits /v1/deposits/* /v1/kyc/submissions/*/approve /v1/kyc/submissions/*/reject
+		not remote_ip {$ADMIN_ALLOW_CIDR:127.0.0.1/32 ::1/128}
 	}
 
-	# ---- API: everything else (/v1, /health, /ready) ----------------------
-	# Load-balances across all payment-server replicas (Docker DNS returns one
-	# A record per replica; add more with `--scale payment-server=N`). Active
-	# health checks use /ready, which turns 503 when the database is unreachable,
-	# so a replica that lost its DB is taken out of rotation. Caddy sets
-	# X-Forwarded-For; the app (TRUST_PROXY=true) reads the right-most hop.
-	reverse_proxy payment-server:8080 {
-		lb_policy round_robin
-		health_uri /ready
-		health_interval 5s
-		health_timeout 2s
+	# `route` keeps the order below literal (Caddy would otherwise sort handle
+	# blocks by path length and could serve /admin/* before the allowlist).
+	route {
+		# 1. Admin allowlist, first: same error shape as the API.
+		handle @admin_denied {
+			header Content-Type application/json
+			header Cache-Control no-store
+			respond `{"error":{"code":"forbidden","message":"admin endpoints are not reachable from this network","request_id":"-"}}` 403
+		}
+
+		# 2. Admin console: static SPA at /admin. Auth happens in-app against the
+		# same-origin API (no CORS). `handle_path` strips the /admin prefix, so
+		# inside the block paths are /index.html, /assets/... (the SPA is built
+		# with base "/admin/").
+		redir /admin /admin/ 301
+		handle_path /admin/* {
+			root * /srv/admin
+			try_files {path} /index.html
+
+			# Vite emits content-hashed files under /assets -> cache forever. The
+			# HTML shell that references them must always be revalidated.
+			@assets path /assets/*
+			header @assets Cache-Control "public, max-age=31536000, immutable"
+			@shell not path /assets/*
+			header @shell Cache-Control "no-cache"
+
+			# No 'unsafe-inline': the console has no inline scripts/styles (React
+			# sets style={} through the CSSOM, which CSP does not govern). blob: is
+			# for the KYC document viewer (documents are fetched with the Bearer
+			# token and rendered from object URLs in a sandboxed iframe); data: is
+			# the inline favicon.
+			header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; font-src 'self'; frame-src blob:; connect-src 'self'; form-action 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+
+			file_server
+		}
+
+		# 3. API: everything else (/v1, /health, /ready). One upstream per
+		# replica (see API_UPSTREAMS above); each is probed on /ready, which
+		# turns 503 when that replica cannot reach the database. Two failed
+		# probes take it out, two good ones bring it back. While no replica is
+		# healthy, requests wait up to lb_try_duration and then get 503.
+		# Caddy sets X-Forwarded-For (an untrusted incoming value is replaced);
+		# the app (TRUST_PROXY=true) reads the right-most hop.
+		reverse_proxy {$API_UPSTREAMS:payment-server:8080} {
+			lb_policy round_robin
+			lb_try_duration 5s
+			lb_try_interval 250ms
+
+			health_uri /ready
+			health_interval 5s
+			health_timeout 2s
+			health_status 200
+			health_fails 2
+			health_passes 2
+
+			# Passive: a replica that refuses connections is skipped at once
+			# (dial errors only — business 5xx such as retry_later never count).
+			fail_duration 30s
+			max_fails 3
+		}
 	}
 }

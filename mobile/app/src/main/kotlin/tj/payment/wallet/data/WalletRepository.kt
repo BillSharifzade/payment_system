@@ -7,55 +7,99 @@ import kotlinx.coroutines.flow.asStateFlow
 import tj.payment.core.AccountResponse
 import tj.payment.core.ApiOutcome
 import tj.payment.core.CheckDto
-import tj.payment.core.CreateCheckRequest
-import tj.payment.core.PayCheckRequest
 import tj.payment.core.ClientConfigResponse
+import tj.payment.core.CreateCheckRequest
 import tj.payment.core.DocumentResponse
+import tj.payment.core.ErrorCode
 import tj.payment.core.FxRateDto
 import tj.payment.core.FxRequest
-import tj.payment.core.FxResponse
 import tj.payment.core.KycStatusResponse
 import tj.payment.core.KycSubmissionDto
+import tj.payment.core.PayCheckRequest
+import tj.payment.core.PaymentAuthorizer
+import tj.payment.core.PaymentKind
 import tj.payment.core.PaymentSubmitter
+import tj.payment.core.PendingPayment
 import tj.payment.core.PendingPaymentStore
 import tj.payment.core.ResolveResponse
+import tj.payment.core.Settlement
 import tj.payment.core.StatementResponse
 import tj.payment.core.SubmitKycRequest
 import tj.payment.core.TransferRequest
 import tj.payment.core.WalletDto
+import tj.payment.core.deviceHeaders
+import tj.payment.core.map
 
 /**
- * Everything money: wallets, statement, recipient lookup, and the send/convert
- * paths. Sends go ONLY through [submitter] — no screen may call the transfer
- * endpoint directly, so the persisted-idempotency-key rules can't be bypassed.
+ * Everything money: wallets, statement, recipient lookup, and the send /
+ * pay-check / convert paths. Every money move goes ONLY through [submitter] —
+ * no screen may call a money endpoint directly, so the device-approval and
+ * persisted-idempotency-key rules can't be bypassed.
  *
  * Wallets and `/v1/config` are cached in memory and shared by Home, Send and
  * FX (which open seconds apart); every money move marks the wallets stale so
  * the next reader fetches.
+ *
+ * @param currentUser The signed-in user id (pending payments are per user).
+ * @param authorizer Strong device authentication, asked before every new money move.
+ * @param onDeviceRejected The server refused the payment's device signature
+ *   (unknown/revoked device): the registration must be renewed with the password.
  */
 class WalletRepository(
     private val api: ApiClient,
     pendingStore: PendingPaymentStore,
+    currentUser: () -> String?,
+    authorizer: PaymentAuthorizer,
     private val clock: () -> Long = System::currentTimeMillis,
+    private val onDeviceRejected: suspend (userId: String) -> Unit = {},
 ) {
     val submitter = PaymentSubmitter(
         store = pendingStore,
+        currentUser = currentUser,
         newKey = { UUID.randomUUID().toString() },
-        transfer = { p ->
-            val checkId = p.checkId
-            if (checkId != null) {
-                // A scanned check: the server debits p.fromAccount and credits the
-                // merchant; the key is the transaction id exactly as for a transfer.
-                api.payCheck(checkId, PayCheckRequest(account = p.fromAccount), idempotencyKey = p.idempotencyKey)
-            } else {
-                api.transfer(
-                    TransferRequest(p.fromAccount, p.toAccount, p.amountMinor, p.currency),
-                    idempotencyKey = p.idempotencyKey,
-                )
-            }.also { markWalletsStale() } // any outcome but a refusal may have moved money
+        authorizer = authorizer,
+        // Any outcome but a refusal may have moved money.
+        execute = { p ->
+            send(p).also { outcome ->
+                markWalletsStale()
+                if (outcome is ApiOutcome.Failed && outcome.coded && outcome.code in DEVICE_REFUSALS) onDeviceRejected(p.userId)
+            }
         },
-        findPosted = { p -> findPostedByKey(p.fromAccount, p.idempotencyKey) },
+        lookup = { id -> api.transaction(id) },
+        void = { id -> api.voidTransaction(id).also { markWalletsStale() } },
+        clock = clock,
     )
+
+    /** The one place a persisted payment becomes a request; the key is the transaction id for all three. */
+    private suspend fun send(p: PendingPayment): ApiOutcome<Settlement> = when (p.kind) {
+        PaymentKind.TRANSFER ->
+            api.transfer(
+                TransferRequest(p.fromAccount, p.toAccount, p.amountMinor, p.currency),
+                idempotencyKey = p.idempotencyKey,
+                deviceHeaders = p.deviceHeaders(),
+            ).map { Settlement(it.transactionId, alreadyPosted = it.status == "already_posted") }
+        // A scanned check: the server debits p.fromAccount and credits the merchant.
+        PaymentKind.CHECK -> {
+            val checkId = p.checkId
+            if (checkId == null) {
+                ApiOutcome.Failed(ErrorCode.BAD_REQUEST, 0, "check payment without a check id")
+            } else {
+                api.payCheck(
+                    checkId,
+                    PayCheckRequest(account = p.fromAccount),
+                    idempotencyKey = p.idempotencyKey,
+                    deviceHeaders = p.deviceHeaders(),
+                ).map { Settlement(it.transactionId, alreadyPosted = it.status == "already_posted") }
+            }
+        }
+        // Between the user's own wallets; the answer carries the exact legs.
+        PaymentKind.FX ->
+            api.fx(
+                FxRequest(p.fromAccount, p.toAccount, p.amountMinor),
+                idempotencyKey = p.idempotencyKey,
+                deviceHeaders = p.deviceHeaders(),
+            ).map { Settlement(it.transactionId, alreadyPosted = false, fx = it) }
+    }
 
     private val _wallets = MutableStateFlow<List<WalletDto>?>(null)
 
@@ -95,11 +139,16 @@ class WalletRepository(
     /** True when the next Home visit should not trust its last render. */
     val walletsAreStale: Boolean get() = walletsStale
 
-    /** Forget everything (sign-out): the next user must never see this one's balances. */
+    /**
+     * Forget everything (sign-out): the next user must never see this one's
+     * balances or pending payment. The pending RECORD stays on disk, bound to
+     * its owner, and resurfaces when they sign back in.
+     */
     fun clearCache() {
         _wallets.value = null
         walletsStale = true
         configCache = null
+        submitter.forget()
     }
 
     suspend fun createWallet(currency: String): ApiOutcome<AccountResponse> =
@@ -119,27 +168,6 @@ class WalletRepository(
 
     suspend fun statement(accountId: String, cursor: String?, limit: Int = 30): ApiOutcome<StatementResponse> =
         api.statement(accountId, cursor, limit)
-
-    /**
-     * Second opinion for the submitter: is a transfer carrying [idempotencyKey]
-     * already in [fromAccount]'s statement? The backend uses the key as the
-     * transaction id. A pending payment is recent, so the newest two pages are
-     * enough. `Ok(false)` = not there; Failed/Offline = could not tell.
-     */
-    suspend fun findPostedByKey(fromAccount: String, idempotencyKey: String): ApiOutcome<Boolean> {
-        var cursor: String? = null
-        repeat(RECONCILE_PAGES) {
-            when (val page = api.statement(fromAccount, cursor, limit = RECONCILE_PAGE_SIZE)) {
-                is ApiOutcome.Ok -> {
-                    if (page.value.entries.any { it.transactionId == idempotencyKey }) return ApiOutcome.Ok(true)
-                    cursor = page.value.nextCursor ?: return ApiOutcome.Ok(false)
-                }
-                is ApiOutcome.Failed -> return page
-                is ApiOutcome.Offline -> return page
-            }
-        }
-        return ApiOutcome.Ok(false)
-    }
 
     suspend fun resolveByPhone(phone: String): ApiOutcome<ResolveResponse> =
         api.resolveByPhone(phone)
@@ -161,19 +189,8 @@ class WalletRepository(
 
     suspend fun fxRates(): ApiOutcome<List<FxRateDto>> = api.fxRates()
 
-    /**
-     * FX moves money between the caller's own wallets. The caller (FxViewModel)
-     * owns [idempotencyKey] and keeps it for the SAME (from, to, amount) attempt
-     * until a definitive outcome, so an offline/5xx retry can never convert twice.
-     */
-    suspend fun convert(
-        fromAccount: String,
-        toAccount: String,
-        amountMinor: Long,
-        idempotencyKey: String,
-    ): ApiOutcome<FxResponse> =
-        api.fx(FxRequest(fromAccount, toAccount, amountMinor), idempotencyKey = idempotencyKey)
-            .also { markWalletsStale() }
+    // FX conversions go through [submitter] (kind = FX) like every money move:
+    // persisted key, device approval, same-key retry, void before discard.
 
     // --- Checks (request money by QR / pay a scanned check) ---
 
@@ -195,9 +212,8 @@ class WalletRepository(
     suspend fun cancelCheck(id: String): ApiOutcome<CheckDto> = api.cancelCheck(id)
 
     private companion object {
+        val DEVICE_REFUSALS = setOf(ErrorCode.DEVICE_SIGNATURE_INVALID, ErrorCode.DEVICE_SIGNATURE_REQUIRED)
         const val WALLETS_FRESH_MS = 60_000L
         const val CONFIG_FRESH_MS = 10 * 60_000L
-        const val RECONCILE_PAGES = 2
-        const val RECONCILE_PAGE_SIZE = 50
     }
 }

@@ -1,0 +1,30 @@
+# Custom postgres-exporter query (PG_EXPORTER_EXTEND_QUERY_PATH). Metric names
+# are <top-level key>_<column>, e.g. payment_deposits_max_minor_15m.
+#
+# Deposits are read from the LEDGER, not from an API log line or audit row, so
+# the signal survives any change to how deposits are requested or approved: a
+# deposit is the only posting that debits a system_settlement account. Uses the
+# partial index idx_entries_account_debit_time (16 settlement shards x a
+# 15-minute window). payment_monitor gets SELECT on entries/accounts in
+# migration 0027.
+payment_deposits:
+  master: true
+  query: |
+    SELECT COALESCE(MAX(e.amount_minor), 0)::float8 AS max_minor_15m,
+           COALESCE(SUM(e.amount_minor), 0)::float8 AS sum_minor_15m,
+           COUNT(*)::float8                       AS count_15m
+    FROM entries e
+    JOIN accounts a ON a.id = e.account_id
+    WHERE a.account_type = 'system_settlement'
+      AND e.direction = 'debit'
+      AND e.created_at > now() - interval '15 minutes'
+  metrics:
+    - max_minor_15m:
+        usage: GAUGE
+        description: "Largest single deposit posted in the last 15 minutes (minor units)"
+    - sum_minor_15m:
+        usage: GAUGE
+        description: "Total deposited in the last 15 minutes (minor units)"
+    - count_15m:
+        usage: GAUGE
+        description: "Deposits posted in the last 15 minutes"

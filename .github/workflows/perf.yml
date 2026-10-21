@@ -1,0 +1,104 @@
+# Load-test smoke (crates/loadtest): short payment-loadtest runs against a real Postgres, each
+# followed by the harness's invariant checks — conservation, balances = entries, every
+# acknowledged transfer present exactly as acknowledged, nothing refused yet posted. Any failed
+# request, invariant violation or lost transfer fails the job; the JSON reports are uploaded.
+# Shared runners are too noisy to gate on throughput, so there is none here — only a generous
+# p99 ceiling that catches a pathological regression (a deadlock waits seconds), not a slow day.
+#
+# Actions are pinned to full commit SHAs (version in the comment), as in ci.yml.
+name: Perf smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  loadtest:
+    name: Load-test smoke — invariants after every run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+        env:
+          POSTGRES_USER: payment
+          POSTGRES_PASSWORD: payment_dev_pw
+          POSTGRES_DB: payment
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U payment -d payment"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: postgres://payment:payment_dev_pw@localhost:5432/payment
+      LT_COMMON: --users 200 --concurrency 16 --duration 20s --warmup 3s --pg-stats --p99-ceiling-ms 3000
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust (rust-toolchain.toml pins 1.98)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09
+        with:
+          toolchain: "1.98"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build payment-server and payment-loadtest (release)
+        run: cargo build --release --locked --bin payment-server --bin payment-loadtest
+
+      # Each run spawns its own payment-server (dev mode: single-admin deposits, optional
+      # device binding, AML caps lifted; see crates/loadtest/README.md) on the same database,
+      # so the ledger accumulates across runs and every check covers all of them.
+      - name: Load-test runs
+        run: |
+          set -euo pipefail
+          mkdir -p perf-reports
+          bin=target/release
+          run() {
+            local name=$1; shift
+            echo "::group::$name"
+            # shellcheck disable=SC2086 # LT_COMMON is a word list by design
+            "$bin/payment-loadtest" $LT_COMMON --label "$name" --report "perf-reports/$name.json" "$@"
+            echo "::endgroup::"
+          }
+          run http-mixed --server-bin "$bin/payment-server" --server-log perf-reports/http-mixed.server.log \
+            --workload mixed
+          run http-fx-check-signed --server-bin "$bin/payment-server" --server-log perf-reports/http-fx-check.server.log \
+            --mix transfer=2,fx=1,check=1 --sign
+          run http-hot --server-bin "$bin/payment-server" --server-log perf-reports/http-hot.server.log \
+            --workload hot --merchants 5
+          run direct-contention --mode direct --workload contention --concurrency 8
+
+      - name: Summary
+        if: always()
+        run: |
+          shopt -s nullglob
+          reports=(perf-reports/*.json)
+          if ((${#reports[@]})); then
+            target/release/payment-loadtest summarize "${reports[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: perf-reports
+          path: perf-reports/
+          retention-days: 14

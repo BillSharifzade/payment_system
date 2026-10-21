@@ -32,8 +32,15 @@ struct IdentifyBody<'a> {
     limit: usize,
 }
 
+#[derive(Serialize)]
+struct VerifyBody<'a> {
+    format: &'a str,
+    template: String,
+    enrollment_ids: &'a [Uuid],
+}
+
 #[derive(Deserialize)]
-struct IdentifyResponse {
+struct HitsResponse {
     hits: Vec<Hit>,
 }
 
@@ -92,25 +99,43 @@ impl HttpMatcher {
     }
 
     pub async fn identify(&self, probe: &Template, limit: usize) -> Result<Vec<Hit>, MatcherError> {
+        let body = IdentifyBody {
+            format: probe.format().as_str(),
+            template: probe.to_base64(),
+            limit,
+        };
+        self.hits("identify", &body).await
+    }
+
+    pub async fn verify(
+        &self,
+        probe: &Template,
+        enrollment_ids: &[Uuid],
+    ) -> Result<Vec<Hit>, MatcherError> {
+        let body = VerifyBody {
+            format: probe.format().as_str(),
+            template: probe.to_base64(),
+            enrollment_ids,
+        };
+        self.hits("verify", &body).await
+    }
+
+    async fn hits<B: Serialize>(&self, op: &str, body: &B) -> Result<Vec<Hit>, MatcherError> {
         let resp = self
             .client
-            .post(format!("{}/v1/identify", self.base))
-            .json(&IdentifyBody {
-                format: probe.format().as_str(),
-                template: probe.to_base64(),
-                limit,
-            })
+            .post(format!("{}/v1/{op}", self.base))
+            .json(body)
             .send()
             .await
             .map_err(|e| MatcherError::Unavailable(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(Self::status_error(status, "identify"));
+            return Err(Self::status_error(status, op));
         }
-        let body: IdentifyResponse = resp
+        let body: HitsResponse = resp
             .json()
             .await
-            .map_err(|e| MatcherError::Protocol(format!("identify response: {e}")))?;
+            .map_err(|e| MatcherError::Protocol(format!("{op} response: {e}")))?;
         Ok(body.hits)
     }
 

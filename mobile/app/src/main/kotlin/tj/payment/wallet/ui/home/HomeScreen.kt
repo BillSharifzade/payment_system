@@ -46,10 +46,13 @@ import tj.payment.wallet.ui.GlyphList
 import tj.payment.wallet.ui.GlyphQr
 import tj.payment.wallet.ui.GlyphScan
 import tj.payment.wallet.ui.GlyphSwap
+import tj.payment.wallet.ui.PendingPaymentCard
 import tj.payment.wallet.ui.TransactionRow
 import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.Rust
 import tj.payment.wallet.ui.theme.RustBright
+import androidx.compose.ui.res.stringResource
+import tj.payment.wallet.R
 
 @Composable
 fun HomeScreen(
@@ -63,6 +66,7 @@ fun HomeScreen(
     onRequest: () -> Unit,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val pending by viewModel.pending.state.collectAsStateWithLifecycle()
 
     // Fresh balances whenever Home comes (back) on screen — first entry, return
     // from Send/KYC/FX, return from the background — rate-limited in the VM.
@@ -84,12 +88,12 @@ fun HomeScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "Your money",
+                    text = stringResource(R.string.home_title),
                     style = MaterialTheme.typography.headlineMedium,
                     color = MaterialTheme.colorScheme.onBackground,
                 )
                 TextButton(onClick = viewModel::logout) {
-                    Text("Sign out", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(stringResource(R.string.action_sign_out), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
             Spacer(Modifier.height(12.dp))
@@ -100,11 +104,25 @@ fun HomeScreen(
         if (state.unreadableRecordNotice) {
             item(key = "unreadable-notice") {
                 NoticeCard(
-                    title = "Check your history before sending",
-                    body = "An earlier payment record on this device was unreadable and had to be " +
-                        "removed. If you were in the middle of a payment, check History to see " +
-                        "whether it went through before sending it again.",
+                    title = stringResource(R.string.home_unreadable_title),
+                    body = stringResource(R.string.home_unreadable_body),
                     onDismiss = viewModel::dismissUnreadableRecordNotice,
+                )
+                Spacer(Modifier.height(16.dp))
+            }
+        }
+
+        // This user's unsettled payment (and the outcome of resolving one) —
+        // surfaced at startup, not only when Send opens.
+        if (pending.pending != null || pending.notice != null) {
+            item(key = "pending-payment") {
+                PendingPaymentCard(
+                    state = pending,
+                    onFinish = viewModel.pending::finish,
+                    onRequestDiscard = viewModel.pending::requestDiscard,
+                    onConfirmDiscard = viewModel.pending::confirmDiscard,
+                    onCancelDiscard = viewModel.pending::cancelDiscard,
+                    onDismissNotice = viewModel.pending::dismissNotice,
                 )
                 Spacer(Modifier.height(16.dp))
             }
@@ -163,20 +181,20 @@ fun HomeScreen(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly,
                     ) {
-                        ActionButton("Send", onClick = onSend) { GlyphArrow(up = true) }
-                        ActionButton("Pay QR", onClick = onPayCheck) { GlyphScan() }
-                        ActionButton("Request", onClick = onRequest) { GlyphQr() }
+                        ActionButton(stringResource(R.string.home_action_send), onClick = onSend) { GlyphArrow(up = true) }
+                        ActionButton(stringResource(R.string.home_action_pay_qr), onClick = onPayCheck) { GlyphScan() }
+                        ActionButton(stringResource(R.string.home_action_request), onClick = onRequest) { GlyphQr() }
                     }
                     Spacer(Modifier.height(18.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly,
                     ) {
-                        ActionButton("Receive", onClick = onReceive) { GlyphArrow(up = false) }
-                        ActionButton("History", onClick = {
+                        ActionButton(stringResource(R.string.home_action_receive), onClick = onReceive) { GlyphArrow(up = false) }
+                        ActionButton(stringResource(R.string.home_action_history), onClick = {
                             state.primaryWallet?.let { onHistory(it.id) }
                         }) { GlyphList() }
-                        ActionButton("Convert", onClick = onConvert) { GlyphSwap() }
+                        ActionButton(stringResource(R.string.home_action_convert), onClick = onConvert) { GlyphSwap() }
                     }
                     Spacer(Modifier.height(24.dp))
                 }
@@ -189,13 +207,13 @@ fun HomeScreen(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(
-                                "Recent",
+                                stringResource(R.string.home_recent),
                                 style = MaterialTheme.typography.titleLarge,
                                 color = MaterialTheme.colorScheme.onBackground,
                             )
                             TextButton(onClick = {
                                 state.primaryWallet?.let { onHistory(it.id) }
-                            }) { Text("See all", color = Rust) }
+                            }) { Text(stringResource(R.string.home_see_all), color = Rust) }
                         }
                     }
                     itemsIndexed(state.recent, key = { _, e -> e.entryId }) { _, entry ->
@@ -229,7 +247,7 @@ private fun NoticeCard(title: String, body: String, onDismiss: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             TextButton(onClick = onDismiss, modifier = Modifier.align(Alignment.End)) {
-                Text("Got it", color = Rust)
+                Text(stringResource(R.string.action_got_it), color = Rust)
             }
         }
     }
@@ -253,16 +271,16 @@ private fun KycBanner(pending: Boolean, onClick: () -> Unit) {
     ) {
         Column(Modifier.padding(16.dp)) {
             Text(
-                text = if (pending) "Verification under review" else "Verify your identity",
+                text = stringResource(if (pending) R.string.home_kyc_pending_title else R.string.home_kyc_title),
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurface,
             )
             Spacer(Modifier.height(4.dp))
             Text(
                 text = if (pending) {
-                    "We're checking your document. This usually takes less than a day."
+                    stringResource(R.string.home_kyc_pending_body)
                 } else {
-                    "Sending money requires a one-time identity check. Tap to start."
+                    stringResource(R.string.home_kyc_body)
                 },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -304,7 +322,7 @@ private fun WalletCard(wallet: WalletDto, primary: Boolean) {
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    text = wallet.money().formatAmount(),
+                    text = wallet.displayAmount(),
                     fontSize = 30.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurface,

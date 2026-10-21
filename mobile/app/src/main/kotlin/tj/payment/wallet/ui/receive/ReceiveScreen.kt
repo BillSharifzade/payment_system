@@ -29,6 +29,8 @@ import tj.payment.wallet.ui.BrandMark
 import tj.payment.wallet.ui.ScreenHeader
 import tj.payment.wallet.ui.theme.PositiveGreen
 import tj.payment.wallet.ui.theme.Rust
+import androidx.compose.ui.res.stringResource
+import tj.payment.wallet.R
 
 /**
  * How someone pays this user: their phone number. Static by design — the
@@ -53,7 +55,7 @@ fun ReceiveScreen(
             .fillMaxSize()
             .padding(horizontal = 20.dp),
     ) {
-        ScreenHeader(title = "Receive", onBack = onBack)
+        ScreenHeader(title = stringResource(R.string.receive_title), onBack = onBack)
         Spacer(Modifier.height(28.dp))
 
         Column(
@@ -66,13 +68,13 @@ fun ReceiveScreen(
             BrandMark(size = 48)
             Spacer(Modifier.height(20.dp))
             Text(
-                "Your number is your wallet",
+                stringResource(R.string.receive_heading),
                 style = MaterialTheme.typography.titleLarge,
                 color = MaterialTheme.colorScheme.onSurface,
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                "Anyone can send you money by entering this phone number in their Send screen.",
+                stringResource(R.string.receive_body),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.fillMaxWidth(),
@@ -92,7 +94,7 @@ fun ReceiveScreen(
                 horizontalArrangement = androidx.compose.foundation.layout.Arrangement.Center,
             ) {
                 Text(
-                    text = phone?.let { "+$it" } ?: "Unknown — sign in again",
+                    text = phone?.let { "+$it" } ?: stringResource(R.string.receive_phone_unknown),
                     fontSize = 22.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurface,
@@ -100,7 +102,7 @@ fun ReceiveScreen(
             }
             Spacer(Modifier.height(10.dp))
             Text(
-                text = if (copied) "Copied" else "Tap to copy",
+                text = stringResource(if (copied) R.string.receive_copied else R.string.receive_tap_to_copy),
                 style = MaterialTheme.typography.bodyMedium,
                 fontSize = 12.sp,
                 color = if (copied) PositiveGreen else Rust,

@@ -1,0 +1,248 @@
+# TigerBeetle ledger backend (LEDGER_BACKEND=tigerbeetle; crates/ledger-tigerbeetle,
+# DESIGN.md §15 Phase 2).
+#
+# 1. ledger-tigerbeetle's suites against the in-process cluster model, then against a real
+#    single-replica cluster: model/cluster fidelity, the differentials, crash recovery,
+#    races, holds, cut-over and rollback.
+# 2. Every api integration suite through the TigerBeetle backend: against the model, then
+#    against a live cluster. Every workers suite against a live cluster (the recovery loop,
+#    reconciliation against the cluster). ci.yml runs the same suites on Postgres.
+# 3. A short benchmark smoke run, its table in the job summary.
+#
+# One cluster per database, as in production (a cluster belongs to one database for good):
+# three replicas, clusters 0/1/2 on ports 3000/3001/3002, for the crate, api and workers
+# lanes. The native client builds with Zig (pinned like in ci.yml) and the runner's libclang.
+# The TigerBeetle release and Zig are pinned by version and SHA-256; actions by commit SHA,
+# service images by digest, as in ci.yml.
+name: TigerBeetle
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/**
+      - migrations/**
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/tigerbeetle.yml
+  pull_request:
+    paths:
+      - crates/**
+      - migrations/**
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/tigerbeetle.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tigerbeetle-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Server release; the client embedded by tigerbeetle-unofficial 0.14.28 is
+  # 0.16.78, within this server's release_client_min (0.16.4).
+  TB_VERSION: "0.17.9"
+  TB_SHA256: af71f2c0057e3b409bf79940fa94894b738187b0d4f1e711097bca15df5d8cd4
+  # Zig builds tb_client; the release TigerBeetle 0.16.78 itself pins.
+  ZIG_VERSION: "0.14.1"
+  ZIG_SHA256: 24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
+  NATS_IMAGE: nats:2.11.17-alpine@sha256:e4bf19f15fd3218814a4e3c9e0064e1334bd8aa20d5984b9f1a0afd084f8cc00
+
+jobs:
+  tigerbeetle:
+    name: TigerBeetle — model, live clusters, api and workers suites, benchmark smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+
+    services:
+      postgres:
+        image: postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+        env:
+          POSTGRES_USER: payment
+          POSTGRES_PASSWORD: payment_dev_pw
+          POSTGRES_DB: payment
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U payment -d payment"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7.4.11-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+      nats:
+        image: nats:2.11.17-alpine@sha256:e4bf19f15fd3218814a4e3c9e0064e1334bd8aa20d5984b9f1a0afd084f8cc00
+        ports:
+          - 4222:4222
+          - 8222:8222
+
+    env:
+      PG: postgres://payment:payment_dev_pw@localhost:5432
+      REDIS_URL: redis://localhost:6379
+      NATS_URL: nats://localhost:4222
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust (rust-toolchain.toml pins 1.98)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09
+        with:
+          toolchain: "1.98"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # As in ci.yml: `services:` cannot pass the -js flag JetStream needs.
+      - name: Enable JetStream on the NATS service
+        env:
+          NATS_SERVICE_ID: ${{ job.services.nats.id }}
+        run: |
+          set -euo pipefail
+          docker rm -f "$NATS_SERVICE_ID" >/dev/null
+          docker run -d --name nats-js -p 4222:4222 -p 8222:8222 "$NATS_IMAGE" -js -m 8222 >/dev/null
+          for _ in $(seq 1 30); do
+            wget -q -O /dev/null "http://127.0.0.1:8222/healthz?js-enabled-only=true" && break
+            sleep 1
+          done
+          wget -q -O - "http://127.0.0.1:8222/healthz?js-enabled-only=true"
+
+      - name: One database per lane
+        env:
+          PG_SERVICE_ID: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          for db in tb_crate tb_api_model tb_api_live tb_workers_live; do
+            docker exec "$PG_SERVICE_ID" psql -U payment -d payment -qc "CREATE DATABASE $db"
+          done
+
+      - name: TigerBeetle ${{ env.TB_VERSION }} — download, verify, start one replica per lane
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/tigerbeetle"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/tb.zip" \
+            "https://github.com/tigerbeetle/tigerbeetle/releases/download/$TB_VERSION/tigerbeetle-x86_64-linux.zip"
+          echo "$TB_SHA256  $dir/tb.zip" | sha256sum -c -
+          unzip -q "$dir/tb.zip" -d "$dir"
+          rm "$dir/tb.zip"
+          "$dir/tigerbeetle" version
+          for cluster in 0 1 2; do
+            "$dir/tigerbeetle" format --cluster="$cluster" --replica=0 --replica-count=1 \
+              --development "$dir/${cluster}_0.tigerbeetle"
+            nohup "$dir/tigerbeetle" start --addresses="127.0.0.1:300$cluster" --development \
+              "$dir/${cluster}_0.tigerbeetle" > "$dir/replica-$cluster.log" 2>&1 &
+          done
+          for cluster in 0 1 2; do
+            for _ in $(seq 1 60); do
+              (echo > "/dev/tcp/127.0.0.1/300$cluster") 2>/dev/null && break
+              sleep 1
+            done
+            (echo > "/dev/tcp/127.0.0.1/300$cluster") 2>/dev/null \
+              || { cat "$dir/replica-$cluster.log"; exit 1; }
+            echo "cluster $cluster listening on 127.0.0.1:300$cluster"
+          done
+
+      - name: Zig ${{ env.ZIG_VERSION }} (builds TigerBeetle's native client)
+        run: |
+          set -euo pipefail
+          archive="zig-x86_64-linux-$ZIG_VERSION"
+          curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" "https://ziglang.org/download/$ZIG_VERSION/$archive.tar.xz"
+          echo "$ZIG_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          rm "$RUNNER_TEMP/zig.tar.xz"
+          echo "ZIG_PATH=$RUNNER_TEMP/$archive/zig" >> "$GITHUB_ENV"
+
+      - name: ledger-tigerbeetle — Postgres suites against the cluster model
+        env:
+          DATABASE_URL: ${{ env.PG }}/tb_crate
+        run: cargo test -p ledger-tigerbeetle -- --ignored
+
+      - name: ledger-tigerbeetle — suites against the live cluster
+        env:
+          DATABASE_URL: ${{ env.PG }}/tb_crate
+          TIGERBEETLE_ADDRESSES: "127.0.0.1:3000"
+          TIGERBEETLE_CLUSTER_ID: "0"
+        run: cargo test -p ledger-tigerbeetle --features native-client,testkit --test live -- --ignored --test-threads=1
+
+      - name: api — every suite through the TigerBeetle backend, cluster model
+        env:
+          DATABASE_URL: ${{ env.PG }}/tb_api_model
+          TEST_LEDGER_BACKEND: tigerbeetle-sim
+        run: cargo test -p api -- --ignored
+
+      - name: api — every suite through the TigerBeetle backend, live cluster
+        env:
+          DATABASE_URL: ${{ env.PG }}/tb_api_live
+          TEST_LEDGER_BACKEND: tigerbeetle
+          TIGERBEETLE_ADDRESSES: "127.0.0.1:3001"
+          TIGERBEETLE_CLUSTER_ID: "1"
+        run: cargo test -p api --features tigerbeetle -- --ignored
+
+      - name: workers — every suite against the live cluster
+        env:
+          DATABASE_URL: ${{ env.PG }}/tb_workers_live
+          TEST_LEDGER_BACKEND: tigerbeetle
+          TIGERBEETLE_ADDRESSES: "127.0.0.1:3002"
+          TIGERBEETLE_CLUSTER_ID: "2"
+        run: cargo test -p workers --features tigerbeetle -- --ignored --test-threads=1
+
+      - name: Benchmark smoke run
+        env:
+          DATABASE_URL: ${{ env.PG }}/tb_crate
+          TIGERBEETLE_ADDRESSES: "127.0.0.1:3000"
+          TIGERBEETLE_CLUSTER_ID: "0"
+        run: |
+          set -euo pipefail
+          cargo run -p ledger-tigerbeetle --features native-client --locked --release --bin tb-bench -- \
+            --concurrency 1,8,32 --seconds 3 --rounds 1 --wallets 300 | tee bench.md
+          {
+            echo "### TigerBeetle posting benchmark (smoke: shared CI runner, one round)"
+            echo
+            cat bench.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Replica logs
+        if: failure()
+        run: tail -n 200 "$RUNNER_TEMP"/tigerbeetle/replica-*.log
+
+  image:
+    name: Container image with TigerBeetle's client (deploy/Dockerfile TIGERBEETLE=1)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: payment-system, TIGERBEETLE=1
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          build-args: TIGERBEETLE=1
+          push: false
+          load: true
+          tags: payment-system:tigerbeetle
+          cache-from: type=gha,scope=payment-system-tigerbeetle
+          cache-to: type=gha,scope=payment-system-tigerbeetle,mode=max
+      - name: The binaries refuse nothing they should accept
+        run: |
+          set -euo pipefail
+          # Built with the client: a bad cluster setting is refused by the parser, not by a
+          # missing client (the default image says "needs a build with --features tigerbeetle").
+          out=$(docker run --rm -e APP_ENV=dev -e LEDGER_BACKEND=tigerbeetle -e TIGERBEETLE_CLUSTER_ID=1 \
+                  -e TIGERBEETLE_ADDRESSES=tigerbeetle:3000 \
+                  -e DATABASE_URL=postgres://x:y@127.0.0.1:1/z payment-system:tigerbeetle 2>&1 || true)
+          echo "$out"
+          grep -q "the client resolves no names" <<<"$out"

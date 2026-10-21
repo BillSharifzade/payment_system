@@ -7,10 +7,11 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useRef,
   useState,
 } from "react";
-import { UserListItem, describeError, isAbort, listUsers } from "./api";
+import { IdlePausedError, UserListItem, describeError, isAbort, listUsers } from "./api";
 
 // ----- Icons (inline, stroke-based) -------------------------------------------
 
@@ -121,6 +122,20 @@ const ICON_PATHS = {
     <>
       <path d="M3 3v18h18" />
       <path d="M7 14l4-5 3 3 5-7" />
+    </>
+  ),
+  key: (
+    <>
+      <circle cx="8" cy="15" r="4.5" />
+      <path d="M11.2 11.8L20 3M16 7l3 3M14 9l2 2" />
+    </>
+  ),
+  plus: <path d="M12 5v14M5 12h14" />,
+  fingerprint: (
+    <>
+      <path d="M12 11v4a6 6 0 01-1.5 4" />
+      <path d="M8.5 9.5A3.5 3.5 0 0115.5 11v2.5a10 10 0 01-1 4.5" />
+      <path d="M5.5 15.5A10 10 0 015 12.5V11a7 7 0 0114 0v1.5" />
     </>
   ),
 } as const;
@@ -234,50 +249,102 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 
 // ----- Modal ---------------------------------------------------------------------
 
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/** Accessible dialog: focus moves inside on open (to the first element marked
+ *  `data-autofocus`, else the dialog itself), Tab is trapped within it, and
+ *  focus returns to whatever opened it on close. With `dismissible={false}`
+ *  neither Escape nor a backdrop click closes it — for dialogs whose content
+ *  must be acknowledged (a key shown once). */
 export function Modal({
   title,
   onClose,
   wide,
+  dismissible = true,
+  role = "dialog",
   children,
 }: {
   title: string;
   onClose: () => void;
   wide?: boolean;
+  dismissible?: boolean;
+  role?: "dialog" | "alertdialog";
   children: ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const titleId = useId();
+  // Latest props in refs, so a parent re-render (a fresh onClose arrow) never
+  // re-runs the mount effect and yanks focus back to the top of the dialog.
+  const onCloseRef = useRef(onClose);
+  const dismissibleRef = useRef(dismissible);
   useEffect(() => {
+    onCloseRef.current = onClose;
+    dismissibleRef.current = dismissible;
+  });
+
+  useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
+    const dialog = ref.current;
+    const initial = dialog?.querySelector<HTMLElement>("[data-autofocus]");
+    (initial ?? dialog)?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        if (dismissibleRef.current) onCloseRef.current();
+        return;
+      }
+      if (e.key !== "Tab" || !dialog) return;
+      const items = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE));
+      if (items.length === 0) {
+        e.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      if (e.shiftKey && (active === first || active === dialog)) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
+      } else if (!dialog.contains(active)) {
+        e.preventDefault();
+        first.focus();
+      }
     };
     document.addEventListener("keydown", onKey);
-    document.body.style.overflow = "hidden";
-    ref.current?.focus();
+    document.body.classList.add("modal-open");
     return () => {
       document.removeEventListener("keydown", onKey);
-      document.body.style.overflow = "";
+      document.body.classList.remove("modal-open");
+      if (opener && document.contains(opener)) opener.focus();
     };
-  }, [onClose]);
+  }, []);
+
   return (
     <div
       className="modal-backdrop"
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget && dismissibleRef.current) onCloseRef.current();
       }}
     >
       <div
         className={`modal ${wide ? "wide" : ""}`}
-        role="dialog"
+        role={role}
         aria-modal="true"
-        aria-label={title}
+        aria-labelledby={titleId}
         tabIndex={-1}
         ref={ref}
       >
         <div className="modal-head">
-          <h3>{title}</h3>
-          <button className="icon-btn" onClick={onClose} aria-label="Close">
-            <Icon name="x" />
-          </button>
+          <h3 id={titleId}>{title}</h3>
+          {dismissible && (
+            <button className="icon-btn" onClick={onClose} aria-label="Close">
+              <Icon name="x" />
+            </button>
+          )}
         </div>
         <div className="modal-body">{children}</div>
       </div>
@@ -409,14 +476,13 @@ export function Alert({
 // navigator.clipboard exists only in a secure context (HTTPS/localhost); over
 // plain HTTP it is undefined. Fall back to the legacy execCommand path so copy
 // works on an IP-based LAN deployment too.
-function copyText(text: string): Promise<void> {
+export function copyText(text: string): Promise<void> {
   if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(text);
   return new Promise((resolve, reject) => {
     try {
       const ta = document.createElement("textarea");
       ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
+      ta.className = "offscreen-copy";
       document.body.appendChild(ta);
       ta.select();
       const ok = document.execCommand("copy");
@@ -723,7 +789,9 @@ export function usePoll<T>(fetcher: (signal: AbortSignal) => Promise<T>, interva
           setUpdatedAt(Date.now());
         })
         .catch((e) => {
-          if (ac.signal.aborted || isAbort(e)) return;
+          // A poll paused because the operator is idle keeps its last data:
+          // it is not an outage, and it must not extend the session.
+          if (ac.signal.aborted || isAbort(e) || e instanceof IdlePausedError) return;
           setError(describeError(e));
         });
     };

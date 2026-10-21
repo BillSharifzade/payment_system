@@ -1,11 +1,13 @@
 // The signed-in frame: top bar (brand, nav, integrity pill, sign-out) around
-// the routed page. Owns the OpsProvider, so admin status and metrics are
-// polled once here for every consumer — health pill, KYC badge, dashboard
-// tiles and the queue's counts all read the same data.
+// the routed page. Owns the OpsProvider, so admin status, metrics and the
+// pending-deposit queue are polled once here for every consumer — health
+// pill, nav badges, dashboard tiles and the queues' counts all read the same
+// data — and the idle guard, which signs an unattended console out.
 
 import { NavLink, Outlet } from "react-router-dom";
 import { logout } from "./api";
-import { OpsProvider, useOps } from "./ops";
+import { IdleGuard } from "./idle";
+import { OpsProvider, pendingLabel, useOps } from "./ops";
 import { Icon, IconName } from "./ui";
 
 function NavItem({
@@ -13,20 +15,26 @@ function NavItem({
   icon,
   label,
   count,
+  countLabel,
   end,
 }: {
   to: string;
   icon: IconName;
   label: string;
   count?: number;
+  /** Overrides how `count` is shown (e.g. "50+"). */
+  countLabel?: string;
   end?: boolean;
 }) {
+  const shown = count !== undefined && count > 0;
   return (
     <NavLink to={to} end={end} className="nav-link">
       <Icon name={icon} size={15} />
       {label}
-      {count !== undefined && count > 0 && (
-        <span className="nav-count">{count.toLocaleString()}</span>
+      {shown && (
+        <span className="nav-count" aria-label={`${countLabel ?? count} waiting`}>
+          {countLabel ?? count.toLocaleString()}
+        </span>
       )}
     </NavLink>
   );
@@ -73,7 +81,7 @@ function HealthPill() {
 }
 
 function Topbar() {
-  const { metrics } = useOps();
+  const { metrics, pendingDeposits } = useOps();
   return (
     <header className="topbar">
       <div className="brand">
@@ -92,6 +100,14 @@ function Topbar() {
         <NavItem to="/users" icon="users" label="Users" />
         <NavItem to="/fx" icon="exchange" label="FX rates" />
         <NavItem to="/funding" icon="bank" label="Funding" />
+        <NavItem
+          to="/deposits"
+          icon="inbox"
+          label="Approvals"
+          count={pendingDeposits?.count}
+          countLabel={pendingDeposits ? pendingLabel(pendingDeposits) : undefined}
+        />
+        <NavItem to="/terminals" icon="fingerprint" label="Terminals" />
       </nav>
       <div className="topbar-right">
         <HealthPill />
@@ -107,6 +123,7 @@ function Topbar() {
 export default function Shell() {
   return (
     <OpsProvider>
+      <IdleGuard />
       <Topbar />
       <main>
         <Outlet />

@@ -1,0 +1,136 @@
+[package]
+name = "payment-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "proprietary"
+publish = false
+description = "cargo-fuzz targets: properties of every parser and invariant reachable from untrusted input."
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone: the root workspace excludes this directory (nightly + sanitizers only).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+money = { path = "../crates/money" }
+ledger = { path = "../crates/ledger" }
+auth = { path = "../crates/auth" }
+biometric = { path = "../crates/biometric" }
+crypto = { path = "../crates/crypto" }
+api = { path = "../crates/api" }
+storage = { path = "../crates/storage" }
+# Versions match the root workspace's (same lockfile seed).
+axum = { version = "0.8", default-features = false }
+sqlx = { version = "0.8", default-features = false }
+uuid = "1"
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+sha2 = "0.10"
+hmac = "0.12"
+ed25519-dalek = "2"
+curve25519-dalek = "4"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "money"
+path = "fuzz_targets/money.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ledger_validate"
+path = "fuzz_targets/ledger_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ledger_ops"
+path = "fuzz_targets/ledger_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_verify"
+path = "fuzz_targets/auth_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_token"
+path = "fuzz_targets/auth_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "biometric_template"
+path = "fuzz_targets/biometric_template.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "biometric_policy"
+path = "fuzz_targets/biometric_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "biometric_cipher"
+path = "fuzz_targets/biometric_cipher.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "biometric_terminal"
+path = "fuzz_targets/biometric_terminal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto_merkle"
+path = "fuzz_targets/crypto_merkle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto_signing"
+path = "fuzz_targets/crypto_signing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_common"
+path = "fuzz_targets/api_common.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_device_payload"
+path = "fuzz_targets/api_device_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_dto"
+path = "fuzz_targets/api_dto.rs"
+test = false
+doc = false
+bench = false

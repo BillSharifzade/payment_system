@@ -1,0 +1,45 @@
+[package]
+name = "ledger-tigerbeetle"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "TigerBeetle ledger backend (DESIGN.md §15, Phase 2): balances and the no-overdraft rule live in TigerBeetle; guards, idempotency, the outbox and the journal mirror stay in Postgres, joined by a reserve → commit → post protocol with crash recovery."
+
+[features]
+# The shared test suites (src/testkit.rs), run against the model here and against a live
+# cluster by tests/live.rs.
+testkit = []
+# TigerBeetle's native client (LiveTb). Off by default: building it needs Zig (ZIG_PATH, else
+# the build script downloads one) and libclang, until TigerBeetle publishes its Rust client
+# with prebuilt libraries. The official crate is a placeholder; tigerbeetle-unofficial
+# 0.14.28 is "0.14.28+0.16.78": it embeds the TigerBeetle 0.16.78 client, which 0.16.4+ and
+# 0.17.x servers accept (release_client_min).
+native-client = ["dep:tigerbeetle-unofficial"]
+
+[dependencies]
+ledger = { workspace = true }
+money = { workspace = true }
+storage = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tigerbeetle-unofficial = { version = "=0.14.28", features = ["tokio-rt-multi-thread"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+
+# The shared suites against a live cluster (TIGERBEETLE_ADDRESSES, DATABASE_URL).
+[[test]]
+name = "live"
+required-features = ["native-client", "testkit"]
+
+# Posting throughput and latency of every backend, interleaved (src/bin/tb-bench.rs).
+[[bin]]
+name = "tb-bench"
+required-features = ["native-client"]

@@ -1,18 +1,33 @@
-# Alertmanager: one webhook receiver. The URL is not in this file — it comes
-# from ALERT_WEBHOOK_URL in deploy/.env, which the compose overlay writes to
-# /etc/alertmanager/webhook_url (see `configs:` in docker-compose.monitoring.yml).
-# Point it at whatever pages you: a Slack/Mattermost incoming webhook via a
-# bridge, PagerDuty/Opsgenie events API, ntfy.sh, or your own tiny receiver.
+# Alertmanager: one paging webhook + one outbound heartbeat. Neither URL is in
+# this file — they come from ALERT_WEBHOOK_URL / ALERT_HEARTBEAT_URL in
+# deploy/.env, which the compose overlay writes to /etc/alertmanager/*_url
+# (see `configs:` in docker-compose.monitoring.yml).
+#
+#   ops-webhook  whatever pages you: a Slack/Mattermost incoming webhook via a
+#                bridge, PagerDuty/Opsgenie events API, ntfy.sh, ...
+#   heartbeat    a dead man's switch OUTSIDE this box (healthchecks.io check
+#                URL, Cronitor, Dead Man's Snitch, ...). It receives only the
+#                always-firing Watchdog alert, about once a minute; configure
+#                it to page you when the pings stop (e.g. period 5 min, grace
+#                5 min). Everything runs on one box, so this is the only way a
+#                dead host, Docker daemon, Prometheus or Alertmanager — or a
+#                severed uplink — ever pages anyone.
 global:
   resolve_timeout: 5m
 
 route:
   receiver: ops-webhook
-  group_by: ["alertname", "service", "job"]
+  group_by: ["alertname", "service", "job", "kind"]
   group_wait: 30s
   group_interval: 5m
   repeat_interval: 4h
   routes:
+    - matchers:
+        - alertname="Watchdog"
+      receiver: heartbeat
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 1m
     # Money-integrity and availability alerts nag every hour until resolved.
     - matchers:
         - severity="critical"
@@ -25,6 +40,11 @@ receivers:
       - url_file: /etc/alertmanager/webhook_url
         send_resolved: true
         max_alerts: 20
+  - name: heartbeat
+    webhook_configs:
+      - url_file: /etc/alertmanager/heartbeat_url
+        send_resolved: false
+        max_alerts: 1
 
 inhibit_rules:
   # A critical alert for a service silences its warnings.
@@ -33,3 +53,9 @@ inhibit_rules:
     target_matchers:
       - severity="warning"
     equal: ["service", "job"]
+  # The critical disk alert supersedes the early warnings for the same mount.
+  - source_matchers:
+      - alertname="DiskSpaceCritical"
+    target_matchers:
+      - alertname=~"DiskSpaceLow|DiskWillFillIn24h"
+    equal: ["mountpoint"]

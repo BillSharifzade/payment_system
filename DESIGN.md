@@ -1,8 +1,7 @@
 # Payment System — Backend Design & Architecture
 
-> Status: **DRAFT FOR REVIEW.** Nothing here is implemented yet. This document is for us to argue over and refine before a single line of code is written.
+> Status: **IMPLEMENTED — living design record.** It began as the pre-code design review; the backend, clients and ops stack it describes now exist. §17 carries the live build status, and "As built" notes mark where the implementation refined the original plan.
 >
-> Author pass: review & hardening of the initial architecture sketch.
 > Target: a domestic (and eventually Central-Asia regional) payment system backend in Rust — fast, secure, correct, and operationally resilient.
 
 ---
@@ -139,6 +138,8 @@ Locking only the specific account rows means unrelated accounts proceed fully in
 
 > **Alternative considered (TigerBeetle-style):** a dedicated single-threaded, in-memory accounting state machine that processes transfers from a queue at ~1M/s with no locks because there's only one writer. Phenomenal throughput and correctness, but it's a separate system to operate. **Plan: start with Postgres row-locking (simpler, one system). Abstract the ledger behind a `LedgerEngine` trait so we can swap in TigerBeetle later if throughput demands it — without rewriting business logic.** See §15.
 
+*As built (perf pass, 2026-10).* A post takes its locks in one global order: the `transactions` row (idempotency claim), the guard's rows (the payer's `users` row `FOR NO KEY UPDATE`, a check or deposit-request row), the wallets (`FOR UPDATE`, id order), then the system-account shards (64 per system account) as additive updates in id order. The guard runs before any wallet is locked, so a wallet everyone pays is held only for the write and the commit. Locking credit-only wallets after the debited ones was rejected: two users paying each other deadlock (`crates/api/tests/lock_order.rs` catches it in seconds). `post_on` plans generically and folds the last system delta and the `statement_timeout` lift into its single write statement: BEGIN, claim, guard, wallet locks, write, COMMIT. Measured with `payment-loadtest` (4 vCPU, shared box, medians of interleaved runs): +24 % uniform, **+47 % hot merchant** (p99 517 → 293 ms), **+92 % single-payer contention**; re-measured on the final tree with nothing else on the box: +21 % uniform (p99 66 → 50 ms), +47 % hot merchant (p99 470 → 267 ms), +123 % contention (p99 115 → 45 ms), 18 runs all verified (`crates/loadtest/README.md`); `synchronous_commit` stays `on` — batching commits was measured to gain at most 3.6–5.8 % and not built. Under `LEDGER_BACKEND=tigerbeetle` (§15) a post locks no wallet or shard at all: TigerBeetle reserves first, then one Postgres transaction takes the `transactions` row, the intent key and the guard's rows, in this order; a reservation that only other requests' holds refuse waits for them, as a wallet lock would.
+
 ### 5.3 Idempotency (retries must never double-charge)
 - Every state-changing endpoint requires a client-supplied **`Idempotency-Key`** (UUID).
 - We store `(idempotency_key → request_hash, response, status)` in a dedicated table.
@@ -175,6 +176,14 @@ Decouple correctness from cryptographic proof:
 If you want externally-verifiable, "nobody can claim we rewrote history" guarantees: **periodically publish the latest checkpoint Merkle root to a public ledger** (e.g., a public blockchain, or even a notarized public log) — say, hourly. This costs almost nothing (one tiny write per hour), runs entirely off the hot path, and gives you blockchain-grade external auditability without blockchain's latency or throughput penalty. This is the genuinely smart use of a public chain for a payment system, and it's *optional and additive*.
 
 **Net:** full tamper-evidence, no throughput penalty, optional public verifiability. This is strictly better than the first draft's design.
+
+### 6.5 As built — what makes the chain trustworthy
+- **Pinned keys.** The verifier never trusts the `public_key` stored next to a signature — that would let anyone with write access re-sign rewritten history with their own key. A checkpoint verifies only under a key in `WORKER_TRUSTED_PUBLIC_KEYS` (plus the current signing key's public half); anything else is `ChainBroken("untrusted signing key")`. Rotation keeps retired public keys in the list.
+- **History is re-verified, not just the tip.** Every interval the worker verifies new checkpoints and re-checks the last verified one (an altered or deleted checkpoint is caught); at startup and every `VERIFY_FULL_EVERY_SECS` (6 h) it re-verifies the whole chain in bounded pages (64 checkpoints / 10k transactions per page). Sealed transactions not covered by any checkpoint are reported.
+- **`payment-workers verify-chain`** runs a full verification against any database (the restore drill uses it) and prints a JSON report; exit 0 intact, 1 broken, 2 error.
+- **External anchoring (§6.4, built — migration 0031).** The worker leader anchors the newest *verified* checkpoint hash every `ANCHOR_INTERVAL_SECS` (default 1 h) with RFC 3161 timestamp authorities (the full TimeStampResp is stored after checking imprint, nonce, genTime, signed attributes, the CMS signature, the `id-kp-timeStamping` EKU and a chain to `ANCHOR_RFC3161_CERTS_FILE`) and/or OpenTimestamps (the pending proof, later completed to a Bitcoin attestation and stored as a *new* row) in the append-only `checkpoint_anchors`. Because each checkpoint hash chains every earlier one, rewriting anchored history — even re-signed with the legitimate key — makes the verifier and `verify-chain` report the chain broken (tested). `verify-chain` reports `anchored_through_seq`, `anchor_age_seconds` and the Bitcoin attestations; matching an attestation against the block header is the auditor's last step (`ots verify` against a node, or `bitcoin-cli getblockheader`). Stock tools verify the stored proofs (`openssl ts -verify`, `ots verify`).
+- **The key out of the process (§12.8, built).** `WORKER_SIGNER=vault` (Vault transit ed25519, a non-exportable key and a sign-only AppRole; the key version is pinned at connect) or `pkcs11` (an HSM via `CKM_EDDSA`; tested against SoftHSM2). Every signature is checked before a checkpoint is written. Verification still uses pinned keys only: an external signer's key must be pinned before it signs, and a retired key is bounded with `<hex>@<last seq>` so it can no longer sign new checkpoints.
+- **Still open.** History newer than the last anchor (≤ one interval) can be re-signed by whoever can request signatures; anchor rows deleted by a superuser across a worker restart are caught only by Prometheus history (`CheckpointAnchorRegressed`) and backups; RFC 3161 revocation (CRL/OCSP) is not checked.
 
 ---
 
@@ -310,6 +319,7 @@ Notes:
 - `entries` and `transactions` are **append-only**. No `UPDATE`/`DELETE`. Corrections are new reversing transactions.
 - Partition `entries` and `audit_log` by time (monthly) for manageable size and fast pruning/archival.
 - `CHECK` constraints and a deferred constraint trigger enforce the "entries sum to zero" invariant at the DB level as a backstop, even if app code has a bug.
+- **As built (migration 0025):** triggers reject UPDATE/DELETE/TRUNCATE on `entries`, `checkpoints`, `admin_actions`, `screening_events`, `biometric_events` and `voided_transactions`; `transactions` rows are insert-only except `sealed_seq` NULL → value. The balance invariant is a statement-level `AFTER INSERT … REFERENCING NEW TABLE` trigger (cheaper than a per-row deferred one) that re-sums every touched transaction per currency — so a transaction's entries must be written in one INSERT, which `PostgresLedger` does. Cost ≈ +20–28 µs of DB CPU per post, within noise end to end. Only a superuser or the table owner can bypass the triggers; the runtime role `payment_app` is neither (§11).
 
 ---
 
@@ -335,6 +345,7 @@ Notes:
 - **Fraud/AML hooks:** every transfer passes through a screening step (velocity checks, sanctions list, anomaly scoring) — can run inline for blocking rules and async for scoring.
 - **Audit:** append-only `audit_log` for every privileged/admin action and every money movement; tamper-evident via the checkpoint chain.
 - **Least privilege:** DB roles scoped per service; the API role *cannot* `DELETE` from `entries`.
+  *As built (migration 0027 + `deploy/postgres/10-roles.sh`):* `payment_owner` owns the schema and only runs migrations; `payment_app` (server + workers) is neither owner nor superuser, so it cannot disable the 0025 triggers, and its grants already exclude UPDATE/DELETE on the append-only tables and every `transactions` column but `sealed_seq`; `payment_backup` is read-only; `payment_monitor` serves the Postgres exporter. Default privileges give tables from later migrations ordinary DML grants — **a migration that adds an append-only table must REVOKE UPDATE/DELETE from `payment_app` itself.** Admin endpoints must live under `/v1/admin/` (or be added to `@admin_denied` in the Caddyfile) to inherit the IP allowlist. Workers' `DATABASE_URL` must be a direct or session-mode connection (leader election uses session advisory locks).
 - **Secure SDLC:** `cargo audit` / `cargo deny` in CI for dependency CVEs; secret scanning; code review required for ledger-touching code.
 
 ---
@@ -356,6 +367,8 @@ Notes:
 - **Health checks:** liveness/readiness endpoints; automatic removal of unhealthy instances.
 
 > ⏸️ **§12.2–§12.9 are DEFERRED until the backend exists.** The full HA datacenter topology below is the *destination*, not the starting point. For now we build and test everything in **Docker Compose on one machine** (§12.10, "Dev"). Do not stand up Talos/Patroni/Vault/etc. until the ledger and API are real and tested. Parked here intentionally so it's ready when we need it.
+
+> **As built (2026-10, `deploy/ha/`):** the Postgres tier of §12.4 exists as a Compose overlay — 3 Patroni 4.1 members (PG16) + 3 etcd 3.6 (client RBAC) behind HAProxy (TCP, routes on Patroni `/primary`, keeps the `postgres` service name). Replication is **quorum-synchronous and strict** (`synchronous_mode: quorum`, `synchronous_node_count: 1`, `synchronous_mode_strict: true` → `ANY 1 (pg-2, pg-3)`) instead of "1 sync standby + 1 async replica": a COMMIT is acknowledged once the leader and either standby have flushed it, so one standby loss never stalls writes; promotion only to a standby holding every acknowledged commit; with both standbys gone writes stop rather than become single-copy. No PgBouncer: HAProxy in TCP mode keeps session semantics, which the workers' advisory-lock leader election needs. pgBackRest archives WAL from the leader and backs up on every promotion. `scripts/ha-failover-drill.sh` (CI: `ha.yml`) measured on one host under 40 transfers/s: **RPO 0** (41 scenario runs, 43 377 acknowledged transfers, all present on every member and in a PITR restore); new leader in a median ~19 s after a crash, ~20 s after a freeze, ~3–5 s for a planned switchover; the client write outage is about 1 s longer. **Rule found by the drill:** a money COMMIT never runs under a `statement_timeout` — Postgres reports a cancelled synchronous-replication wait as *success* — and failover errors (connection loss, 57P0x, 25006, 08xxx) are `503 retry_later`, so the idempotent retry settles them.
 
 ### 12.1 Deployment context (decided)
 - **Data residency:** ✅ all data stays **in-country, in a company-owned datacenter** in Tajikistan. This is good for both law and latency (servers next to users).
@@ -452,7 +465,7 @@ Production never deploys without passing every gate **and** your explicit approv
 
 ### 12.8 Secrets & keys
 - **HashiCorp Vault** is the in-country stand-in for a cloud KMS (no hyperscaler KMS is available locally). It holds DB credentials, service tokens, and issues short-lived dynamic secrets.
-- **Signing keys** (Ed25519 checkpoint sealing, partner webhooks): held in Vault's transit engine now; **migrate to a physical HSM** appliance in the DC for production — the private key then *never* exists in application memory in cleartext. The DC owning real hardware makes a true HSM realistic, which is a security advantage over cloud.
+- **Signing keys** (Ed25519 checkpoint sealing, partner webhooks): *as built, the checkpoint key lives in Vault transit (`deploy/docker-compose.vault.yml`, `WORKER_SIGNER=vault`) and the PKCS#11 signer is ready for a DC HSM.* Originally: held in Vault's transit engine now; **migrate to a physical HSM** appliance in the DC for production — the private key then *never* exists in application memory in cleartext. The DC owning real hardware makes a true HSM realistic, which is a security advantage over cloud.
 - No secret is ever in Git or in an image. Apps fetch secrets from Vault at startup via short-lived tokens.
 
 ### 12.9 What this buys you (and the honest cost)
@@ -477,6 +490,8 @@ Your "every stat possible" goal maps cleanly to three pillars + analytics:
 - **Structured logs (Loki):** JSON logs, correlation IDs, no PII in logs.
 - **Business analytics:** a read-replica / separate analytics store feeds reporting (volumes, active users, fraud rates, settlement reports for the regulator). Kept off the transactional primary so analytics never slows payments.
 - **Continuous reconciliation:** a background job constantly re-derives balances from `entries` and asserts they equal the materialized `balances`, and that all entries sum to zero. Any drift pages an engineer immediately. **This is your early-warning system for correctness bugs.**
+  - *As built:* incremental passes are O(new transactions), not O(history). `reconciled_sums` holds each account's entry sum through a `sealed_seq` watermark; a pass checks `balance = reconciled sum + entries sealed after the watermark or unsealed` in one REPEATABLE READ snapshot, checks those transactions net to zero, then folds the newly sealed range in (a hot account with 515k entries: 730–880 ms → 13–20 ms). A resumable full pass (`RECONCILE_FULL_EVERY_SECS`, daily) walks accounts in bounded chunks and also re-checks `reconciled_sums` against the entries. Mismatches are reported, never auto-repaired.
+  - *Workers are replica-safe:* sealing, verification, reconciliation and retention run only on the leader (Postgres advisory lock on a dedicated connection, TCP keepalives so a dead leader releases it); the outbox relay runs everywhere (`FOR UPDATE SKIP LOCKED` + `Nats-Msg-Id` dedup — consumers must tolerate cross-replica reordering). Metrics: `worker_leader`, `ledger_chain_verified`, `ledger_chain_full_verified_timestamp_seconds`, `reconciliation_healthy`, `reconciliation_full_timestamp_seconds`. Anchoring and signing (§6.5): `checkpoint_anchored_through_seq{witness}`, `checkpoint_anchor_age_seconds{witness}`, `checkpoint_anchor_unanchored_age_seconds{witness}`, `checkpoint_anchor_unconfirmed_age_seconds{witness}`, `checkpoint_anchor_failures_total{witness,op}`, `checkpoint_anchor_last_success_timestamp_seconds{witness}`, `worker_signer_info{signer}`, `checkpoint_signer_ready`, `checkpoint_signer_failures_total{signer}`.
 
 ---
 
@@ -489,7 +504,7 @@ Payments demand more than "I ran it and it worked":
 - **Deterministic simulation testing (the gold standard, à la TigerBeetle/FoundationDB):** run the ledger engine against a simulated world with injected faults — random crashes, network partitions, message reordering, concurrent conflicting transfers — replayable from a seed. If invariants survive millions of simulated fault scenarios, you have real confidence. This is how the best financial systems are tested.
 - **Integration tests:** real Postgres (via testcontainers), full request→ledger→balance path, including retries and idempotency.
 - **Load tests:** establish the real p99 latency and max throughput; catch regressions in CI.
-- **Fuzzing:** on parsers and the API boundary.
+- **Fuzzing (built):** `fuzz/` holds 14 cargo-fuzz targets — money, ledger validation and operation sequences, access tokens, biometric templates/policy/cipher/terminal keys, Merkle proofs and checkpoint signatures, and the API's request parsers and device-signature payload. Each compares the code with an independent reference model (not just "doesn't panic"), and all are built with overflow checks, so any wrapping arithmetic is a failure. CI runs every target for 75 s on PRs and 10 min nightly from a cached corpus; Miri runs the money, ledger, crypto and biometric tests (no UB). The first campaign (~2.6 CPU-hours, ~158 M executions) found and fixed an order-dependent `Transaction::validate`, five `InMemoryLedger` defects (re-opening overwrote an account, an unreadable i128::MIN balance, order-dependent overflow and error naming, overflowing conservation sums), a TTL overflow in `issue_access_token`, NaN/tie match decisions in `biometric::decide` (now fail closed; exact ties are ambiguous), and unbounded currency exponents (now ≤ 18).
 
 ---
 
@@ -505,10 +520,12 @@ You said "extremely fast." The fastest correct path is worth naming explicitly:
 But we still build behind a `LedgerEngine` trait, and we still start on Postgres, for one blunt reason: **the launch bottleneck is never the ledger's TPS — it's auth, KYC, network round-trips, and ops maturity.** TigerBeetle only does accounting; it does *not* store users, KYC, metadata, idempotency records, or the outbox — all of that lives in Postgres regardless. Running TigerBeetle's consensus cluster *and* Postgres *and* Redis *and* NATS on day one, before a single real user, is a lot of moving parts to operate.
 
 So:
-1. **Phase 1: `PostgresLedger`** — double-entry, row-locked, in the Postgres we already need. One fewer datastore to operate while we prove correctness and ship the product. Comfortably handles thousands of TPS — far beyond early Tajik volume.
+1. **Phase 1: `PostgresLedger`** — double-entry, row-locked, in the Postgres we already need. One fewer datastore to operate while we prove correctness and ship the product. Comfortably handles thousands of TPS — far beyond early Tajik volume. Measured and reproducible with `payment-loadtest` (`crates/loadtest/README.md`).
 2. **Phase 2: `TigerBeetleLedger`** — swap the hot accounting path to a TigerBeetle cluster once real load (or load tests) justify the extra operational surface. Postgres stays for everything non-accounting.
+   *As built (`crates/ledger-tigerbeetle`, migration 0033):* `HybridLedger::post_on` has the same signature and guards as `PostgresLedger::post_on`. TigerBeetle reserves funds with a **linked chain of pending transfers** and enforces no-overdraft itself (`debits_must_not_exceed_credits`); one Postgres transaction then claims the id, records the intent (`tb_intents`), runs the posting guards under their row locks (per-user AML stays exact — proven: 14 of 40 concurrent payments post against the limit, 36 without the lock) and writes the journal mirror, idempotency record and outbox. **That COMMIT is the commit point**; the reservation is then posted under ids derived from the transaction id, so a transaction posts at most once. Recovery settles abandoned reservations through a `void` tombstone that serialises with an in-flight commit on the intent's key; pending timeouts are only a backstop. Every crash point is covered by a fault-injection matrix, plus differentials against `InMemoryLedger` and code-for-code fidelity tests against live TigerBeetle 0.17.9 and 0.16.78. System accounts need no sharding in TigerBeetle (one core applies whole batches without locks). **Measured (noisy shared box):** the guarded hybrid is bounded by its Postgres step — about 1.5× `PostgresLedger` at best and **≈5× under a single hot recipient** (no balance-row locks: 1 009 vs 212 ops/s, Postgres p99 835 ms) — but adds two TigerBeetle round trips of latency, so plain transfers at low concurrency are slower. TigerBeetle's own throughput (the `direct` path) needs the guards out of the per-transfer path: per-user limit accounts with 24 h pending debits, check/deposit transitions as transfers with derived ids, audit/outbox from TigerBeetle's change stream — designed, not built. Client: `tigerbeetle-unofficial` (the official Rust client is not on crates.io yet) behind a trait, so switching is one adapter.
+   *Wired (2026-10, `LEDGER_BACKEND=tigerbeetle`, migration 0034):* `AppState.ledger` is a `Ledger` enum (`crates/api/src/backend.rs`) dispatching posting, account opening and balance reads; everything else stays on Postgres, so the guards keep their `PostHook`s unchanged. **How to switch:** build with `--features tigerbeetle` (api/workers; the native client needs Zig + libclang — the default build and image have neither and refuse the setting), set `TIGERBEETLE_CLUSTER_ID`/`TIGERBEETLE_ADDRESSES` (strictly parsed, IP literals: the client resolves no names), and cut over with money stopped: `payment-server tigerbeetle-import` copies every balance as an opening transfer and records `tb_cutover`; servers and workers refuse a database whose balances never reached the cluster, a cluster lacking the newest wallets (wrong id, reformatted file) and a rolled-back cluster; `tigerbeetle-rollback` settles, requires cluster = journal for every account and rebuilds `balances` from the journal (deploy/README.md; overlay `docker-compose.tigerbeetle.yml`). Under TigerBeetle `balances` is no longer written: balances, wallet lists and the fingerprint payer pick read the cluster; admin conservation and customer funds sum the journal (`reconciled_sums` + tail; the cluster conserves per ledger by construction). An unanswered cluster or a lost reservation is `503 retry_later`; a protocol violation is a 500 counted in `tigerbeetle_request_errors_total{kind="protocol"}`. Adapted to the perf pass: the hybrid's Postgres step plans generically and lifts `statement_timeout` for its COMMIT (a timeout-cancelled synchronous-standby wait reads as success for a transaction a failover can lose — and the post would then move money no journal holds), and refuses a connection already inside a transaction (a savepoint is no commit point). **Found by the live runs:** eight concurrent fingerprint payments of one check answered `422 insufficient_funds` where Postgres answers `409` — reservations of attempts whose guard then fails held the funds; a post refused only for other requests' holds now waits for them (`TIGERBEETLE_HOLD_WAIT_MS`, 2 s, like the row-lock wait) and then fails retryably, never with an insufficiency the committed balance contradicts (whether those holds are still there when it looks or already gone), and the payer pick compares the committed balance, as on Postgres, not the one net of holds. AML stays exact: the guard runs in the hybrid's Postgres step under the user-row lock, and the mirror's single `entries` INSERT fires the `aml_windows` trigger exactly as storage's does — the aml_windows suites, the concurrent one included, pass against a live cluster. **Workers:** the leader runs `HybridLedger::recover()` every `TIGERBEETLE_RECOVERY_INTERVAL_SECS` (2 s; metrics `tigerbeetle_recovered_total{outcome}`, `tigerbeetle_recovery_errors_total{kind}`, alerts for staleness, forced re-posts and protocol errors). Reconciliation compares the cluster with the journal and re-checks a mismatch exactly after a recovery pass: the balance is read between two readings of the cluster's newest timestamp and the journal in a snapshot after it, so the committed-but-unposted transactions it may lag by are found one by one (their post ids derive from the transaction id) — a post in flight is never reported, drift always is; an account whose posts keep landing inside the read is reported inconclusive and re-checked. **Measured end to end** (`payment-loadtest` over HTTP, same release binaries, 1 000 users, 64 clients, 20 s; fresh database and fresh single-replica cluster per run, variants interleaved, median of 3, every run verified; one shared box, so ratios rather than absolutes): uniform transfers 1 759 ops/s, p99 54 ms on Postgres vs 1 452 ops/s, p99 96 ms on TigerBeetle (0.83×: two cluster round trips per post, Postgres CPU per op 1.61 → 1.30 ms); a single hot merchant 564 ops/s, p99 393 ms vs 1 500 ops/s, p99 98 ms (**2.7×, p99 4× lower**: no balance-row lock queue). `TIGERBEETLE_SESSIONS=4` was slower on this box (1 214 / 1 291 ops/s), so the default is one session. **Proof:** all 70 api integration tests and all 25 workers tests pass against Postgres, against the in-process cluster model and against a live TigerBeetle 0.17.9 replica (`.github/workflows/tigerbeetle.yml` runs every lane, one cluster per database); fault injection through the API: a lost post answers 201 with the journal written and the balance following after recovery, a lost reservation reply answers 503 and the same-key retry posts exactly once while recovery voids the orphan.
 
-Because all business logic talks to the **trait**, this swap is a *configuration/wiring change, not a rewrite*. We get "ship correct soon" **and** "extremely fast at scale" without betting the launch on operating two consensus systems before we have users. The trait is designed from day one with TigerBeetle's model in mind (integer amounts, debit/credit transfers, pending/posted two-phase transfers) so the Postgres implementation doesn't paint us into a corner.
+*As built, this claim needs a correction:* money endpoints call `post_on` (`PostgresLedger`'s, or the hybrid's through `api::Ledger`) with a Postgres connection, and the rules that must hold *inside* the posting lock — the per-user AML window, single-use check/deposit-request transitions, audit rows — run as `PostHook`s on the same Postgres transaction. That co-location is exactly what makes them exact under concurrency, but it means a TigerBeetle move is a real port (those guards become two-phase pending/post transfers plus Postgres-side reservations), not a wiring change. (The hybrid keeps them in its Postgres step, so moving balances became the wiring above; only TigerBeetle's own throughput, the `direct` path, still needs that port.) The pure `LedgerEngine`/`InMemoryLedger` remains the reference model: a differential test (`crates/storage/tests/differential.rs`) replays random operation sequences against both and requires identical results and balances. Originally: because all business logic talks to the **trait**, this swap is a *configuration/wiring change, not a rewrite*. We get "ship correct soon" **and** "extremely fast at scale" without betting the launch on operating two consensus systems before we have users. The trait is designed from day one with TigerBeetle's model in mind (integer amounts, debit/credit transfers, pending/posted two-phase transfers) so the Postgres implementation doesn't paint us into a corner.
 
 ---
 
@@ -574,7 +591,7 @@ payment-backend/
 - ✅ FX accounts, fees (sharded). ⬜ Partner-bank deposit/withdrawal integration — the biggest remaining product gap; deposits are admin-only today and there is no withdrawal endpoint.
 
 **Phase 5 — Compliance & ops hardening:**
-- ✅ KYC/AML subsystems, incremental reconciliation, load test (~3k transfers/s per box, p99 20 ms), backups + restore drill script, alert rules. ⬜ DR drill on real hardware, chaos tests.
+- ✅ KYC/AML subsystems, incremental reconciliation, load test (~3k transfers/s per box, p99 20 ms), backups + restore drill script, alert rules. ✅ Postgres HA overlay (Patroni quorum-sync + etcd + HAProxy) with an automated failover drill (crash / switchover / freeze, RPO 0, RTO ≈ 20 s) in CI. ⬜ DR drill on real hardware (members on separate machines), chaos tests beyond the database.
 
 **Phase 6 — Scale (only if needed):**
 - ⬜ Evaluate `TigerBeetleLedger` (only once a single Postgres box's ~3k commits/s is the limit), read replicas, partitioning, multi-region.
@@ -657,9 +674,12 @@ customer (once)      POST /v1/biometric/fingerprints  {finger, format, template,
 merchant terminal    POST /v1/checks   Idempotency-Key = check id   {account, amount_minor, description?}
                      → check {id, status:"open", expires_at}    (TTL 300 s default, 30 s … 1 h)
 
-customer's finger    POST /v1/checks/{id}/pay/fingerprint   Idempotency-Key   {format, template}
-                     1. check belongs to caller, is open, not expired, amount ≤ biometric cap
-                     2. identify: matcher → candidates → decision policy (§20.4)
+customer's finger    POST /v1/checks/{id}/pay/fingerprint   Idempotency-Key, X-Terminal-Key
+                     {format, template, payer_phone}
+                     1. check belongs to caller, is open, not expired, amount ≤ biometric cap;
+                        terminal key active for this merchant; probe not a replay; attempts left
+                     2. verify 1:1 against payer_phone's enrolments (or, opt-in, identify 1:N
+                        with the gallery-scaled threshold) → decision policy (§20.4, §20.8)
                      3. payer ≠ merchant; payer's best wallet in the check currency; balance ≥ amount
                      4. payer active, KYC ≥ 1, neither party blocklisted, per-tx AML limit
                      5. post_on: debit payer / credit merchant (− fee) / credit fee shard, with the
@@ -704,6 +724,7 @@ ambiguous_match` and the cashier asks for another finger. The exact matcher scor
 | `PUT /v1/templates/{enrollment_id}` | `{subject, format, template(base64)}` | 2xx |
 | `DELETE /v1/templates/{enrollment_id}` | — | 2xx or 404 |
 | `POST /v1/identify` | `{format, template(base64), limit}` | `{hits:[{enrollment_id, score}]}` |
+| `POST /v1/verify` | `{format, template(base64), enrollment_ids:[…]}` | `{hits:[{enrollment_id, score}]}` |
 | `GET /health` | — | 2xx |
 
 The sidecar owns the in-memory gallery; the database stays the source of truth (hits
@@ -716,8 +737,9 @@ wrong person). Enrolment pushes before commit; a 5xx / timeout is `503 retry_lat
 `BIOMETRIC_MATCHER` = `exact` | `http`, `BIOMETRIC_MATCHER_URL`,
 `BIOMETRIC_MATCHER_TIMEOUT_MS` (2000), `BIOMETRIC_MATCH_THRESHOLD` (40),
 `BIOMETRIC_MATCH_MARGIN` (10), `BIOMETRIC_MAX_MINOR` (200000), `CHECK_TTL_SECS` (300),
-`CHECK_MAX_TTL_SECS` (3600). `GET /v1/config` exposes `biometric_max_minor` and
-`check_ttl_secs` to terminals.
+`CHECK_MAX_TTL_SECS` (3600), `BIOMETRIC_IDENTIFY` (false), `BIOMETRIC_IDENTIFY_SCALE` (10),
+`BIOMETRIC_MAX_ATTEMPTS` (5). `GET /v1/config` exposes `biometric_max_minor`,
+`check_ttl_secs` and `biometric_identify` to terminals.
 
 ### 20.7 What is deliberately not built yet
 
@@ -725,14 +747,79 @@ wrong person). Enrolment pushes before commit; a 5xx / timeout is `503 retry_lat
   scanner-agnostic (template in, ISO/ANSI/raw).
 - **Matcher sidecar** — SourceAFIS (Java) behind §20.5 is the default plan; run it next
   to the API, one instance per site is enough for tens of thousands of templates.
-- **Terminal identity** — terminals authenticate as the merchant user today; a
-  `terminals` table with per-device API keys and a merchant role comes with the first
-  real merchant.
-- **Console** — enrolment / check / event views for support and disputes.
+- ~~Terminal identity~~ — built, see §20.8.
+- **Console** — enrolment / check / event views for support and disputes (terminal
+  registration and revocation are built).
 - Key rotation for `BIOMETRIC_TEMPLATE_KEY` (re-seal in place; the AAD makes rows
   self-describing), liveness / anti-spoof (scanner-dependent), a second factor above a
   configurable amount.
 
+### 20.8 As built — hardening (migration 0024)
+
+The first cut identified the payer 1:N at SourceAFIS's threshold 40, which is the
+**1:1** operating point (FMR ≈ 0.01 %). Searched against N templates the false-match
+rate compounds to ≈ 1 − (1 − 10⁻⁴)ᴺ — about 63 % at N = 10 000, i.e. an unenrolled
+finger usually "matches" somebody and that person pays. And any KYC'd user could act
+as a terminal and replay a captured template. Fixed as follows:
+
+- **1:1 by default.** `POST /v1/checks/{id}/pay/fingerprint` takes `payer_phone`; the
+  probe is compared only with that person's enrolments (`/v1/verify` on the sidecar)
+  at the normal threshold.
+- **1:N only by opt-in** (`BIOMETRIC_IDENTIFY=true`), with a gallery-scaled threshold
+  `BIOMETRIC_MATCH_THRESHOLD + BIOMETRIC_IDENTIFY_SCALE · log10(active enrolments)`
+  (scale 10: SourceAFIS scores ≈ −10·log10 FMR, so the *system-wide* false-match rate
+  stays at the 1:1 operating point).
+- **Terminal identity.** Admin-registered `terminals` per merchant; `X-Terminal-Key`
+  (32 random bytes, stored as SHA-256, constant-time compare, `last_used_at`) is
+  required on top of the merchant's bearer token; revocable from the console.
+- **Replay refusal.** In http mode a probe byte-identical to any earlier probe is refused
+  (`409 probe_replayed`) — a real scanner never produces the same bytes twice, so
+  terminals must rescan per attempt.
+- **Lockout.** After `BIOMETRIC_MAX_ATTEMPTS` (5) failed attempts the check is cancelled
+  (`409 check_locked`); an attempt slot is reserved before the matcher runs, so
+  concurrent probes can't exceed the budget (a request killed mid-attempt keeps its slot,
+  which only makes that check stricter until it expires).
+- **Less disclosure.** `payer_name` is masked ("Bilal S.") everywhere a merchant sees it.
+- `BIOMETRIC_MATCHER=exact` refuses to boot outside dev; enrolment no longer calls the
+  matcher while holding the user's row lock (payments lock that row for AML).
+
+Still open: liveness/anti-spoof (scanner-dependent), template-key rotation, the
+terminal app itself.
+
 ---
 
-*End of draft. Let's review §18 together, settle the open questions, and only then start Phase 0.*
+## 21. Money creation, AML and voids — added in the hardening pass
+
+- **Dual control on deposits (migration 0023).** `POST /v1/deposits` creates a
+  `deposit_requests` row (`202 pending_approval`); a *different* admin approves
+  (`POST /v1/admin/deposits/{id}/approve`) and only then is the ledger transaction
+  posted, with the request's status flip inside the posting lock (single use under
+  concurrency). The approver can be neither the requester nor the wallet owner
+  (`403 dual_control_required`); no admin can fund their own wallet; per-deposit cap
+  `DEPOSIT_MAX_MINOR`; every step lands in `admin_actions`. `DEPOSIT_DUAL_CONTROL=false`
+  is accepted only in dev. KYC review follows the same rule: nobody reviews their own
+  submission.
+- **AML per person, not per wallet.** The rolling 24 h amount and hourly velocity sum
+  every wallet the user owns (converted to TJS at the current rate; a wallet with
+  recent debits and no rate fails closed). Exactness under concurrency: inside the
+  posting transaction, before any wallet is locked, the guard takes the user's row
+  `FOR NO KEY UPDATE`. Lock order is transactions row → user row → wallets (sorted) →
+  system shards (sorted), so it cannot deadlock. From 64 debits in a day a user's
+  per-currency window is stored in `aml_windows` (migration 0030): a running (sum, count)
+  with movable edges, kept current by a statement trigger on `entries`, so the decision
+  equals the full sum at O(1) cost (`crates/api/tests/aml_windows.rs` proves it, under
+  concurrency too); lighter users keep the full sum. One wallet per currency per user (`POST /v1/wallets` returns
+  the existing one).
+- **Recipients** whose user status is not `active` cannot be paid
+  (`403 recipient_unavailable`). Registration creates user, wallet and session in one
+  transaction.
+- **Voids.** `POST /v1/transactions/{id}/void` claims an unused idempotency key as
+  voided (a `transactions` row with no entries + `voided_transactions`); any later
+  money request with that key gets `409 voided`, and if the key had already posted the
+  call returns the posted transaction instead. Clients void before discarding an
+  unsettled payment, so "discard then pay again" can never double-pay. Status lookups
+  use `GET /v1/transactions/{id}` (only the caller's own entries are shown).
+
+---
+
+*Originally the end of the pre-code draft; the sections above record what was built.*

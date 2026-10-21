@@ -53,6 +53,8 @@ import tj.payment.wallet.ui.paycheck.CheckCode
 import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.PositiveGreen
 import tj.payment.wallet.ui.theme.Rust
+import androidx.compose.ui.res.stringResource
+import tj.payment.wallet.R
 
 @Composable
 fun RequestScreen(viewModel: RequestViewModel, onBack: () -> Unit) {
@@ -65,7 +67,7 @@ fun RequestScreen(viewModel: RequestViewModel, onBack: () -> Unit) {
             .imePadding()
             .verticalScroll(rememberScrollState()),
     ) {
-        ScreenHeader(title = "Request payment", onBack = onBack)
+        ScreenHeader(title = stringResource(R.string.request_title), onBack = onBack)
         val check = state.check
         if (check == null) AmountForm(viewModel) else CheckView(check, state, viewModel)
     }
@@ -76,7 +78,7 @@ private fun AmountForm(viewModel: RequestViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     Spacer(Modifier.height(16.dp))
     Text(
-        "Enter the amount. The customer scans the code with their app and confirms with their fingerprint.",
+        stringResource(R.string.request_body),
         style = MaterialTheme.typography.bodyMedium,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
@@ -84,7 +86,7 @@ private fun AmountForm(viewModel: RequestViewModel) {
     OutlinedTextField(
         value = state.amountText,
         onValueChange = viewModel::onAmountChange,
-        label = { Text("Amount, ${state.wallet?.currency ?: "TJS"}") },
+        label = { Text(stringResource(R.string.request_amount_label, state.wallet?.currency ?: "TJS")) },
         singleLine = true,
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
         colors = appFieldColors(),
@@ -94,7 +96,7 @@ private fun AmountForm(viewModel: RequestViewModel) {
     OutlinedTextField(
         value = state.description,
         onValueChange = viewModel::onDescriptionChange,
-        label = { Text("What for (optional)") },
+        label = { Text(stringResource(R.string.request_description_label)) },
         singleLine = true,
         colors = appFieldColors(),
         modifier = Modifier.fillMaxWidth(),
@@ -105,7 +107,7 @@ private fun AmountForm(viewModel: RequestViewModel) {
     }
     Spacer(Modifier.height(20.dp))
     PrimaryButton(
-        text = state.amount?.let { "Request ${it.format()}" } ?: "Request",
+        text = state.amount?.let { stringResource(R.string.request_action_amount, it.format()) } ?: stringResource(R.string.request_action),
         onClick = viewModel::create,
         enabled = state.canCreate,
         loading = state.creating,
@@ -145,13 +147,17 @@ private fun CheckView(check: CheckDto, state: RequestUiState, viewModel: Request
         Spacer(Modifier.height(16.dp))
         when {
             paid -> {
-                Text("PAID", color = PositiveGreen, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+                Text(stringResource(R.string.request_paid), color = PositiveGreen, fontSize = 28.sp, fontWeight = FontWeight.Bold)
                 check.payerName?.let {
-                    Text("by $it", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(stringResource(R.string.request_paid_by, it), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
             !check.isOpen -> Text(
-                check.status.replaceFirstChar { it.uppercase() },
+                when (check.status) {
+                    "cancelled" -> stringResource(R.string.request_status_cancelled)
+                    "expired" -> stringResource(R.string.request_status_expired)
+                    else -> check.status.replaceFirstChar { it.uppercase() }
+                },
                 color = NegativeRed,
                 fontSize = 24.sp,
                 fontWeight = FontWeight.Bold,
@@ -165,7 +171,10 @@ private fun CheckView(check: CheckDto, state: RequestUiState, viewModel: Request
                 )
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    "Waiting for the customer… expires in ${state.secondsLeft / 60}:${"%02d".format(state.secondsLeft % 60)}",
+                    stringResource(
+                        R.string.request_waiting,
+                        "${state.secondsLeft / 60}:${"%02d".format(state.secondsLeft % 60)}",
+                    ),
                     style = MaterialTheme.typography.bodyMedium,
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -191,7 +200,7 @@ private fun CheckView(check: CheckDto, state: RequestUiState, viewModel: Request
                 color = MaterialTheme.colorScheme.onSurface,
             )
             Text(
-                if (copied) "Copied" else "Check code — tap to copy",
+                stringResource(if (copied) R.string.receive_copied else R.string.request_code_tap_to_copy),
                 fontSize = 11.sp,
                 color = if (copied) PositiveGreen else Rust,
             )
@@ -199,16 +208,16 @@ private fun CheckView(check: CheckDto, state: RequestUiState, viewModel: Request
     }
     Spacer(Modifier.height(16.dp))
     if (paid) {
-        KeyValueRow("Transaction", check.transactionId?.take(8)?.let { "$it…" } ?: "—")
+        KeyValueRow(stringResource(R.string.request_transaction), check.transactionId?.take(8)?.let { "$it…" } ?: "—")
     }
     Spacer(Modifier.height(8.dp))
     if (check.isOpen) {
         TextButton(onClick = viewModel::cancel, enabled = !state.cancelling, modifier = Modifier.fillMaxWidth()) {
-            Text("Cancel this request", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(stringResource(R.string.request_cancel), color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
     PrimaryButton(
-        text = if (check.isOpen) "New request" else "Done",
+        text = stringResource(if (check.isOpen) R.string.request_new else R.string.action_done),
         onClick = viewModel::newRequest,
         modifier = Modifier.fillMaxWidth(),
     )

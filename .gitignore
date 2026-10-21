@@ -22,9 +22,16 @@ kyc-documents/
 .env.*
 !.env.prod.example
 
-# Deployment state that lives only on the server
+# Deployment state that lives only on the server (never commit: secrets, the
+# per-install settings, their backups made by upgrade-hardening.sh)
 deploy/secrets/
 deploy/backups/
+deploy/app.env
+deploy/app.env.bak-*
+deploy/.env.bak-*
+# age/gpg private keys must never land in the tree, wherever they are dropped
+*.age-identity
+backup_age_identity
 
 # Editors / OS
 .idea/

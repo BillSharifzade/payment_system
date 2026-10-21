@@ -31,21 +31,27 @@ groups:
             A signed checkpoint failed the independent re-verification. Treat as a
             security incident: preserve the database and logs before acting.
 
-      - alert: NoCheckpointsSealed
-        # The sealer only logs this line when it sealed at least one batch, so a
-        # genuinely idle ledger (no transactions for 15 min) also fires this. It
-        # is a liveness hint; the precise signal is the Prometheus alert
-        # LedgerSealingLagging (ledger_oldest_unsealed_age_seconds > 300).
+      # (NoCheckpointsSealed was removed: absence of a "sealed new checkpoints"
+      # line also fired on every idle ledger. The precise signal is the age of
+      # the oldest UNSEALED transaction — Prometheus alerts UnsealedBacklogAging
+      # and LedgerSealingLagging in prometheus-rules.yml.)
+
+  - name: payment-backups
+    interval: 1m
+    rules:
+      - alert: BackupErrorLogged
+        # The sidecars log "ERROR:" on every failed stage (dump, archive,
+        # encryption, off-box copy). Prometheus' BackupStale/BackupFailed are
+        # the authoritative alerts; this one carries the error text sooner.
         expr: |
-          absent_over_time({project="payment", service="payment-workers"} |= "sealed new checkpoints" [15m]) == 1
+          sum by (service) (count_over_time({project="payment", service=~"postgres-backup|kyc-backup"} |= "ERROR:" [10m])) > 0
         labels:
           severity: warning
         annotations:
-          summary: "No 'sealed new checkpoints' log line for 15 minutes"
+          summary: "{{ $labels.service }} logged a backup ERROR"
           description: >-
-            payment-workers has not sealed a checkpoint in 15 minutes. Check
-            `docker compose logs payment-workers` and the ledger_unsealed_transactions
-            metric: harmless when there was no traffic, an outage otherwise.
+            docker compose logs --tail=100 {{ $labels.service }} — a backup that
+            fails keeps failing until fixed; the sidecar retries hourly.
 
   - name: payment-containers
     interval: 1m

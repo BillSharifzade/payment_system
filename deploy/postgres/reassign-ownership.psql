@@ -1,0 +1,91 @@
+-- Transfer every object in schema public to payment_owner (psql script, run
+-- as the bootstrap superuser by upgrade-hardening.sh; idempotent).
+--
+-- Installs deployed before the role split ran migrations as the superuser
+-- `payment`, so the schema belongs to it. `REASSIGN OWNED BY payment` cannot
+-- be used: in the official image that role is the bootstrap superuser and also
+-- owns the system catalogs. So objects are moved one by one, public schema
+-- only, extension members excluded. Indexes and column-owned sequences follow
+-- their table automatically.
+
+SET client_min_messages = warning;
+-- Each ALTER takes an ACCESS EXCLUSIVE lock for an instant; do not queue
+-- behind a long transaction forever (re-run the upgrade if this trips).
+SET lock_timeout = '30s';
+
+DO $reassign$
+DECLARE
+    r record;
+    n int := 0;
+BEGIN
+    -- tables, partitioned tables, views, materialized views, foreign tables
+    FOR r IN
+        SELECT c.oid::regclass AS obj,
+               CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW'
+                              WHEN 'f' THEN 'FOREIGN TABLE' ELSE 'TABLE' END AS kind
+        FROM pg_class c JOIN pg_namespace ns ON ns.oid = c.relnamespace
+        WHERE ns.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+          AND pg_get_userbyid(c.relowner) <> 'payment_owner'
+          AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                          WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')
+    LOOP
+        EXECUTE format('ALTER %s %s OWNER TO payment_owner', r.kind, r.obj);
+        n := n + 1;
+    END LOOP;
+
+    -- standalone sequences (BIGSERIAL ones moved with their table above)
+    FOR r IN
+        SELECT c.oid::regclass AS obj
+        FROM pg_class c JOIN pg_namespace ns ON ns.oid = c.relnamespace
+        WHERE ns.nspname = 'public' AND c.relkind = 'S'
+          AND pg_get_userbyid(c.relowner) <> 'payment_owner'
+          AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                          WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+                            AND d.deptype IN ('a', 'i', 'e'))
+    LOOP
+        EXECUTE format('ALTER SEQUENCE %s OWNER TO payment_owner', r.obj);
+        n := n + 1;
+    END LOOP;
+
+    -- functions, procedures, aggregates (e.g. trigger functions)
+    FOR r IN
+        SELECT p.oid::regprocedure AS obj,
+               CASE p.prokind WHEN 'p' THEN 'PROCEDURE' WHEN 'a' THEN 'AGGREGATE' ELSE 'FUNCTION' END AS kind
+        FROM pg_proc p JOIN pg_namespace ns ON ns.oid = p.pronamespace
+        WHERE ns.nspname = 'public'
+          AND pg_get_userbyid(p.proowner) <> 'payment_owner'
+          AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                          WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e')
+    LOOP
+        EXECUTE format('ALTER %s %s OWNER TO payment_owner', r.kind, r.obj);
+        n := n + 1;
+    END LOOP;
+
+    -- enums, domains, ranges and standalone composite types (not table row
+    -- types, not array types — those follow their base)
+    FOR r IN
+        SELECT t.oid::regtype AS obj, CASE t.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END AS kind
+        FROM pg_type t JOIN pg_namespace ns ON ns.oid = t.typnamespace
+        WHERE ns.nspname = 'public' AND t.typtype IN ('e', 'd', 'r', 'c')
+          AND (t.typtype <> 'c' OR (SELECT c.relkind FROM pg_class c WHERE c.oid = t.typrelid) = 'c')
+          AND pg_get_userbyid(t.typowner) <> 'payment_owner'
+          AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                          WHERE d.classid = 'pg_type'::regclass AND d.objid = t.oid AND d.deptype = 'e')
+    LOOP
+        EXECUTE format('ALTER %s %s OWNER TO payment_owner', r.kind, r.obj);
+        n := n + 1;
+    END LOOP;
+
+    RAISE WARNING 'reassign-ownership: % object(s) moved to payment_owner', n;
+END
+$reassign$;
+
+-- PG 15+ default: the schema belongs to whoever owns the database
+-- (payment_owner since roles.psql).
+ALTER SCHEMA public OWNER TO pg_database_owner;
+
+-- Report what is still not owned by payment_owner (should be nothing).
+SELECT c.relkind, c.oid::regclass AS not_moved
+FROM pg_class c JOIN pg_namespace ns ON ns.oid = c.relnamespace
+WHERE ns.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+  AND pg_get_userbyid(c.relowner) <> 'payment_owner';

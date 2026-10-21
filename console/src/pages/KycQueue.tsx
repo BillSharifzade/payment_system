@@ -8,6 +8,7 @@ import {
   isAbort,
   rejectKyc,
 } from "../api";
+import { useAdminId } from "../auth";
 import { useOps } from "../ops";
 import {
   Ago,
@@ -28,6 +29,13 @@ type QueueStatus = "pending" | "approved" | "rejected";
 
 /** Rows per request; the next page is keyed off the last row's cursor. */
 const PAGE_SIZE = 50;
+
+/** Sharper copy for the codes a KYC decision can fail with (contract §4). */
+export const KYC_ERROR_COPY: Record<string, string> = {
+  dual_control_required:
+    "Dual control: you cannot approve or reject your own KYC submission. Another admin must decide it.",
+  conflict: "This submission was already decided — reload the queue.",
+};
 
 // The document endpoint requires the admin Bearer token, which <img>/<iframe>
 // src requests never carry — so fetch the bytes with auth and render a blob URL.
@@ -64,9 +72,9 @@ function DocumentViewer({ documentRef }: { documentRef: string }) {
   return documentRef.endsWith(".pdf") ? (
     // Sandboxed WITHOUT allow-same-origin: the blob: URL is same-origin with
     // the console, so an un-sandboxed frame would let a malicious PDF that
-    // ever achieved script execution in the viewer read sessionStorage and
-    // lift the admin tokens. allow-scripts alone is what Chrome's PDF viewer
-    // needs to run; the frame's origin stays opaque.
+    // ever achieved script execution in the viewer reach into the console's
+    // window and act as the signed-in admin. allow-scripts alone is what
+    // Chrome's PDF viewer needs to run; the frame's origin stays opaque.
     <iframe
       className="docframe docframe-pdf"
       sandbox="allow-scripts"
@@ -88,6 +96,9 @@ function ReviewModal({
   onDone: () => void;
 }) {
   const toast = useToast();
+  const me = useAdminId();
+  // The server refuses self-review (403 dual_control_required); say so up front.
+  const own = me !== null && submission.user_id === me;
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -101,7 +112,7 @@ function ReviewModal({
       onDone();
       onClose();
     } catch (e) {
-      setError(describeError(e));
+      setError(describeError(e, KYC_ERROR_COPY));
     } finally {
       setBusy(false);
     }
@@ -109,14 +120,7 @@ function ReviewModal({
 
   return (
     <Modal title={`KYC review — ${submission.full_name}`} onClose={onClose} wide>
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "minmax(280px, 1.4fr) minmax(240px, 1fr)",
-          gap: "1.25rem",
-          alignItems: "start",
-        }}
-      >
+      <div className="review-grid">
         <DocumentViewer documentRef={submission.document_ref} />
         <div>
           <dl className="kv">
@@ -140,11 +144,16 @@ function ReviewModal({
             </dd>
           </dl>
 
+          {submission.status === "pending" && own && (
+            <Alert kind="warning" title="This is your own submission">
+              Dual control: another admin must approve or reject it.
+            </Alert>
+          )}
           {submission.status === "pending" ? (
-            <div style={{ marginTop: "1.25rem", display: "flex", flexDirection: "column", gap: "0.6rem" }}>
+            <div className="decision">
               <ConfirmButton
                 className="approve"
-                disabled={busy}
+                disabled={busy || own}
                 confirmLabel={`Confirm: approve ${submission.full_name} to level ${submission.requested_level}?`}
                 onConfirm={() =>
                   act(
@@ -160,12 +169,13 @@ function ReviewModal({
                 <input
                   placeholder="e.g. document unreadable"
                   value={reason}
+                  disabled={own}
                   onChange={(e) => setReason(e.target.value)}
                 />
               </label>
               <button
                 className="danger"
-                disabled={busy || reason.trim().length < 3}
+                disabled={busy || own || reason.trim().length < 3}
                 onClick={() =>
                   act(
                     () => rejectKyc(submission.id, reason.trim()),
@@ -177,7 +187,7 @@ function ReviewModal({
               </button>
             </div>
           ) : (
-            <div style={{ marginTop: "1rem" }}>
+            <div className="mt-1">
               <Badge tone={submission.status === "approved" ? "ok" : "bad"}>
                 {submission.status}
               </Badge>
@@ -308,7 +318,7 @@ export default function KycQueue() {
 
       <div className="table-wrap">
         {items === null ? (
-          <div style={{ padding: "1rem", display: "flex", flexDirection: "column", gap: "0.7rem" }}>
+          <div className="skeleton-stack">
             <Skeleton w="100%" h={18} />
             <Skeleton w="85%" h={18} />
             <Skeleton w="92%" h={18} />

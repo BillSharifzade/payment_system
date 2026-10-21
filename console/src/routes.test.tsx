@@ -61,6 +61,23 @@ describe("auth gate", () => {
     expect(host.querySelector("nav.topnav")).not.toBeNull();
   });
 
+  it("routes the new Approvals and Terminals pages, with nav entries", async () => {
+    setAuthed(true);
+    const router = await mount(routes, "/deposits");
+    expect(host.textContent).toContain("Deposit approvals");
+    expect(host.querySelector('nav.topnav a[href="/deposits"]')).not.toBeNull();
+    expect(host.querySelector('nav.topnav a[href="/terminals"]')).not.toBeNull();
+    await act(async () => {
+      await router.navigate("/terminals");
+    });
+    expect(host.textContent).toContain("Fingerprint terminals");
+  });
+
+  it("tells the operator on the login page that sessions are memory-only", async () => {
+    await mount(routes, "/login");
+    expect(host.textContent).toMatch(/reloading or closing the tab signs you\s+out/);
+  });
+
   it("drops to /login with the notice when the session ends mid-visit", async () => {
     setAuthed(true);
     const router = await mount(routes, "/users");

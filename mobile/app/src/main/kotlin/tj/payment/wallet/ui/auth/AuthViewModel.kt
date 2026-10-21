@@ -8,7 +8,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import tj.payment.core.ApiOutcome
 import tj.payment.wallet.data.AuthRepository
-import tj.payment.wallet.ui.OFFLINE_MESSAGE
 import tj.payment.wallet.ui.userMessage
 
 enum class AuthMode { LOGIN, REGISTER }
@@ -57,7 +56,7 @@ class AuthViewModel(private val repo: AuthRepository) : ViewModel() {
             _state.value = when (outcome) {
                 is ApiOutcome.Ok -> _state.value.copy(submitting = false, authenticated = true)
                 is ApiOutcome.Failed -> _state.value.copy(submitting = false, error = outcome.userMessage())
-                is ApiOutcome.Offline -> _state.value.copy(submitting = false, error = OFFLINE_MESSAGE)
+                is ApiOutcome.Offline -> _state.value.copy(submitting = false, error = outcome.userMessage())
             }
         }
     }

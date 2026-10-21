@@ -1,8 +1,9 @@
 # pgBackRest configuration for the WAL-archiving overlay
-# (docker-compose.wal-archive.yml). Copy to deploy/secrets/pgbackrest.conf,
-# fill in the S3 placeholders, chmod 644 (the postgres container user must read
-# it; the secrets/ directory itself is 0700). It contains credentials and the
-# encryption passphrase: it is a secret, never commit it.
+# (docker-compose.wal-archive.yml). Copy to deploy/secrets/pgbackrest.conf and
+# fill in the S3 placeholders; deploy.sh gives it the same permissions as every
+# other secret (0640, group SECRETS_GID, which the postgres container runs
+# with). It contains credentials and the encryption passphrase: it is a
+# secret, never commit it, and escrow repo1-cipher-pass off the box.
 #
 # Repository layout in the bucket: <repo1-path>/archive/payment/... (WAL) and
 # <repo1-path>/backup/payment/... (base backups). Everything is encrypted
@@ -46,3 +47,5 @@ compress-level=3
 pg1-path=/var/lib/postgresql/data
 pg1-port=5432
 pg1-socket-path=/var/run/postgresql
+# The cluster's superuser (there is no `postgres` role: POSTGRES_USER=payment).
+pg1-user=payment

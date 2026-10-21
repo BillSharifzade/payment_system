@@ -11,6 +11,9 @@ pub enum MoneyError {
     #[error("invalid currency code: {0:?}")]
     InvalidCurrencyCode(String),
 
+    #[error("currency exponent {0} exceeds the maximum of {max}", max = crate::MAX_EXPONENT)]
+    InvalidExponent(u8),
+
     #[error("could not parse {input:?} as an amount in {currency}")]
     ParseError { input: String, currency: Currency },
 

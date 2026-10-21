@@ -50,6 +50,9 @@ import tj.payment.wallet.ui.appFieldColors
 import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.PositiveGreen
 import tj.payment.wallet.ui.theme.Rust
+import androidx.compose.ui.res.stringResource
+import tj.payment.wallet.R
+import tj.payment.wallet.ui.Copy
 
 @Composable
 fun KycScreen(
@@ -93,7 +96,7 @@ fun KycScreen(
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp),
     ) {
-        ScreenHeader(title = "Identity", onBack = onBack)
+        ScreenHeader(title = stringResource(R.string.kyc_title), onBack = onBack)
 
         when {
             state.loading -> Box(
@@ -107,37 +110,34 @@ fun KycScreen(
 
             state.verified -> StatusPanel(
                 tint = PositiveGreen,
-                title = "Verified",
-                body = "Your identity is confirmed (level ${state.kycLevel}). " +
-                    "You can send money and exchange currency.",
+                title = stringResource(R.string.kyc_verified_title),
+                body = stringResource(R.string.kyc_verified_body, state.kycLevel ?: 0),
             )
 
             state.underReview -> StatusPanel(
                 tint = Rust,
-                title = "Under review",
-                body = "We received your document and it's being checked. " +
-                    "This usually takes less than a day — no need to resubmit.",
+                title = stringResource(R.string.kyc_review_title),
+                body = stringResource(R.string.kyc_review_body),
             )
 
             else -> {
                 if (state.submissionStatus == "rejected") {
                     StatusPanel(
                         tint = NegativeRed,
-                        title = "Verification declined",
-                        body = "Your previous submission wasn't accepted. " +
-                            "Check the document is sharp, complete and matches your name, then try again.",
+                        title = stringResource(R.string.kyc_declined_title),
+                        body = stringResource(R.string.kyc_declined_body),
                     )
                     Spacer(Modifier.height(20.dp))
                 }
 
                 Text(
-                    "One-time identity check",
+                    stringResource(R.string.kyc_form_title),
                     style = MaterialTheme.typography.titleLarge,
                     color = MaterialTheme.colorScheme.onBackground,
                 )
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "Enter your name exactly as in your document and attach a clear photo of it.",
+                    stringResource(R.string.kyc_form_body),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -146,7 +146,7 @@ fun KycScreen(
                 OutlinedTextField(
                     value = state.fullName,
                     onValueChange = viewModel::onNameChange,
-                    label = { Text("Full name (as in document)") },
+                    label = { Text(stringResource(R.string.kyc_full_name)) },
                     singleLine = true,
                     shape = RoundedCornerShape(14.dp),
                     colors = appFieldColors(),
@@ -156,7 +156,7 @@ fun KycScreen(
 
                 // Document kind: two honest options, no dropdown ceremony.
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    for ((value, label) in listOf("passport" to "Passport", "id_card" to "ID card")) {
+                    for ((value, labelRes) in listOf("passport" to R.string.kyc_doc_passport, "id_card" to R.string.kyc_doc_id_card)) {
                         val selected = state.documentType == value
                         OutlinedButton(
                             onClick = { viewModel.onDocumentType(value) },
@@ -165,14 +165,14 @@ fun KycScreen(
                                 containerColor = if (selected) Rust.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surface,
                                 contentColor = if (selected) Rust else MaterialTheme.colorScheme.onSurfaceVariant,
                             ),
-                        ) { Text(label) }
+                        ) { Text(stringResource(labelRes)) }
                     }
                 }
                 Spacer(Modifier.height(14.dp))
 
                 if (state.documentRef == null) {
                     PrimaryButton(
-                        text = "Attach document photo",
+                        text = stringResource(R.string.kyc_attach),
                         onClick = { pickDocument.launch("image/*") },
                         loading = state.uploading,
                         modifier = Modifier.fillMaxWidth(),
@@ -186,7 +186,7 @@ fun KycScreen(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            "Document attached",
+                            stringResource(R.string.kyc_attached),
                             style = MaterialTheme.typography.titleMedium,
                             fontSize = 14.sp,
                             color = PositiveGreen,
@@ -194,7 +194,7 @@ fun KycScreen(
                         )
                         androidx.compose.material3.TextButton(
                             onClick = { pickDocument.launch("image/*") },
-                        ) { Text("Replace", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                        ) { Text(stringResource(R.string.kyc_replace), color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     }
                 }
 
@@ -205,7 +205,7 @@ fun KycScreen(
 
                 Spacer(Modifier.height(24.dp))
                 PrimaryButton(
-                    text = "Submit for review",
+                    text = stringResource(R.string.kyc_submit),
                     onClick = viewModel::submit,
                     enabled = state.canSubmit,
                     loading = state.submitting,
@@ -238,9 +238,9 @@ private fun readDocument(resolver: ContentResolver, uri: Uri): PickedDocument {
         resolver.openInputStream(uri)?.use { readBounded(it, max, initialCapacity = declared) }
     } catch (_: Exception) {
         null
-    } ?: return PickedDocument.Rejected("Couldn't read that file. Try another one.")
+    } ?: return PickedDocument.Rejected(Copy.text(R.string.kyc_error_unreadable))
     if (bytes.size > max) return PickedDocument.Rejected(KycViewModel.DOCUMENT_TOO_LARGE)
-    if (bytes.isEmpty()) return PickedDocument.Rejected("That file is empty. Try another one.")
+    if (bytes.isEmpty()) return PickedDocument.Rejected(Copy.text(R.string.kyc_error_empty))
     return PickedDocument.Ready(bytes, resolver.getType(uri) ?: "image/jpeg")
 }
 

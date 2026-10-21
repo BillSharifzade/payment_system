@@ -7,6 +7,7 @@ target/
 .claude/
 scratchpad/
 mobile/
+scripts/
 kyc-documents/
 console/node_modules/
 console/dist/

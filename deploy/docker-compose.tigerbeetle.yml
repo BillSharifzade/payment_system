@@ -1,0 +1,111 @@
+# OPT-IN overlay: LEDGER_BACKEND=tigerbeetle (DESIGN.md §15). Balances and the
+# no-overdraft rule move to a TigerBeetle replica; everything else (users, the
+# journal, idempotency, the outbox, guards) stays in Postgres. Layered on the
+# prod (or lan) file; builds the image with TigerBeetle's native client
+# (Dockerfile build arg TIGERBEETLE=1: Zig + libclang in the builder stage).
+#
+# One cluster belongs to one database, for good. First time (deploy/README.md,
+# "TigerBeetle"; with money already in Postgres, follow its cut-over instead):
+#
+#   1. deploy/.env: COMPOSE_FILE=docker-compose.prod.yml:docker-compose.tigerbeetle.yml
+#      (keep your other overlays) and TIGERBEETLE_CLUSTER_ID=<a fresh random
+#      u128, e.g. `python3 -c 'import uuid; print(uuid.uuid4().int)'`>
+#   2. docker compose run --rm --no-deps tigerbeetle format \
+#        --cluster="$TIGERBEETLE_CLUSTER_ID" --replica=0 --replica-count=1 /data/0_0.tigerbeetle
+#   3. ./deploy.sh
+#
+# Never format over an existing data file: the servers refuse to start on a
+# cluster that lacks the database's wallets, but the balances would be gone.
+# Back up the tigerbeetledata volume with the replica stopped (it is one file).
+#
+# The client resolves no host names (TigerBeetle 0.16 client), so the replica
+# has a fixed address on a network of its own: TIGERBEETLE_SUBNET /
+# TIGERBEETLE_IP if the defaults collide with a local network.
+#
+# Memory: the replica allocates everything at start. Measured (0.17.9, this
+# --cache-grid): 2.3 GiB resident. That does not fit next to the prod stack on
+# a 4 GB box; give it 8 GB, or run the replica on its own host.
+name: payment
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+      labels: "com.docker.compose.service,com.docker.compose.project"
+
+x-tigerbeetle-env: &tigerbeetle-env
+  LEDGER_BACKEND: tigerbeetle
+  TIGERBEETLE_CLUSTER_ID: ${TIGERBEETLE_CLUSTER_ID:?set TIGERBEETLE_CLUSTER_ID in deploy/.env (the id the data file was formatted with)}
+  TIGERBEETLE_ADDRESSES: ${TIGERBEETLE_IP:-172.31.250.2}:3000
+
+services:
+  tigerbeetle:
+    # Official image (alpine + tini + the static binary), multi-arch index digest.
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.17.9@sha256:48f623f9c1e9b6cc44d77ca93634595ae99cce3246ded418763eb1a62eee45e9
+    restart: unless-stopped
+    <<: *logging
+    # io_uring is TigerBeetle's only I/O path, and Docker >= 25 blocks it in the
+    # default seccomp profile (TigerBeetle's own Docker guide sets the same).
+    # Capabilities stay dropped; the image runs as root only so the replica can
+    # write the volume Docker creates root-owned.
+    security_opt: ["seccomp=unconfined", "no-new-privileges:true"]
+    cap_drop: [ALL]
+    read_only: true
+    command:
+      - start
+      - --addresses=0.0.0.0:3000
+      - --cache-grid=${TIGERBEETLE_CACHE_GRID:-256MiB}
+      - /data/0_0.tigerbeetle
+    volumes:
+      - tigerbeetledata:/data
+    networks:
+      tigerbeetle:
+        ipv4_address: ${TIGERBEETLE_IP:-172.31.250.2}
+    healthcheck:
+      # A TCP probe (busybox nc): a client-protocol probe would register a
+      # session in the cluster's client table on every check.
+      test: ["CMD", "nc", "-z", "-w", "2", "127.0.0.1", "3000"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+          pids: 64
+
+  # Networks merge with the base file's; the build section is spelled out whole so
+  # the lan file (which loads images built elsewhere) gets the right context too.
+  payment-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        TIGERBEETLE: "1"
+    environment:
+      <<: *tigerbeetle-env
+    networks: [tigerbeetle]
+    depends_on:
+      tigerbeetle: { condition: service_healthy }
+
+  payment-workers:
+    environment:
+      <<: *tigerbeetle-env
+    networks: [tigerbeetle]
+    depends_on:
+      tigerbeetle: { condition: service_healthy }
+
+networks:
+  # The replica and the two app services only; no egress.
+  tigerbeetle:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${TIGERBEETLE_SUBNET:-172.31.250.0/29}
+
+volumes:
+  tigerbeetledata:

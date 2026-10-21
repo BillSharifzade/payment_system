@@ -1,9 +1,13 @@
 # CI for the payment system: Rust (lint + unit + integration against real
-# Postgres/Redis/NATS), supply chain, the admin console, both container images
-# and the Android app's JVM tests.
+# Postgres/Redis/NATS), the database role model, supply chain (cargo-deny,
+# secret scan, image vulnerability scan), the admin console, the container
+# images with an end-to-end backup/restore drill, the deploy tooling and the
+# Android app's JVM tests.
 #
 # Third-party actions are pinned to full commit SHAs (the version in the comment
-# is what the SHA resolves to); bump deliberately.
+# is what the SHA resolves to); tools that run as containers are pinned by image
+# digest (scripts/image-digest.sh resolves a tag). Bump deliberately.
+# Service and tool images match production (deploy/docker-compose.prod.yml).
 name: CI
 
 on:
@@ -21,6 +25,20 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Same images as production.
+  PG_IMAGE: postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+  NATS_IMAGE: nats:2.11.17-alpine@sha256:e4bf19f15fd3218814a4e3c9e0064e1334bd8aa20d5984b9f1a0afd084f8cc00
+  # Tools.
+  SHELLCHECK_IMAGE: koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
+  ACTIONLINT_IMAGE: rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+  PROMETHEUS_IMAGE: prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+  ALERTMANAGER_IMAGE: prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
+  CADDY_IMAGE: caddy:2.11.7@sha256:f2a1290d0463aad60660d4ec134943f183ee2a5f6c3eb7bf32dd984f2f020772
+  TRIVY_IMAGE: aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  # Builds TigerBeetle's native client (the `tigerbeetle` features); as in tigerbeetle.yml.
+  ZIG_VERSION: "0.14.1"
+  ZIG_SHA256: 24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
 
 jobs:
   rust:
@@ -30,7 +48,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
         env:
           POSTGRES_USER: payment
           POSTGRES_PASSWORD: payment_dev_pw
@@ -43,7 +61,7 @@ jobs:
           --health-timeout 3s
           --health-retries 20
       redis:
-        image: redis:7-alpine
+        image: redis:7.4.11-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
         ports:
           - 6379:6379
         options: >-
@@ -53,7 +71,7 @@ jobs:
           --health-retries 20
       nats:
         # JetStream is required: the workers create the PAYMENTS stream.
-        image: nats:2-alpine
+        image: nats:2.11.17-alpine@sha256:e4bf19f15fd3218814a4e3c9e0064e1334bd8aa20d5984b9f1a0afd084f8cc00
         ports:
           - 4222:4222
           - 8222:8222
@@ -82,14 +100,15 @@ jobs:
 
       # GitHub's `services:` cannot pass a command, and the nats image only
       # enables JetStream with the `-js` flag — so the service container is
-      # replaced by one started with the flag before the integration lane.
+      # replaced by one (same pinned image) started with the flag.
       - name: Enable JetStream on the NATS service
+        env:
+          NATS_SERVICE_ID: ${{ job.services.nats.id }}
         run: |
           set -euo pipefail
-          id=$(docker ps -q --filter "ancestor=nats:2-alpine" | head -n1)
-          docker rm -f "$id" >/dev/null
-          docker run -d --name nats-js -p 4222:4222 -p 8222:8222 nats:2-alpine -js -m 8222 >/dev/null
-          for i in $(seq 1 30); do
+          docker rm -f "$NATS_SERVICE_ID" >/dev/null
+          docker run -d --name nats-js -p 4222:4222 -p 8222:8222 "$NATS_IMAGE" -js -m 8222 >/dev/null
+          for _ in $(seq 1 30); do
             wget -q -O /dev/null "http://127.0.0.1:8222/healthz?js-enabled-only=true" && break
             sleep 1
           done
@@ -97,6 +116,20 @@ jobs:
 
       - name: Format check
         run: cargo fmt --all -- --check
+
+      # `--all-features` includes LEDGER_BACKEND=tigerbeetle's native client (the api and
+      # workers `tigerbeetle` features), which compiles with Zig and the runner's libclang:
+      # the same pinned Zig step as tigerbeetle.yml, so the lint below covers every feature on
+      # every PR. Everything else here builds without it.
+      - name: Zig ${{ env.ZIG_VERSION }} (builds TigerBeetle's native client)
+        run: |
+          set -euo pipefail
+          archive="zig-x86_64-linux-$ZIG_VERSION"
+          curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" "https://ziglang.org/download/$ZIG_VERSION/$archive.tar.xz"
+          echo "$ZIG_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          rm "$RUNNER_TEMP/zig.tar.xz"
+          echo "ZIG_PATH=$RUNNER_TEMP/$archive/zig" >> "$GITHUB_ENV"
 
       - name: Clippy (warnings = errors)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -116,6 +149,32 @@ jobs:
       - name: Release build (what the image ships)
         run: cargo build --release --locked --bin payment-server --bin payment-workers
 
+  db-roles:
+    name: Database roles — migrations as payment_owner, payment_app least privilege
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+        env:
+          POSTGRES_USER: payment
+          POSTGRES_PASSWORD: payment_dev_pw
+          POSTGRES_DB: payment
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U payment -d payment"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # psql 16 from the production image (\getenv needs psql >= 15).
+      - name: deploy/postgres/10-roles.sh + every migration as payment_owner + payment_app denials
+        run: |
+          docker run --rm --network host -v "$PWD:/repo:ro" -w /repo --entrypoint bash "$PG_IMAGE" \
+            scripts/test-db-grants.sh postgres://payment:payment_dev_pw@127.0.0.1:5432/postgres payment_grants
+
   deny:
     name: Supply chain — cargo-deny
     runs-on: ubuntu-latest
@@ -130,6 +189,20 @@ jobs:
           # pins 1.98, so the matching toolchain must be installed there too.
           rust-version: "1.98"
 
+  secrets:
+    name: Supply chain — secret scan (full history)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Scan every commit for credentials
+        run: |
+          # Same uid as the checkout, so git inside the container trusts the repo.
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/repo:ro" -w /repo "$GITLEAKS_IMAGE" \
+            git /repo --config /repo/scripts/gitleaks.toml --redact --no-banner --verbose --exit-code 1
+
   console:
     name: Admin console — lint, test, build, audit
     runs-on: ubuntu-latest
@@ -141,7 +214,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          # Same Node as deploy/Dockerfile.console builds the console with.
+          node-version: 22.23.3
           cache: npm
           cache-dependency-path: console/package-lock.json
       - run: npm ci --no-audit --no-fund
@@ -151,10 +225,46 @@ jobs:
       - name: Runtime dependency audit
         run: npm audit --omit=dev --audit-level=high
 
-  docker:
-    name: Container images
+  ops-lint:
+    name: Deploy tooling — shellcheck, actionlint, Prometheus/Alertmanager/Caddy configs
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: shellcheck (every tracked shell script)
+        run: |
+          mapfile -t scripts < <(git ls-files '*.sh' | grep -v '^mobile/')
+          printf '%s\n' "${scripts[@]}"
+          docker run --rm -v "$PWD:/mnt:ro" -w /mnt "$SHELLCHECK_IMAGE" -x "${scripts[@]}"
+          for s in "${scripts[@]}"; do bash -n "$s"; done
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo:ro" -w /repo "$ACTIONLINT_IMAGE" -color
+      - name: promtool — rules, rule unit tests, config
+        run: |
+          docker run --rm -v "$PWD/deploy/monitoring:/m:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" check rules /m/prometheus-rules.yml
+          docker run --rm -v "$PWD/deploy/monitoring:/m:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" test rules /m/tests/prometheus-rules.test.yml
+          docker run --rm -v "$PWD/deploy/monitoring:/m:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" check config /m/prometheus.yml
+      - name: amtool — config and routing (Watchdog -> heartbeat only)
+        run: |
+          am() { docker run --rm -v "$PWD/deploy/monitoring:/m:ro" --entrypoint amtool "$ALERTMANAGER_IMAGE" "$@"; }
+          am check-config /m/alertmanager.yml
+          test "$(am config routes test --config.file=/m/alertmanager.yml alertname=Watchdog severity=none)" = heartbeat
+          test "$(am config routes test --config.file=/m/alertmanager.yml alertname=BackupStale severity=critical)" = ops-webhook
+      - name: Caddyfile — validate the address/allowlist/upstream shapes the compose files use
+        run: |
+          cv() {
+            docker run --rm -e SITE_ADDRESS="$1" -e ADMIN_ALLOW_CIDR="$2" -e API_UPSTREAMS="$3" \
+              -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" "$CADDY_IMAGE" \
+              caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          }
+          cv ":80" "203.0.113.7/32" "payment-payment-server-1:8080"
+          cv "payments.example.com" "203.0.113.7/32 10.8.0.0/24" "payment-payment-server-1:8080 payment-payment-server-2:8080"
+          cv "http://:80, http://:8099" "192.168.1.0/24" "payment-payment-server-1:8080"
+
+  docker:
+    name: Container images — build, scan, compose, end-to-end restore drill
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -164,29 +274,103 @@ jobs:
           context: .
           file: deploy/Dockerfile
           push: false
+          load: true
           tags: payment-system:ci
           cache-from: type=gha,scope=payment-system
           cache-to: type=gha,scope=payment-system,mode=max
-      - name: payment-console (Vite build + Caddy)
+      - name: payment-console (Vite build + non-root Caddy)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/Dockerfile.console
           push: false
+          load: true
           tags: payment-console:ci
           cache-from: type=gha,scope=payment-console
           cache-to: type=gha,scope=payment-console,mode=max
-      - name: Compose files parse
+      - name: payment-backup (pg_dump + age + gnupg + rclone)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: deploy/backup
+          push: false
+          load: true
+          tags: payment-backup:ci
+          cache-from: type=gha,scope=payment-backup
+          cache-to: type=gha,scope=payment-backup,mode=max
+
+      - name: Vulnerability scan (fixable HIGH/CRITICAL fail the build)
         run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/scan"
+          for img in payment-system payment-console payment-backup; do
+            docker save "$img:ci" -o "$RUNNER_TEMP/scan/$img.tar"
+            echo "::group::trivy $img"
+            docker run --rm -v "$RUNNER_TEMP/scan:/scan:ro" -v "$PWD/deploy/trivyignore:/trivyignore:ro" \
+              -v trivy-cache:/root/.cache "$TRIVY_IMAGE" image --input "/scan/$img.tar" \
+              --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --ignorefile /trivyignore \
+              --exit-code 1 --no-progress
+            echo "::endgroup::"
+          done
+
+      - name: Compose files parse (every documented combination)
+        run: |
+          set -euo pipefail
           cd deploy
-          printf 'GRAFANA_PASSWORD=ci\nALERT_WEBHOOK_URL=http://example/ci\n' > .env
-          mkdir -p secrets && for s in postgres_password database_url jwt_secret worker_signing_key pgbackrest.conf; do echo ci > "secrets/$s"; done
+          printf '%s\n' 'ADMIN_ALLOW_CIDR=203.0.113.7/32' 'LAN_BIND_ADDRESS=192.168.1.156' \
+            'GRAFANA_PASSWORD=ci' 'ALERT_WEBHOOK_URL=http://example/ci' 'ALERT_HEARTBEAT_URL=http://example/hb' \
+            'TIGERBEETLE_CLUSTER_ID=1' > .env
+          mkdir -p secrets
+          for s in postgres_password pg_owner_password pg_app_password pg_backup_password pg_monitor_password \
+                   database_url migration_database_url jwt_secret worker_signing_key worker_trusted_public_keys \
+                   biometric_template_key redis_acl redis_url nats_auth.conf nats_url backup_recipients \
+                   backup_rclone_conf pgbackrest.conf vault_role_id vault_secret_id; do echo ci > "secrets/$s"; done
           cp app.env.example app.env
-          docker compose -f docker-compose.prod.yml config -q
-          docker compose -f docker-compose.lan.yml config -q
-          docker compose -f docker-compose.prod.yml -f docker-compose.monitoring.yml config -q
-          docker compose -f docker-compose.prod.yml -f docker-compose.wal-archive.yml config -q
-          bash -n deploy.sh restore-drill.sh backup/kyc-backup.sh
+          mkdir -p anchor && echo ci > anchor/tsa-certs.pem
+          for combo in docker-compose.prod.yml docker-compose.lan.yml \
+                       docker-compose.prod.yml:docker-compose.monitoring.yml \
+                       docker-compose.prod.yml:docker-compose.wal-archive.yml \
+                       docker-compose.prod.yml:docker-compose.monitoring.yml:docker-compose.wal-archive.yml \
+                       docker-compose.lan.yml:docker-compose.monitoring.yml \
+                       docker-compose.prod.yml:docker-compose.anchor.yml \
+                       docker-compose.prod.yml:docker-compose.vault.yml:docker-compose.anchor.yml \
+                       docker-compose.lan.yml:docker-compose.anchor.yml \
+                       docker-compose.prod.yml:docker-compose.tigerbeetle.yml \
+                       docker-compose.prod.yml:docker-compose.monitoring.yml:docker-compose.tigerbeetle.yml \
+                       docker-compose.prod.yml:docker-compose.vault.yml:docker-compose.anchor.yml:docker-compose.tigerbeetle.yml \
+                       docker-compose.lan.yml:docker-compose.tigerbeetle.yml; do
+            echo "compose config: $combo"
+            COMPOSE_FILE=$combo docker compose config -q
+          done
+          # Nothing but Caddy (and Grafana on loopback) may publish a port.
+          COMPOSE_FILE=docker-compose.prod.yml:docker-compose.monitoring.yml docker compose config --format json \
+            | jq -e '[.services | to_entries[] | select(.value.ports) | .key] | sort == ["caddy", "grafana"]'
+          COMPOSE_FILE=docker-compose.prod.yml:docker-compose.monitoring.yml docker compose config --format json \
+            | jq -e '[.services.grafana.ports[].host_ip] == ["127.0.0.1"]'
+          # The anchoring overlay gives the workers egress and the TSA roots.
+          COMPOSE_FILE=docker-compose.prod.yml:docker-compose.vault.yml:docker-compose.anchor.yml docker compose config --format json \
+            | jq -e '(.services."payment-workers".networks | keys | sort) == ["backend", "egress", "vault"]
+                     and .services."payment-workers".environment.ANCHOR_RFC3161_CERTS_FILE == "/etc/payment/tsa-certs.pem"'
+          # The TigerBeetle overlay: the replica publishes nothing and sits alone with the two
+          # app services on an internal network, at the address both are given (the client
+          # resolves no names); the image is built with the native client.
+          COMPOSE_FILE=docker-compose.prod.yml:docker-compose.monitoring.yml:docker-compose.tigerbeetle.yml docker compose config --format json \
+            | jq -e '[.services | to_entries[] | select(.value.ports) | .key] | sort == ["caddy", "grafana"]'
+          COMPOSE_FILE=docker-compose.prod.yml:docker-compose.tigerbeetle.yml docker compose config --format json \
+            | jq -e '.networks.tigerbeetle.internal == true
+                     and ([.services | to_entries[] | select((.value.networks // {}) | has("tigerbeetle")) | .key] | sort)
+                         == ["payment-server", "payment-workers", "tigerbeetle"]
+                     and (.services.tigerbeetle.networks.tigerbeetle.ipv4_address + ":3000") as $tb
+                     | .services."payment-server".environment.TIGERBEETLE_ADDRESSES == $tb
+                       and .services."payment-workers".environment.TIGERBEETLE_ADDRESSES == $tb
+                       and .services."payment-server".environment.LEDGER_BACKEND == "tigerbeetle"
+                       and .services."payment-workers".environment.LEDGER_BACKEND == "tigerbeetle"
+                       and .services."payment-server".build.args.TIGERBEETLE == "1"'
+          rm -rf secrets anchor .env app.env
+
+      - name: End-to-end backup + restore drill (images from this run)
+        env:
+          IMAGE_TAG: ci
+        run: scripts/ci-restore-drill.sh
 
   mobile:
     name: Android app — JVM tests

@@ -1,34 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Default (prod): no cleartext, ever. The dev and staging flavors override
-     this file to allow HTTP to exactly one LAN host each. -->
+<!-- Default (prod): no cleartext, ever. The dev flavor overrides this file to
+     allow HTTP to the emulator's host loopback only; the staging flavor uses a
+     config GENERATED from its API_BASE_URL (cleartext to that one host only —
+     see app/build.gradle.kts, StagingNetworkSecurityConfigTask).
+
+     Certificate pinning (hardening item S1) is NOT configured here: a <pin-set>
+     cannot take build-time values. It is enforced by OkHttp's CertificatePinner
+     in ApiClient, from BuildConfig.CERT_PINS (-PpaymentCertPins=sha256/…,sha256/…:
+     the live key AND an offline backup key). A prod release refuses to package
+     without pins and refuses to start without them; see data/CertificatePins.kt
+     for how to compute a pin. -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="false" />
-
-    <!-- Certificate pinning (hardening item S1). Ready to enable the day the
-         production API has its real domain and certificate chain:
-
-         1. Replace the domain with the real API host (BuildConfig.API_BASE_URL
-            for the prod flavor must point at the same host).
-         2. Fill in TWO pins: the SHA-256 of the SubjectPublicKeyInfo of the
-            leaf (or the issuing intermediate) AND of a backup key that is kept
-            offline. Never ship a single pin: a key rotation would brick every
-            installed app. Compute a pin with
-              openssl s_client -connect HOST:443 -servername HOST 2>/dev/null \
-                | openssl x509 -pubkey -noout \
-                | openssl pkey -pubin -outform der \
-                | openssl dgst -sha256 -binary | base64
-         3. Set the expiration a few months before the pinned key expires; after
-            that date the platform silently stops enforcing the pins (fail-open),
-            so track it in the release calendar.
-         4. Uncomment. OkHttp uses the platform trust manager, so these pins are
-            enforced for every ApiClient request, including the token refresh.
-
-    <domain-config cleartextTrafficPermitted="false">
-        <domain includeSubdomains="true">api.example.tj</domain>
-        <pin-set expiration="2027-12-31">
-            <pin digest="SHA-256">REPLACE_WITH_BASE64_SPKI_SHA256_OF_LEAF_OR_INTERMEDIATE=</pin>
-            <pin digest="SHA-256">REPLACE_WITH_BASE64_SPKI_SHA256_OF_OFFLINE_BACKUP_KEY=</pin>
-        </pin-set>
-    </domain-config>
-    -->
 </network-security-config>

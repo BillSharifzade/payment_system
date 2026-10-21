@@ -1,0 +1,29 @@
+# OPT-IN overlay: external anchoring of checkpoint hashes (DESIGN.md §6.5). The
+# worker leader periodically timestamps the newest verified checkpoint hash with
+# RFC 3161 timestamp authorities and/or OpenTimestamps (Bitcoin), so history
+# cannot be rewritten after it was anchored — not even with the signing key.
+#
+#   1. COMPOSE_FILE=docker-compose.prod.yml:docker-compose.anchor.yml   (deploy/.env;
+#      keep :docker-compose.vault.yml, :docker-compose.monitoring.yml, … if used)
+#   2. deploy/anchor/tsa-certs.pem: the PEM root/intermediate certificates of
+#      every TSA in ANCHOR_RFC3161_URLS. KEEP retired TSAs' roots in the file, or
+#      their old tokens stop verifying. (The restore drill uses it too.)
+#   3. deploy/app.env: ANCHOR_RFC3161_URLS and/or ANCHOR_OTS_CALENDARS
+#      (see app.env.example), optionally ANCHOR_INTERVAL_SECS.
+#   4. ./deploy.sh — `payment-workers verify-chain` then reports anchored_through_seq.
+#
+# The workers need outbound HTTPS for this, so they join the `egress` network.
+# To restrict that to the witnesses, put an allowlisting proxy in front instead
+# and set HTTPS_PROXY (keep NO_PROXY=vault when the Vault overlay is used).
+services:
+  payment-workers:
+    environment:
+      ANCHOR_RFC3161_CERTS_FILE: /etc/payment/tsa-certs.pem
+    configs:
+      - source: tsa_certs
+        target: /etc/payment/tsa-certs.pem
+    networks: [backend, egress]
+
+configs:
+  tsa_certs:
+    file: ./anchor/tsa-certs.pem

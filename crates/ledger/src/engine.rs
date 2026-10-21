@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::account::{Account, NormalSide};
 use crate::error::{LedgerError, Result};
@@ -34,27 +34,42 @@ impl InMemoryLedger {
     }
 
     pub fn is_conserved(&self) -> bool {
-        let mut totals: HashMap<String, i128> = HashMap::new();
-        for raw in self.raw_balances.values() {
-            *totals.entry(raw.currency().code().to_string()).or_insert(0) += raw.minor_units();
-        }
-        totals.values().all(|&t| t == 0)
+        let currencies: BTreeSet<Currency> = self
+            .raw_balances
+            .values()
+            .map(|raw| raw.currency())
+            .collect();
+        currencies
+            .into_iter()
+            .all(|c| self.net_minor_units(c) == Some(0))
     }
 
-    pub fn net_minor_units(&self, currency: Currency) -> i128 {
-        self.raw_balances
+    /// The exact sum of the raw balances in `currency`, or None if it is not an i128. A plain
+    /// i128 sum could overflow on the way to zero, depending on iteration order.
+    pub fn net_minor_units(&self, currency: Currency) -> Option<i128> {
+        let (mut sum, mut wraps) = (0i128, 0i64);
+        for raw in self
+            .raw_balances
             .values()
-            .filter(|raw| raw.currency() == currency)
-            .map(|raw| raw.minor_units())
-            .sum()
+            .filter(|r| r.currency() == currency)
+        {
+            let (next, overflowed) = sum.overflowing_add(raw.minor_units());
+            sum = next;
+            if overflowed {
+                wraps += if raw.is_negative() { -1 } else { 1 };
+            }
+        }
+        (wraps == 0).then_some(sum)
     }
 }
 
 impl LedgerEngine for InMemoryLedger {
+    // Re-opening an id keeps the account as first opened, as Postgres's ON CONFLICT DO NOTHING
+    // does: replacing it could, say, re-type a negative system account as a user wallet.
     fn open_account(&mut self, account: Account) -> Result<()> {
-        let currency = account.currency;
         let id = account.id;
-        self.accounts.insert(id, account);
+        let currency = account.currency;
+        self.accounts.entry(id).or_insert(account);
         self.raw_balances
             .entry(id)
             .or_insert_with(|| Money::zero(currency));
@@ -68,7 +83,10 @@ impl LedgerEngine for InMemoryLedger {
 
         txn.validate()?;
 
-        let mut proposed: HashMap<AccountId, Money> = HashMap::new();
+        // One net change per account. Validation bounds an account's debits and credits by the
+        // transaction's totals, so the net fits whatever the entry order; a BTreeMap makes the
+        // account an error names independent of hashing.
+        let mut deltas: BTreeMap<AccountId, (&Account, Money)> = BTreeMap::new();
         for entry in &txn.entries {
             let account = self
                 .accounts
@@ -83,32 +101,30 @@ impl LedgerEngine for InMemoryLedger {
                 });
             }
 
-            let current = proposed
-                .get(&entry.account_id)
-                .copied()
-                .unwrap_or_else(|| self.raw_balances[&entry.account_id]);
-            let next = current.checked_add(&entry.signed_amount()?)?;
-            proposed.insert(entry.account_id, next);
+            let (_, delta) = deltas
+                .entry(entry.account_id)
+                .or_insert((account, Money::zero(account.currency)));
+            *delta = delta.checked_add(&entry.signed_amount()?)?;
         }
 
-        for (account_id, raw) in &proposed {
-            let account = &self.accounts[account_id];
-            if !account.allows_negative_balance() {
-                let oriented = Self::orient(account, *raw)?;
-                if oriented.is_negative() {
-                    return Err(LedgerError::InsufficientFunds {
-                        account: *account_id,
-                        balance_minor: self.raw_balances[account_id].minor_units(),
-                        delta_minor: raw.minor_units()
-                            - self.raw_balances[account_id].minor_units(),
-                    });
-                }
+        let mut next = Vec::with_capacity(deltas.len());
+        for (account_id, (account, delta)) in deltas {
+            let current = self.raw_balances[&account_id];
+            let raw = current.checked_add(&delta)?;
+            // Every balance must stay readable in its own orientation (a debit-normal raw of
+            // i128::MIN has no positive counterpart).
+            let balance = Self::orient(account, raw)?;
+            if balance.is_negative() && !account.allows_negative_balance() {
+                return Err(LedgerError::InsufficientFunds {
+                    account: account_id,
+                    balance_minor: current.minor_units(),
+                    delta_minor: delta.minor_units(),
+                });
             }
+            next.push((account_id, raw));
         }
 
-        for (account_id, raw) in proposed {
-            self.raw_balances.insert(account_id, raw);
-        }
+        self.raw_balances.extend(next);
         self.posted.insert(txn.id);
         Ok(())
     }

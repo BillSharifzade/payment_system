@@ -1,0 +1,31 @@
+# With the monitoring overlay: Prometheus scrapes every Patroni member, etcd
+# member and HAProxy (ha/prometheus-scrape.yml) and evaluates the HA alert
+# rules (ha/prometheus-rules.yml: no leader, two leaders, no quorum standby —
+# writes blocked —, leader changed, replication lag, member/etcd/HAProxy down).
+#
+#   COMPOSE_FILE=docker-compose.prod.yml:docker-compose.monitoring.yml:ha/docker-compose.ha.yml:ha/docker-compose.ha-monitoring.yml
+#
+# The rules are picked up by the existing `rule_files: /etc/prometheus/rules/*.yml`;
+# the scrape jobs need `scrape_config_files: ["/etc/prometheus/scrape/*.yml"]`
+# in monitoring/prometheus.yml (until then HaMetricsMissing fires).
+# postgres-exporter needs nothing: it connects to `postgres` (HAProxy), so its
+# metrics — WAL archiving included — always describe the current leader.
+services:
+  postgres:
+    networks: [backend, ha, monitoring]
+  pg-1:
+    networks: [ha, egress, monitoring]
+  pg-2:
+    networks: [ha, egress, monitoring]
+  pg-3:
+    networks: [ha, egress, monitoring]
+  etcd-1:
+    networks: [ha, monitoring]
+  etcd-2:
+    networks: [ha, monitoring]
+  etcd-3:
+    networks: [ha, monitoring]
+  prometheus:
+    volumes:
+      - ./ha/prometheus-rules.yml:/etc/prometheus/rules/ha.yml:ro
+      - ./ha/prometheus-scrape.yml:/etc/prometheus/scrape/ha.yml:ro

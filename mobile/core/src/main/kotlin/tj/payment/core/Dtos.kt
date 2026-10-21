@@ -41,6 +41,13 @@ data class WalletDto(
     val display: String,
 ) {
     fun money(): Money = Money.ofMinor(balanceMinor, Currency.of(currency))
+
+    /**
+     * The balance as text: our own exact formatting for a currency this build
+     * knows, else the server's [display] string (fail closed — never a guessed
+     * exponent).
+     */
+    fun displayAmount(): String = if (Currency.of(currency).isKnown) money().formatAmount() else display
 }
 
 /** Response of GET /v1/users/resolve — the "check number" / QR-scan lookup. */
@@ -235,4 +242,76 @@ data class CheckDto(
 @Serializable
 data class PayCheckRequest(
     val account: String? = null,
+)
+
+// --- Transaction status (hardening contract §1/§2) ---
+
+/** One leg of a transaction on an account the caller owns. */
+@Serializable
+data class TransactionEntryDto(
+    @SerialName("account_id") val accountId: String,
+    /** "debit" | "credit". */
+    val direction: String,
+    @SerialName("amount_minor") val amountMinor: Long,
+    val currency: String,
+)
+
+/**
+ * GET /v1/transactions/{id} and POST /v1/transactions/{id}/void. The id is the
+ * idempotency key the client sent (the backend uses the key as the transaction
+ * id). [status] is "posted" (money moved; [entries] lists only the caller's own
+ * legs) or "voided" (the caller voided the key: it can never post). A 404 means
+ * neither — unknown id, or none of its accounts is the caller's.
+ */
+@Serializable
+data class TransactionStatusDto(
+    @SerialName("transaction_id") val transactionId: String,
+    val status: String,
+    @SerialName("created_at") val createdAt: String? = null,
+    /** Same values as the statement's `kind`; posted only. */
+    val kind: String? = null,
+    val entries: List<TransactionEntryDto> = emptyList(),
+) {
+    val isPosted: Boolean get() = status == STATUS_POSTED
+    val isVoided: Boolean get() = status == STATUS_VOIDED
+
+    companion object {
+        const val STATUS_POSTED = "posted"
+        const val STATUS_VOIDED = "voided"
+    }
+}
+
+/**
+ * POST /v1/devices: bind this phone's signing key to the account. The password
+ * is re-checked (a bearer token alone cannot add a device). 201 = registered,
+ * 200 = this key was already an active device of the user (same id).
+ * 403 `forbidden` = wrong password (or the account is not active),
+ * 403 `account_blocked`, 409 `conflict` = the account has the maximum number
+ * of active devices, 429 = too many password attempts.
+ */
+@Serializable
+data class RegisterDeviceRequest(
+    /** Base64 SubjectPublicKeyInfo DER of the P-256 key. */
+    @SerialName("public_key") val publicKey: String,
+    val label: String,
+    val password: String,
+)
+
+/** A registered device (POST /v1/devices, GET /v1/devices, POST /v1/devices/{id}/revoke). */
+@Serializable
+data class DeviceDto(
+    val id: String,
+    val label: String,
+    /** Base64 SPKI DER, as the server stored it (canonical encoding). */
+    @SerialName("public_key") val publicKey: String,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("last_used_at") val lastUsedAt: String? = null,
+    @SerialName("revoked_at") val revokedAt: String? = null,
+) {
+    val isActive: Boolean get() = revokedAt == null
+}
+
+@Serializable
+data class DeviceListResponse(
+    val items: List<DeviceDto> = emptyList(),
 )

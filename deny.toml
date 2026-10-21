@@ -7,11 +7,13 @@
 yanked = "deny"
 # Accepted advisories, with rationale. Review periodically.
 ignore = [
-    # rsa 0.9 "Marvin attack" timing side-channel. No upstream fix exists. It is
-    # pulled ONLY transitively by sqlx-macros → sqlx-mysql (compile-time macro
-    # infrastructure); we use the Postgres driver exclusively, our Postgres auth
-    # is SCRAM-SHA-256, and the MySQL RSA auth path is never instantiated at
-    # runtime — so the vulnerable code is not reachable in this system.
+    # rsa 0.9 "Marvin attack" timing side-channel in RSA *decryption* (private-key
+    # operations). No upstream fix exists. Two users here, neither reachable:
+    #  - sqlx-macros → sqlx-mysql (compile-time macro infrastructure); we use the
+    #    Postgres driver exclusively with SCRAM-SHA-256, so the MySQL RSA auth
+    #    path is never instantiated at runtime;
+    #  - crates/crypto (RFC 3161 anchor tokens) uses rsa ONLY to verify TSA
+    #    signatures with public keys — no private-key operation ever runs.
     "RUSTSEC-2023-0071",
 ]
 

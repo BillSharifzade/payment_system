@@ -76,25 +76,30 @@ impl Transaction {
             });
         }
 
-        let mut net_by_currency: BTreeMap<String, (Currency, Money)> = BTreeMap::new();
-
+        // Debits and credits are totalled apart: sums of positive amounts overflow regardless
+        // of entry order, where a running net would accept or refuse the same entries
+        // depending on how they are ordered.
+        let mut totals: BTreeMap<String, (Currency, Money, Money)> = BTreeMap::new();
         for entry in &self.entries {
             if !entry.amount.is_positive() {
                 return Err(LedgerError::NonPositiveAmount);
             }
             let currency = entry.amount.currency();
-            let signed = entry.signed_amount()?;
-            let slot = net_by_currency
+            let (_, debits, credits) = totals
                 .entry(currency.code().to_string())
-                .or_insert_with(|| (currency, Money::zero(currency)));
-            slot.1 = slot.1.checked_add(&signed)?;
+                .or_insert_with(|| (currency, Money::zero(currency), Money::zero(currency)));
+            let total = match entry.direction {
+                Direction::Debit => debits,
+                Direction::Credit => credits,
+            };
+            *total = total.checked_add(&entry.amount)?;
         }
 
-        for (currency, net) in net_by_currency.into_values() {
-            if !net.is_zero() {
+        for (currency, debits, credits) in totals.into_values() {
+            if debits != credits {
                 return Err(LedgerError::Unbalanced {
                     currency,
-                    net_minor: net.minor_units(),
+                    net_minor: credits.minor_units() - debits.minor_units(),
                 });
             }
         }

@@ -1,7 +1,10 @@
 mod admin;
+mod backend;
 pub mod biometric;
 mod common;
 pub mod config;
+mod deposits;
+pub mod devices;
 mod error;
 mod kyc;
 pub mod middleware;
@@ -9,18 +12,25 @@ mod payments;
 mod ratelimit;
 mod reads;
 mod session;
+mod terminals;
+mod transactions;
 
+pub use backend::Ledger;
 pub use biometric::{BiometricConfig, MatcherBackend};
+pub use config::{DeviceBinding, DeviceConfig};
 pub use error::{ApiError, ApiResult};
+pub use payments::{aml_guard, payment_entries, settlement_shard, system_shards, ScreenCtx};
 pub use ratelimit::RateLimitState;
 pub use session::{warm_password_hasher, AdminUser, AuthUser};
 
+use std::str::FromStr;
 use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::{header, HeaderValue, Request, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use storage::PostgresLedger;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -140,19 +150,79 @@ impl Default for AmlConfig {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct DepositConfig {
+    pub dual_control: bool,
+    pub max_minor: i64,
+}
+
+impl Default for DepositConfig {
+    fn default() -> Self {
+        Self {
+            dual_control: true,
+            max_minor: 100_000_000,
+        }
+    }
+}
+
+impl DepositConfig {
+    pub fn from_env(is_prod: bool) -> Result<Self, String> {
+        let d = Self::default();
+        let cfg = Self {
+            dual_control: config::env_bool("DEPOSIT_DUAL_CONTROL", d.dual_control)?,
+            max_minor: config::env_or("DEPOSIT_MAX_MINOR", d.max_minor)?,
+        };
+        if !cfg.dual_control {
+            if is_prod {
+                return Err("DEPOSIT_DUAL_CONTROL=false is only allowed when APP_ENV=dev".into());
+            }
+            tracing::warn!(
+                "DEPOSIT_DUAL_CONTROL=false — a single admin can create money (dev only)"
+            );
+        }
+        if cfg.max_minor <= 0 {
+            return Err("DEPOSIT_MAX_MINOR must be positive".to_string());
+        }
+        Ok(cfg)
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
-    pub ledger: PostgresLedger,
+    pub ledger: Ledger,
     pub auth: AuthConfig,
     pub rate_limit: RateLimitState,
     pub login_limit: RateLimitState,
     pub resolve_limit: RateLimitState,
     pub aml: AmlConfig,
     pub fees: FeeConfig,
+    pub deposits: DepositConfig,
     pub biometric: BiometricConfig,
+    pub devices: DeviceConfig,
     pub trust_proxy: bool,
     pub document_dir: std::path::PathBuf,
     pub kyc_upload_daily_max: i64,
+}
+
+// With owner credentials, migrations run on a short-lived pool of their own and the runtime
+// pool (a role that does not own the schema) only reloads the currency cache.
+pub async fn run_migrations(
+    ledger: &PostgresLedger,
+    owner_url: Option<&str>,
+) -> storage::Result<()> {
+    let Some(url) = owner_url else {
+        return ledger.migrate().await;
+    };
+    let options = PgConnectOptions::from_str(url)?.application_name("payment-server-migrate");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(30))
+        .connect_with(options)
+        .await?;
+    let migrated = PostgresLedger::new(pool.clone()).migrate().await;
+    pool.close().await;
+    migrated?;
+    ledger.load_currencies().await
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -207,9 +277,37 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/admin/fx-rates", post(admin::set_fx_rate))
         .route("/v1/fx/rates", get(reads::list_fx_rates))
-        .route("/v1/deposits", post(payments::create_deposit))
+        .route("/v1/deposits", post(deposits::create_deposit))
+        .route("/v1/admin/deposits", get(deposits::list_deposits))
+        .route("/v1/admin/deposits/{id}", get(deposits::get_deposit))
+        .route(
+            "/v1/admin/deposits/{id}/approve",
+            post(deposits::approve_deposit),
+        )
+        .route(
+            "/v1/admin/deposits/{id}/reject",
+            post(deposits::reject_deposit),
+        )
+        .route(
+            "/v1/admin/terminals",
+            post(terminals::create_terminal).get(terminals::list_terminals),
+        )
+        .route(
+            "/v1/admin/terminals/{id}/revoke",
+            post(terminals::revoke_terminal),
+        )
+        .route(
+            "/v1/devices",
+            post(devices::register_device).get(devices::list_devices),
+        )
+        .route("/v1/devices/{id}/revoke", post(devices::revoke_device))
         .route("/v1/transfers", post(payments::create_transfer))
         .route("/v1/fx", post(payments::create_fx))
+        .route("/v1/transactions/{id}", get(transactions::get_transaction))
+        .route(
+            "/v1/transactions/{id}/void",
+            post(transactions::void_transaction),
+        )
         .route(
             "/v1/biometric/fingerprints",
             post(biometric::enroll_fingerprint).get(biometric::list_fingerprints),

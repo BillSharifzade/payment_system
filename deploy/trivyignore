@@ -1,0 +1,4 @@
+# Accepted image vulnerabilities for the CI image scan (trivy --ignorefile).
+# One CVE id per line, each with a comment: why it does not apply to this
+# system, who decided, and when to re-check. Prefer fixing — bump the base
+# image digest (scripts/image-digest.sh) — over adding a line here.

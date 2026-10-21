@@ -19,6 +19,12 @@ pub enum StorageError {
 
     #[error("{message}")]
     Rejected { rule: String, message: String },
+
+    /// The ledger backend (TigerBeetle) did not answer in time, or the attempt lost its
+    /// reservation before it committed. Nothing was posted that recovery will not settle;
+    /// retrying with the same transaction id is safe.
+    #[error("ledger backend unavailable: {0}")]
+    Unavailable(String),
 }
 
 pub type Result<T> = core::result::Result<T, StorageError>;

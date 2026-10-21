@@ -1,207 +1,17 @@
-use api::{
-    build_router, AmlConfig, AppState, AuthConfig, BiometricConfig, FeeConfig, Limits,
-    RateLimitState,
-};
+mod common;
+
+use api::{AmlConfig, AuthConfig, FeeConfig, Limits, RateLimitState};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use common::*;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
 use std::time::Duration;
 use storage::PostgresLedger;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-async fn connect() -> PgPool {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&url)
-        .await
-        .unwrap()
-}
-
-fn router_with(pool: PgPool, rate_limit: RateLimitState) -> axum::Router {
-    router_full(pool, rate_limit, AmlConfig::default(), FeeConfig::default())
-}
-
-fn router_with_aml(pool: PgPool, rate_limit: RateLimitState, aml: AmlConfig) -> axum::Router {
-    router_full(pool, rate_limit, aml, FeeConfig::default())
-}
-
-fn router_full(
-    pool: PgPool,
-    rate_limit: RateLimitState,
-    aml: AmlConfig,
-    fees: FeeConfig,
-) -> axum::Router {
-    router_full_quota(pool, rate_limit, aml, fees, 10_000)
-}
-
 const PNG_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR-test-bytes";
-
-fn router_with_auth(pool: PgPool, auth: AuthConfig) -> axum::Router {
-    router_custom(
-        pool,
-        RateLimitState::default(),
-        AmlConfig::default(),
-        FeeConfig::default(),
-        10_000,
-        auth,
-    )
-}
-
-fn router_full_quota(
-    pool: PgPool,
-    rate_limit: RateLimitState,
-    aml: AmlConfig,
-    fees: FeeConfig,
-    kyc_upload_daily_max: i64,
-) -> axum::Router {
-    router_custom(
-        pool,
-        rate_limit,
-        aml,
-        fees,
-        kyc_upload_daily_max,
-        AuthConfig::default(),
-    )
-}
-
-fn router_custom(
-    pool: PgPool,
-    rate_limit: RateLimitState,
-    aml: AmlConfig,
-    fees: FeeConfig,
-    kyc_upload_daily_max: i64,
-    auth: AuthConfig,
-) -> axum::Router {
-    let ledger = PostgresLedger::new(pool);
-    build_router(AppState {
-        ledger,
-        auth,
-        rate_limit,
-        login_limit: RateLimitState::new(10_000, std::time::Duration::from_secs(60)),
-        resolve_limit: RateLimitState::new(10_000, std::time::Duration::from_secs(60)),
-        aml,
-        fees,
-        biometric: BiometricConfig::dev(),
-        trust_proxy: true,
-        document_dir: std::env::temp_dir().join("payment-kyc-docs-test"),
-        kyc_upload_daily_max,
-    })
-}
-
-async fn app() -> (axum::Router, PgPool) {
-    let pool = connect().await;
-    PostgresLedger::new(pool.clone()).migrate().await.unwrap();
-    (router_with(pool.clone(), RateLimitState::default()), pool)
-}
-
-async fn admin_token(app: &axum::Router, pool: &PgPool) -> String {
-    let (uid, tok) = register(app).await;
-    sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
-        .bind(Uuid::parse_str(&uid).unwrap())
-        .execute(pool)
-        .await
-        .unwrap();
-    tok
-}
-
-async fn verify_kyc(pool: &PgPool, user_id: &str) {
-    sqlx::query("UPDATE users SET kyc_level = 1 WHERE id = $1")
-        .bind(Uuid::parse_str(user_id).unwrap())
-        .execute(pool)
-        .await
-        .unwrap();
-}
-
-async fn admin_deposit(app: &axum::Router, admin_tok: &str, account: &str, amount_minor: i64) {
-    let (status, body) = send(
-        app,
-        req(
-            "POST",
-            "/v1/deposits",
-            Some(admin_tok),
-            Some(&Uuid::new_v4().to_string()),
-            json!({"user_account": account, "amount_minor": amount_minor}),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "admin deposit: {body}");
-}
-
-async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let body: Value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap()
-    };
-    (status, body)
-}
-
-fn req(
-    method: &str,
-    uri: &str,
-    auth: Option<&str>,
-    key: Option<&str>,
-    body: Value,
-) -> Request<Body> {
-    let mut b = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json");
-    if let Some(t) = auth {
-        b = b.header("authorization", format!("Bearer {t}"));
-    }
-    if let Some(k) = key {
-        b = b.header("idempotency-key", k);
-    }
-    let body = if body.is_null() {
-        Body::empty()
-    } else {
-        Body::from(serde_json::to_vec(&body).unwrap())
-    };
-    b.body(body).unwrap()
-}
-
-async fn register(app: &axum::Router) -> (String, String) {
-    let phone = format!("+992{:09}", Uuid::new_v4().as_u128() % 1_000_000_000);
-    let (status, body) = send(
-        app,
-        req(
-            "POST",
-            "/v1/auth/register",
-            None,
-            None,
-            json!({"phone": phone, "password": "password123"}),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "register: {body}");
-    (
-        body["user_id"].as_str().unwrap().to_string(),
-        body["access_token"].as_str().unwrap().to_string(),
-    )
-}
-
-async fn create_wallet(app: &axum::Router, token: &str) -> String {
-    let (status, body) = send(
-        app,
-        req("GET", "/v1/wallets", Some(token), None, Value::Null),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "list wallets: {body}");
-    body.as_array()
-        .and_then(|w| w.first())
-        .and_then(|w| w["id"].as_str())
-        .expect("registration must auto-create a TJS wallet")
-        .to_string()
-}
 
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
@@ -952,19 +762,6 @@ async fn redis_rate_limiter_returns_429() {
     assert_eq!(statuses[3], StatusCode::TOO_MANY_REQUESTS);
 }
 
-async fn system_total(pool: &PgPool, account_type: &str, currency: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT COALESCE(SUM(b.raw_minor), 0)::BIGINT
-         FROM balances b JOIN accounts a ON a.id = b.account_id
-         WHERE a.account_type = $1 AND a.currency = $2",
-    )
-    .bind(account_type)
-    .bind(currency)
-    .fetch_one(pool)
-    .await
-    .unwrap()
-}
-
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn transfer_fee_is_charged_as_three_entries() {
@@ -1027,26 +824,6 @@ async fn transfer_fee_is_charged_as_three_entries() {
 
     let fee_after = system_total(&pool, "system_fee_revenue", "TJS").await;
     assert_eq!(fee_after - fee_before, 100);
-}
-
-async fn create_wallet_cur(app: &axum::Router, token: &str, currency: &str) -> String {
-    let (status, body) = send(
-        app,
-        req(
-            "POST",
-            "/v1/wallets",
-            Some(token),
-            None,
-            json!({"currency": currency}),
-        ),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::CREATED,
-        "create {currency} wallet: {body}"
-    );
-    body["id"].as_str().unwrap().to_string()
 }
 
 static FX_RATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1910,22 +1687,6 @@ fn urlencode(s: &str) -> String {
         .collect()
 }
 
-async fn approve_named_kyc(pool: &PgPool, user_id: &str, full_name: &str) {
-    sqlx::query(
-        "INSERT INTO kyc_submissions
-             (id, user_id, requested_level, full_name, document_type,
-              document_ref, status, reviewed_at)
-         VALUES ($1, $2, 1, $3, 'passport', 'test-ref', 'approved', now())",
-    )
-    .bind(Uuid::new_v4())
-    .bind(Uuid::parse_str(user_id).unwrap())
-    .bind(full_name)
-    .execute(pool)
-    .await
-    .unwrap();
-    verify_kyc(pool, user_id).await;
-}
-
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn resolve_recipient_by_phone_and_wallet() {
@@ -2068,14 +1829,6 @@ async fn page_phone(app: &axum::Router, admin: &str, user_id: &str) -> String {
         .find(|u| u["id"] == user_id)
         .map(|u| u["phone"].as_str().unwrap().to_string())
         .expect("freshly registered user must be on the first page")
-}
-
-async fn db_phone(pool: &PgPool, user_id: &str) -> String {
-    sqlx::query_scalar("SELECT phone FROM users WHERE id = $1")
-        .bind(Uuid::parse_str(user_id).unwrap())
-        .fetch_one(pool)
-        .await
-        .unwrap()
 }
 
 #[tokio::test]
@@ -2409,118 +2162,6 @@ async fn usd_deposit_uses_usd_settlement() {
     assert_eq!(audited, 1);
 }
 
-fn template_bytes(tag: Uuid) -> Vec<u8> {
-    tag.as_bytes()
-        .iter()
-        .cycle()
-        .take(64)
-        .enumerate()
-        .map(|(i, b)| b.wrapping_add(i as u8))
-        .collect()
-}
-
-fn template_b64(tag: Uuid) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(template_bytes(tag))
-}
-
-async fn enroll(app: &axum::Router, token: &str, finger: i16, seed: Uuid) -> (StatusCode, Value) {
-    send(
-        app,
-        req(
-            "POST",
-            "/v1/biometric/fingerprints",
-            Some(token),
-            None,
-            json!({"finger": finger, "format": "raw", "template": template_b64(seed), "consent": true}),
-        ),
-    )
-    .await
-}
-
-async fn create_check(
-    app: &axum::Router,
-    token: &str,
-    account: &str,
-    amount_minor: i64,
-    key: &str,
-    extra: Value,
-) -> (StatusCode, Value) {
-    let mut body = json!({"account": account, "amount_minor": amount_minor});
-    if let Value::Object(m) = extra {
-        for (k, v) in m {
-            body[k] = v;
-        }
-    }
-    send(app, req("POST", "/v1/checks", Some(token), Some(key), body)).await
-}
-
-async fn pay_check(
-    app: &axum::Router,
-    token: &str,
-    check_id: &str,
-    seed: Uuid,
-    key: &str,
-) -> (StatusCode, Value) {
-    send(
-        app,
-        req(
-            "POST",
-            &format!("/v1/checks/{check_id}/pay/fingerprint"),
-            Some(token),
-            Some(key),
-            json!({"format": "raw", "template": template_b64(seed)}),
-        ),
-    )
-    .await
-}
-
-async fn balance_of(app: &axum::Router, token: &str, account: &str) -> i64 {
-    let (status, body) = send(
-        app,
-        req(
-            "GET",
-            &format!("/v1/accounts/{account}/balance"),
-            Some(token),
-            None,
-            Value::Null,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "balance: {body}");
-    body["balance_minor"].as_i64().unwrap()
-}
-
-async fn get_check(app: &axum::Router, token: &str, id: &str) -> (StatusCode, Value) {
-    send(
-        app,
-        req(
-            "GET",
-            &format!("/v1/checks/{id}"),
-            Some(token),
-            None,
-            Value::Null,
-        ),
-    )
-    .await
-}
-
-struct Party {
-    id: String,
-    token: String,
-    wallet: String,
-}
-
-async fn party(app: &axum::Router, pool: &PgPool, name: Option<&str>) -> Party {
-    let (id, token) = register(app).await;
-    match name {
-        Some(n) => approve_named_kyc(pool, &id, n).await,
-        None => verify_kyc(pool, &id).await,
-    }
-    let wallet = create_wallet(app, &token).await;
-    Party { id, token, wallet }
-}
-
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn fingerprint_check_payment_flow() {
@@ -2603,7 +2244,7 @@ async fn fingerprint_check_payment_flow() {
 
     let (status, body) = pay_check(
         &app,
-        &merchant.token,
+        &merchant,
         &check_key,
         Uuid::new_v4(),
         &Uuid::new_v4().to_string(),
@@ -2613,14 +2254,14 @@ async fn fingerprint_check_payment_flow() {
     assert_eq!(body["error"]["code"], "no_match");
 
     let pay_key = Uuid::new_v4().to_string();
-    let (status, paid) = pay_check(&app, &merchant.token, &check_key, seed, &pay_key).await;
+    let (status, paid) = pay_check(&app, &merchant, &check_key, seed, &pay_key).await;
     assert_eq!(status, StatusCode::CREATED, "pay: {paid}");
     assert_eq!(paid["status"], "posted");
     assert_eq!(paid["transaction_id"], pay_key);
     assert_eq!(paid["check_id"], check_key);
     assert_eq!(paid["amount_minor"], 20_000);
     assert_eq!(paid["currency"], "TJS");
-    assert_eq!(paid["payer_name"], "Firuza Karimova");
+    assert_eq!(paid["payer_name"], "Firuza K.");
 
     assert_eq!(
         balance_of(&app, &customer.token, &customer.wallet).await,
@@ -2631,7 +2272,7 @@ async fn fingerprint_check_payment_flow() {
         20_000
     );
 
-    let (status, replay) = pay_check(&app, &merchant.token, &check_key, seed, &pay_key).await;
+    let (status, replay) = pay_check(&app, &merchant, &check_key, seed, &pay_key).await;
     assert_eq!(status, StatusCode::CREATED, "replay: {replay}");
     assert_eq!(replay, paid);
     assert_eq!(
@@ -2641,7 +2282,7 @@ async fn fingerprint_check_payment_flow() {
 
     let (status, body) = pay_check(
         &app,
-        &merchant.token,
+        &merchant,
         &check_key,
         seed,
         &Uuid::new_v4().to_string(),
@@ -2653,7 +2294,7 @@ async fn fingerprint_check_payment_flow() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "paid");
     assert_eq!(body["transaction_id"], pay_key);
-    assert_eq!(body["payer_name"], "Firuza Karimova");
+    assert_eq!(body["payer_name"], "Firuza K.");
     assert!(body["paid_at_ms"].is_i64());
     let (status, body) = get_check(&app, &customer.token, &check_key).await;
     assert_eq!(status, StatusCode::OK, "payer may read: {body}");
@@ -2731,7 +2372,7 @@ async fn fingerprint_payment_refuses_insufficient_funds_and_keeps_check_open() {
 
     let (status, body) = pay_check(
         &app,
-        &merchant.token,
+        &merchant,
         &check_key,
         seed,
         &Uuid::new_v4().to_string(),
@@ -2749,7 +2390,7 @@ async fn fingerprint_payment_refuses_insufficient_funds_and_keeps_check_open() {
     admin_deposit(&app, &admin, &customer.wallet, 10_000).await;
     let (status, body) = pay_check(
         &app,
-        &merchant.token,
+        &merchant,
         &check_key,
         seed,
         &Uuid::new_v4().to_string(),
@@ -2875,7 +2516,7 @@ async fn fingerprint_enrollment_rules() {
     assert_eq!(status, StatusCode::CREATED);
     let (status, body) = pay_check(
         &app,
-        &merchant.token,
+        &merchant,
         &check_key,
         seed,
         &Uuid::new_v4().to_string(),
@@ -2982,7 +2623,7 @@ async fn check_lifecycle_cancel_expiry_and_limits() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     let (status, body) = pay_check(
         &app,
-        &merchant.token,
+        &merchant,
         &cancel_key,
         seed,
         &Uuid::new_v4().to_string(),
@@ -3010,7 +2651,7 @@ async fn check_lifecycle_cancel_expiry_and_limits() {
     assert_eq!(body["status"], "expired");
     let (status, body) = pay_check(
         &app,
-        &merchant.token,
+        &merchant,
         &expired_key,
         seed,
         &Uuid::new_v4().to_string(),
@@ -3047,14 +2688,8 @@ async fn check_lifecycle_cancel_expiry_and_limits() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
-    let (status, body) = pay_check(
-        &app,
-        &merchant.token,
-        &big_key,
-        seed,
-        &Uuid::new_v4().to_string(),
-    )
-    .await;
+    let (status, body) =
+        pay_check(&app, &merchant, &big_key, seed, &Uuid::new_v4().to_string()).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "over cap: {body}");
     assert_eq!(body["error"]["code"], "limit_exceeded");
 
@@ -3071,7 +2706,7 @@ async fn check_lifecycle_cancel_expiry_and_limits() {
     assert_eq!(status, StatusCode::CREATED);
     let (status, body) = pay_check(
         &app,
-        &merchant.token,
+        &merchant,
         &own_key,
         merchant_seed,
         &Uuid::new_v4().to_string(),
@@ -3110,10 +2745,10 @@ async fn concurrent_fingerprint_payments_of_one_check_post_once() {
     let mut tasks = Vec::new();
     for _ in 0..8 {
         let app = app.clone();
-        let tok = merchant.token.clone();
+        let m = merchant.clone();
         let ck = check_key.clone();
         tasks.push(tokio::spawn(async move {
-            pay_check(&app, &tok, &ck, seed, &Uuid::new_v4().to_string()).await
+            pay_check(&app, &m, &ck, seed, &Uuid::new_v4().to_string()).await
         }));
     }
     let mut posted = 0;
@@ -3136,26 +2771,6 @@ async fn concurrent_fingerprint_payments_of_one_check_post_once() {
         balance_of(&app, &merchant.token, &merchant.wallet).await,
         30_000
     );
-}
-
-async fn pay_check_app(
-    app: &axum::Router,
-    token: &str,
-    check_id: &str,
-    key: &str,
-    body: Value,
-) -> (StatusCode, Value) {
-    send(
-        app,
-        req(
-            "POST",
-            &format!("/v1/checks/{check_id}/pay"),
-            Some(token),
-            Some(key),
-            body,
-        ),
-    )
-    .await
 }
 
 #[tokio::test]
@@ -3203,7 +2818,7 @@ async fn check_paid_from_customer_app() {
     assert_eq!(status, StatusCode::CREATED, "pay: {paid}");
     assert_eq!(paid["status"], "posted");
     assert_eq!(paid["transaction_id"], pay_key);
-    assert_eq!(paid["payer_name"], "Daler Nazarov");
+    assert_eq!(paid["payer_name"], "Daler N.");
     assert_eq!(
         balance_of(&app, &customer.token, &customer.wallet).await,
         30_000

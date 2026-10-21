@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Biometric primitives for fingerprint payments: template validation, at-rest template encryption, the identification decision policy and the HTTP adapter to an external matching engine. No database."
+description = "Biometric primitives for fingerprint payments: template validation, at-rest template encryption, the identification decision policy, terminal API keys and the HTTP adapter to an external matching engine. No database."
 
 [dependencies]
 aes-gcm = { workspace = true }

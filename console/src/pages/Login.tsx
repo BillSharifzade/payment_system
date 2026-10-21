@@ -1,6 +1,7 @@
 import { FormEvent, useState } from "react";
 import { ApiError, login } from "../api";
 import { useSessionNotice } from "../auth";
+import { IDLE_TIMEOUT_MS } from "../idle";
 import { Alert, Icon } from "../ui";
 
 export default function Login() {
@@ -71,6 +72,13 @@ export default function Login() {
           {busy ? "Signing in…" : "Sign in"}
         </button>
         {error && <Alert kind="error">{error}</Alert>}
+        <p className="login-note">
+          <Icon name="info" size={13} />
+          <span>
+            Your session is kept in this tab's memory only: reloading or closing the tab signs you
+            out, and so do {Math.round(IDLE_TIMEOUT_MS / 60_000)} minutes without activity.
+          </span>
+        </p>
       </form>
     </div>
   );
