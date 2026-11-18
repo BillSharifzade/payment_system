@@ -106,6 +106,15 @@ if [[ $ha -eq 1 ]]; then
   fi
 fi
 
+# The kernel's default writeback (every 5 s, pages 30 s old) stalls WAL flushes in bursts;
+# see sysctl/60-payment-postgres.conf. Advice, not a gate: the box works either way.
+writeback=$(cat /proc/sys/vm/dirty_writeback_centisecs 2>/dev/null || echo 0)
+expire=$(cat /proc/sys/vm/dirty_expire_centisecs 2>/dev/null || echo 0)
+if [[ $lan -eq 0 ]] && (( writeback > 100 || expire > 500 )); then
+  warn "kernel writeback is bursty on this host (every $((writeback / 100)) s, pages $((expire / 100)) s old): commits"
+  warn "stall while it runs. For steady latency: sudo cp sysctl/60-payment-postgres.conf /etc/sysctl.d/ && sudo sysctl --system"
+fi
+
 encryption=$(setting BACKUP_ENCRYPTION)
 if [[ "$encryption" == none ]]; then
   if [[ $lan -eq 1 ]]; then

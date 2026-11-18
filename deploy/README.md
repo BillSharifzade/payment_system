@@ -63,6 +63,13 @@ proves the whole model on a scratch database (CI job `db-roles`).
   layer, so a source-only rebuild takes a minute or two after the first build).
   A 2-vCPU box should instead receive images built elsewhere — see "LAN box".
 - Nothing else: no Rust, no Node, no age/gpg (everything runs in images).
+- Recommended on every host that runs Postgres (this box; each Patroni member under HA):
+  `sudo cp sysctl/60-payment-postgres.conf /etc/sysctl.d/ && sudo sysctl --system`. The
+  kernel's default writeback flushes data-file pages in a burst every 5 s, and every COMMIT
+  waits out each burst (measured: ~30 commits stalled ~100 ms at a time; with the two
+  settings in that file p99.9 fell from 150–166 ms to 78 ms, nothing else changed).
+  `deploy.sh` warns while the host still has the defaults. A separate device for `pg_wal`
+  removes the interference altogether.
 
 ## Quick start (fresh install)
 

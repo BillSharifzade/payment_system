@@ -229,8 +229,46 @@ zero failed requests:
 
 The gains survived the later work, and the throughput ranges no longer overlap in any row. The quiet box tightened the spread (uniform base 1503–1608 against 1316–1591 above), and
 single-payer contention gained more than on the shared box (+123% against +92%). One number got
-worse: the uniform p99.9 (170.8 → 196.1 ms) at 21% more throughput, so at saturation the rare
-slow commit now queues behind more work. It is the next thing to look at, not a win to claim.
+worse: the uniform p99.9 (170.8 → 196.1 ms) at 21% more throughput. The next section is what
+that turned out to be.
+
+### Tail latency: the uniform p99.9 is the disk, not the code (November 2026)
+
+The p99.9 of a 30 s uniform run is its 50 slowest requests, and they all come from a few
+instants: about 30 COMMITs at once, each 100–110 ms, finishing in the same millisecond
+(`log_min_duration_statement`) — one WAL flush that every commit in flight was waiting for.
+An independent probe (a process that appends 8 kB to its own preallocated file and
+`fdatasync`s it every 10 ms) stalls at the same instants, so the cause is below Postgres. It
+is not WAL segment creation (a run on recycled segments stalls the same), not online discard
+(`nodiscard` changes nothing) and not the ext4 journal interval (`commit=1` changes nothing):
+the stalls come every ~5 s, the kernel's writeback period. Tables growing at 2 000 inserts/s
+dirty page-cache pages that the kernel writes out in one burst every 5 s once they are 30 s
+old, and while the device absorbs the burst every fsync on it waits.
+
+With `vm.dirty_writeback_centisecs=100` and `vm.dirty_expire_centisecs=200` (write back
+every second, pages older than 2 s) the bursts are small. Both builds, both settings, 5
+interleaved repeats each on fresh databases, same box and Postgres flags as above; 20 runs,
+all verified, zero failed requests:
+
+| Build, kernel writeback | ok/s | p50 ms | p99 ms | p99.9 ms | commit stalls > 25 ms per run |
+|---|---|---|---|---|---|
+| base 80945b0, default (5 s / 30 s) | 1635 (1494–1758) | 38.5 | 62.2 | 149.9 (145.7–161.9) | 3.8 |
+| main 94b1003, default (5 s / 30 s) | 1803 (1692–1919) | 35.0 | 57.0 | 166.3 (137.7–197.9) | 4.6 |
+| base 80945b0, tuned (1 s / 2 s) | 1619 (1520–1629) | 39.0 | 63.4 | **78.8** (77.6–84.8) | 1.8 |
+| main 94b1003, tuned (1 s / 2 s) | 1830 (1767–2065) | 34.7 | 58.4 | **78.4** (60.8–86.3) | 2.0 |
+
+So the two builds have the same tail (the p99.9 ranges overlap under the default and are
+equal when tuned): the earlier 171 → 196 ms was which stalls three runs happened to catch.
+Tuning halves the p99.9 and costs nothing measurable in throughput or p99. It is a host
+setting, so it ships as `deploy/sysctl/60-payment-postgres.conf` (deploy/README.md,
+"Prerequisites"), and `deploy.sh` warns on a host that still has the defaults. What is left of
+the tail (60–86 ms) is ordinary queueing at saturation: 64 clients on a 32-connection pool
+whose commits share one WAL flush at a time (0.8 ms each, 21 of the 30 seconds). A separate
+device for `pg_wal` would take the data files' writeback out of the WAL's way entirely; this
+box has one device, so that is not measured here.
+
+Reproduce: `log_min_duration_statement=25` on the benchmark instance, the uniform case from
+the matrix, and the two sysctls above between runs.
 
 ### Postgres vs TigerBeetle (`LEDGER_BACKEND`, October 2026)
 
