@@ -17,7 +17,9 @@ use uuid::Uuid;
 
 use crate::client::{account_flags as af, transfer_flags as tf, Account, TbClient, Transfer};
 use crate::hybrid::{NoFaults, Probe, Step};
-use crate::{HybridLedger, SimTb, TbConfig, TbError, TbLedger};
+use crate::{
+    HybridLedger, KeyOwner, Keyed, MirrorReport, Screening, SimTb, TbConfig, TbError, TbLedger,
+};
 
 /// A cluster a suite can run against.
 pub trait Cluster: TbClient {
@@ -597,7 +599,13 @@ pub async fn post_and_crash<C: TbClient>(
     };
     let mut conn = ledger.pool().acquire().await.expect("connection");
     let r = ledger
-        .post_probed(&mut conn, txn, PostOptions::default(), &CrashAt(Some(step)))
+        .post_probed(
+            &mut conn,
+            txn,
+            PostOptions::default(),
+            None,
+            &CrashAt(Some(step)),
+        )
         .await;
     assert!(injected(&r), "a crash at {at:?} was injected: {r:?}");
 }
@@ -627,6 +635,7 @@ pub async fn crash_recovery<C: TbClient>(tb: C, pg: &PostgresLedger) {
                 &mut conn,
                 &txn,
                 PostOptions::default(),
+                None,
                 &CrashAt(Some(step)),
             )
             .await;
@@ -684,6 +693,7 @@ pub async fn crash_recovery<C: TbClient>(tb: C, pg: &PostgresLedger) {
                 &mut conn,
                 &txn,
                 PostOptions::default(),
+                None,
                 &CrashAt(Some(step)),
             )
             .await;
@@ -779,7 +789,7 @@ pub async fn tombstone_race<C: TbClient>(tb: C, pg: &PostgresLedger) {
         concurrent: false,
     };
     let r = ledger
-        .post_probed(&mut conn, &txn, PostOptions::default(), &probe)
+        .post_probed(&mut conn, &txn, PostOptions::default(), None, &probe)
         .await;
     assert!(matches!(r, Err(TbError::Retry(_))), "recovery first: {r:?}");
     s.assert_moved(0, "recovery won").await;
@@ -797,7 +807,7 @@ pub async fn tombstone_race<C: TbClient>(tb: C, pg: &PostgresLedger) {
         concurrent: true,
     };
     let r = ledger
-        .post_probed(&mut conn, &txn, PostOptions::default(), &probe)
+        .post_probed(&mut conn, &txn, PostOptions::default(), None, &probe)
         .await;
     assert!(r.is_ok(), "commit first: {r:?}");
     // The spawned pass may still be finishing its post; a full pass afterwards settles nothing.
@@ -828,7 +838,7 @@ pub async fn expiry<C: Cluster>(tb: C, pg: &PostgresLedger) {
     let probe = CrashAt(Some(Step::Reserved));
     assert!(injected(
         &ledger
-            .post_probed(&mut conn, &txn, PostOptions::default(), &probe)
+            .post_probed(&mut conn, &txn, PostOptions::default(), None, &probe)
             .await
     ));
     ledger.tb().client().pass_time(wait).await;
@@ -841,7 +851,7 @@ pub async fn expiry<C: Cluster>(tb: C, pg: &PostgresLedger) {
     let probe = CrashAt(Some(Step::Committed));
     assert!(injected(
         &ledger
-            .post_probed(&mut conn, &txn, PostOptions::default(), &probe)
+            .post_probed(&mut conn, &txn, PostOptions::default(), None, &probe)
             .await
     ));
     ledger.tb().client().pass_time(wait).await;
@@ -879,6 +889,7 @@ pub async fn expiry<C: Cluster>(tb: C, pg: &PostgresLedger) {
             &mut conn,
             &txn,
             PostOptions::default(),
+            None,
             &Slow(Duration::from_millis(1_100)),
         )
         .await;
@@ -1341,6 +1352,36 @@ pub async fn fidelity<A: Cluster, B: Cluster>(a: &A, b: &B, seed: u64) {
         ],
         vec![resolve(130, 128, tf::POST_PENDING_TRANSFER, 4)], // partial post
         vec![t(131, 4, 3, 10), t(132, 3, 4, 20)],              // exceeds_debits
+        // Direct posting's chain: a zero-amount key, a hold with a timeout, a leg.
+        vec![
+            with(t(150, 3, 5, 0), tf::LINKED, 0),
+            with(t(151, 1, 5, 400), tf::LINKED | tf::PENDING, 1),
+            t(152, 1, 2, 7),
+        ],
+        // Its replay: the key exists, and the fresh ids behind it are not burned.
+        vec![
+            with(t(150, 3, 5, 0), tf::LINKED, 0),
+            with(t(153, 1, 5, 400), tf::LINKED | tf::PENDING, 1),
+            t(154, 1, 2, 7),
+        ],
+        vec![t(153, 1, 2, 1), t(154, 1, 2, 1)],
+        // The same key from another request (a different fingerprint).
+        vec![
+            Transfer {
+                user_data_64: 9,
+                ..with(t(150, 3, 5, 0), tf::LINKED, 0)
+            },
+            t(155, 1, 2, 7),
+        ],
+        // A hold that does not fit refuses the chain: the key stays free, the hold's id is
+        // burned (which is why holds and legs carry fresh ids).
+        vec![
+            with(t(156, 3, 5, 0), tf::LINKED, 0),
+            with(t(157, 1, 5, 1_000_000), tf::LINKED | tf::PENDING, 1),
+            t(158, 1, 2, 7),
+        ],
+        vec![with(t(156, 3, 5, 0), tf::LINKED, 0), t(158, 1, 2, 7)],
+        vec![with(t(157, 1, 5, 1), tf::PENDING, 1)],
         vec![with(t(140, 1, 2, 5), tf::PENDING, 1)],
     ];
     let mut seen = std::collections::BTreeSet::new();
@@ -1450,4 +1491,265 @@ pub async fn fidelity<A: Cluster, B: Cluster>(a: &A, b: &B, seed: u64) {
             "stored transfers"
         );
     }
+}
+
+fn rejected(r: &crate::Result<Keyed>) -> Option<&str> {
+    match r {
+        Err(TbError::Storage(storage::StorageError::Rejected { rule, .. })) => Some(rule),
+        _ => None,
+    }
+}
+
+/// Runs `n` jobs at once, each with its own handle on the ledger.
+async fn together<C, T, F>(
+    ledger: &HybridLedger<C>,
+    n: usize,
+    job: impl Fn(HybridLedger<C>) -> F,
+) -> Vec<T>
+where
+    C: TbClient,
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    let handles: Vec<_> = (0..n).map(|_| tokio::spawn(job(ledger.clone()))).collect();
+    let mut out = Vec::with_capacity(n);
+    for h in handles {
+        out.push(h.await.unwrap());
+    }
+    out
+}
+
+/// A user row, for what references one (a void's `voided_by`).
+async fn user(pg: &PostgresLedger) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query("INSERT INTO users (id, phone, password_hash) VALUES ($1, $2, 'x')")
+        .bind(id)
+        .bind(format!("+{}", id.as_u128() % 10u128.pow(15)))
+        .execute(pg.pool())
+        .await
+        .unwrap();
+    id
+}
+
+/// Direct posting at the ledger: one chain per transaction with its key and AML holds, the
+/// guarded protocol and voids sharing the keys, and the journal following the cluster.
+pub async fn direct_posting<C: Cluster>(tb: C, pg: &PostgresLedger) {
+    let window = tb.short_timeout();
+    let cfg = TbConfig {
+        aml_day_secs: window,
+        aml_hour_secs: window,
+        ..config(tb.cluster_id()).direct()
+    };
+    let ledger = hybrid(tb, pg, cfg).await;
+    ledger.tb().ensure_aml_accounts().await.unwrap();
+    // The suites share a cluster: what it journaled for other databases is not this one's.
+    ledger.mirror_from_here().await.unwrap();
+    // Funding goes through the guarded protocol, which binds its own key under direct posting.
+    let s = Scene::new(&ledger, 100 * (AMOUNT + FEE)).await;
+    let tb = ledger.tb();
+    let price = (AMOUNT + FEE) as i64;
+    let screening = |user: Uuid, daily_minor: i64, velocity_per_hour: i64| Screening {
+        user,
+        tjs_minor: price,
+        daily_minor,
+        velocity_per_hour,
+    };
+    let roomy = screening(Uuid::now_v7(), 1_000_000_000, 1_000);
+
+    // Posts once; a replay and another request are told apart by the fingerprint.
+    let p = s.payment();
+    assert_eq!(
+        tb.post_keyed(&p, "pay:1", Some(&roomy)).await.unwrap(),
+        Keyed::Posted
+    );
+    assert_eq!(
+        tb.post_keyed(&p, "pay:1", Some(&roomy)).await.unwrap(),
+        Keyed::Replayed
+    );
+    assert_eq!(
+        tb.post_keyed(&p, "pay:2", Some(&roomy)).await.unwrap(),
+        Keyed::Conflict
+    );
+    assert!(matches!(
+        tb.key_owner(p.id.as_uuid()).await.unwrap(),
+        Some(KeyOwner::Direct { fingerprint, .. }) if fingerprint == crate::fingerprint64("pay:1")
+    ));
+    assert_eq!(tb.keyed_legs(p.id.as_uuid()).await.unwrap().len(), 2);
+    let mut posted = 1;
+
+    // Refused for funds: nothing is left behind, and the same key posts once there are funds.
+    let poor = AccountId::new();
+    ledger
+        .open_account(&LedgerAccount::new(
+            poor,
+            AccountType::UserWallet,
+            Currency::tjs(),
+        ))
+        .await
+        .unwrap();
+    let tjs = Currency::tjs();
+    let broke = Transaction::with_entries(vec![
+        Entry::debit(poor, m(500, tjs)),
+        Entry::credit(s.b, m(500, tjs)),
+    ]);
+    let r = tb.post_keyed(&broke, "broke", Some(&roomy)).await;
+    assert!(
+        matches!(
+            r.as_ref().unwrap_err().as_ledger(),
+            Some(LedgerError::InsufficientFunds { account, .. }) if *account == poor
+        ),
+        "{r:?}"
+    );
+    assert_eq!(tb.key_owner(broke.id.as_uuid()).await.unwrap(), None);
+    ledger
+        .post(&Transaction::with_entries(vec![
+            Entry::debit(s.settlement, m(500, tjs)),
+            Entry::credit(poor, m(500, tjs)),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        tb.post_keyed(&broke, "broke", Some(&roomy)).await.unwrap(),
+        Keyed::Posted
+    );
+
+    // The daily limit under concurrency: of five payments at once, exactly the three that
+    // fit post. Then the window passes and the allowance is whole again.
+    let tight = screening(Uuid::now_v7(), 3 * price, 1_000);
+    let outcomes = together(&ledger, 5, |l| {
+        let txn = s.payment();
+        async move { l.tb().post_keyed(&txn, "burst", Some(&tight)).await }
+    })
+    .await;
+    let fit = outcomes
+        .iter()
+        .filter(|r| matches!(r, Ok(Keyed::Posted)))
+        .count();
+    let over = outcomes
+        .iter()
+        .filter(|r| rejected(r) == Some("daily_limit"))
+        .count();
+    assert_eq!((fit, over), (3, 2), "{outcomes:?}");
+    posted += 3;
+    let refused = s.payment();
+    let r = tb.post_keyed(&refused, "later", Some(&tight)).await;
+    assert_eq!(rejected(&r), Some("daily_limit"), "{r:?}");
+    tb.client().pass_time(window as u64 + 1).await;
+    assert_eq!(
+        tb.post_keyed(&refused, "later", Some(&tight))
+            .await
+            .unwrap(),
+        Keyed::Posted,
+        "the window passed, and the refused key was never spent"
+    );
+    posted += 1;
+
+    // The velocity limit: two an hour.
+    let slow = screening(Uuid::now_v7(), 1_000_000_000, 2);
+    for expect in [None, None, Some("velocity"), Some("velocity")] {
+        let r = tb.post_keyed(&s.payment(), "v", Some(&slow)).await;
+        assert_eq!(rejected(&r), expect, "{r:?}");
+        posted += usize::from(expect.is_none());
+    }
+    // Refused whatever the window holds, without asking the cluster: over the limit alone.
+    let r = tb
+        .post_keyed(
+            &s.payment(),
+            "big",
+            Some(&screening(Uuid::now_v7(), price - 1, 5)),
+        )
+        .await;
+    assert_eq!(rejected(&r), Some("daily_limit"));
+
+    // Voids: the key can never post, on either path; only its voider sees it as theirs.
+    let (by, other) = (user(pg).await, user(pg).await);
+    let voided = s.payment();
+    let v = voided.id.as_uuid();
+    assert!(tb.void_key(v, by).await.unwrap());
+    assert!(tb.void_key(v, by).await.unwrap(), "idempotent");
+    assert!(!tb.void_key(v, other).await.unwrap());
+    assert!(matches!(
+        tb.key_owner(v).await.unwrap(),
+        Some(KeyOwner::Void { by: b, .. }) if b == by
+    ));
+    assert_eq!(
+        tb.post_keyed(&voided, "void", Some(&roomy)).await.unwrap(),
+        Keyed::Voided
+    );
+    let r = ledger.post(&voided).await;
+    assert_eq!(
+        r.as_ref().unwrap_err().as_ledger(),
+        Some(&LedgerError::DuplicateTransaction(voided.id)),
+        "the guarded protocol finds the key taken: {r:?}"
+    );
+    assert!(!tb.void_key(p.id.as_uuid(), by).await.unwrap(), "posted");
+
+    // One key, one request, whichever path gets there first.
+    let r = ledger.post(&p).await;
+    assert_eq!(
+        r.as_ref().unwrap_err().as_ledger(),
+        Some(&LedgerError::DuplicateTransaction(p.id)),
+        "a direct posting owns the key: {r:?}"
+    );
+    let guarded = s.payment();
+    ledger.post(&guarded).await.unwrap();
+    posted += 1;
+    assert_eq!(
+        tb.post_keyed(&guarded, "pay:1", Some(&roomy))
+            .await
+            .unwrap(),
+        Keyed::Conflict,
+        "a guarded posting owns the key"
+    );
+    assert!(matches!(
+        tb.key_owner(guarded.id.as_uuid()).await.unwrap(),
+        Some(KeyOwner::Hybrid { .. })
+    ));
+
+    // The journal follows: two mirrors at once write every posting and void exactly once
+    // (the tables' primary keys would refuse a second copy), then nothing is left, and the
+    // journal equals the cluster account by account.
+    let passes = together(&ledger, 2, |l| async move { l.mirror_all().await }).await;
+    let total =
+        passes
+            .into_iter()
+            .map(|r| r.unwrap())
+            .fold(MirrorReport::default(), |mut acc, r| {
+                acc.transactions += r.transactions;
+                acc.voids += r.voids;
+                acc
+            });
+    // `posted` payments of the scene plus the one from the poor wallet; the guarded ones
+    // (funding, `guarded`) were journaled by their own COMMIT.
+    assert_eq!((total.transactions, total.voids), (posted, 1));
+    let again = ledger.mirror_all().await.unwrap();
+    assert_eq!((again.transactions, again.voids, again.more), (0, 0, false));
+    ledger.settle_journal().await.unwrap();
+    recover_all(&ledger).await;
+    let mut ids = s.ids();
+    ids.push(poor);
+    assert_eq!(ledger.reconcile(&ids).await.unwrap(), vec![]);
+    let b = tb.balances(&[s.b, s.fee]).await.unwrap();
+    assert_eq!(
+        (b[0].posted.minor_units(), b[1].posted.minor_units()),
+        (posted as i128 * AMOUNT + 500, posted as i128 * FEE)
+    );
+    let (journaled, stamped): (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*), COUNT(tb_timestamp) FROM transactions WHERE id = ANY($1)")
+            .bind(vec![p.id.as_uuid(), guarded.id.as_uuid(), v])
+            .fetch_one(pg.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        (journaled, stamped),
+        (3, 2),
+        "the guarded one has no cluster stamp"
+    );
+    let voided_by: Uuid =
+        sqlx::query_scalar("SELECT voided_by FROM voided_transactions WHERE id = $1")
+            .bind(v)
+            .fetch_one(pg.pool())
+            .await
+            .unwrap();
+    assert_eq!(voided_by, by);
 }

@@ -69,3 +69,9 @@ async fn timestamps_bound_what_a_read_saw() {
 async fn a_post_waits_for_holds_in_flight_like_for_a_row_lock() {
     holds(LiveTb::from_test_env(), &postgres().await).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TigerBeetle (TIGERBEETLE_ADDRESSES) and PostgreSQL (DATABASE_URL)"]
+async fn direct_posting_keys_limits_and_the_journal() {
+    direct_posting(LiveTb::from_test_env(), &postgres().await).await;
+}

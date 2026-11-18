@@ -33,6 +33,39 @@ impl Backend {
     }
 }
 
+/// `TIGERBEETLE_POSTING`: who decides a posting under `LEDGER_BACKEND=tigerbeetle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Posting {
+    /// Postgres decides (reserve → commit → post, `hybrid.rs`); the default.
+    Hybrid,
+    /// The cluster decides (`direct.rs`): transfers and conversions post as one chain that
+    /// also enforces the AML limits, and the journal follows from the cluster (`mirror.rs`).
+    Direct,
+}
+
+impl Posting {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Posting::Hybrid => "hybrid",
+            Posting::Direct => "direct",
+        }
+    }
+}
+
+impl FromStr for Posting {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "hybrid" => Ok(Posting::Hybrid),
+            "direct" => Ok(Posting::Direct),
+            _ => Err(format!(
+                "TIGERBEETLE_POSTING={s:?} must be hybrid or direct"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TbConfig {
     /// `TIGERBEETLE_CLUSTER_ID` (required): the id the cluster was formatted with.
@@ -58,6 +91,13 @@ pub struct TbConfig {
     /// as a Postgres post waits for a wallet's row lock (`DB_LOCK_TIMEOUT_MS`); then it fails
     /// as retryable (503), never as insufficient funds the committed balance contradicts.
     pub hold_wait: Duration,
+    /// `TIGERBEETLE_POSTING` (default `hybrid`). Must match what the database was switched
+    /// to (`payment-server tigerbeetle-posting`), or the server refuses to start.
+    pub posting: Posting,
+    /// The AML windows the cluster enforces under direct posting: how long a payment's holds
+    /// stay on the payer's 24 h and 1 h allowances. Not configurable (tests shorten them).
+    pub aml_day_secs: u32,
+    pub aml_hour_secs: u32,
 }
 
 impl TbConfig {
@@ -76,7 +116,15 @@ impl TbConfig {
             recovery_grace: Duration::from_secs(Self::DEFAULT_RECOVERY_GRACE_SECS),
             sessions: 1,
             hold_wait: Duration::from_millis(Self::DEFAULT_HOLD_WAIT_MS),
+            posting: Posting::Hybrid,
+            aml_day_secs: 24 * 3600,
+            aml_hour_secs: 3600,
         }
+    }
+
+    pub fn direct(mut self) -> Self {
+        self.posting = Posting::Direct;
+        self
     }
 
     /// A reservation must commit within half its timeout: the other half is the recovery
@@ -129,6 +177,9 @@ impl TbConfig {
         if let Some(ms) = parse::<u64>("TIGERBEETLE_HOLD_WAIT_MS", get("TIGERBEETLE_HOLD_WAIT_MS"))?
         {
             cfg.hold_wait = Duration::from_millis(ms);
+        }
+        if let Some(posting) = get("TIGERBEETLE_POSTING") {
+            cfg.posting = posting.trim().parse()?;
         }
         cfg.validate()?;
         Ok(cfg)
@@ -260,6 +311,8 @@ mod tests {
             ("TIGERBEETLE_SESSIONS", "two"),
             ("TIGERBEETLE_HOLD_WAIT_MS", "30001"),
             ("TIGERBEETLE_HOLD_WAIT_MS", "-1"),
+            ("TIGERBEETLE_POSTING", "Direct"),
+            ("TIGERBEETLE_POSTING", ""),
         ] {
             let mut vars = base.to_vec();
             vars.retain(|(key, _)| *key != k);
@@ -273,6 +326,10 @@ mod tests {
         let mut sessions = base.to_vec();
         sessions.push(("TIGERBEETLE_SESSIONS", "4"));
         assert_eq!(cfg(&sessions).unwrap().sessions, 4);
+        assert_eq!(cfg(&base).unwrap().posting, Posting::Hybrid);
+        let mut direct = base.to_vec();
+        direct.push(("TIGERBEETLE_POSTING", "direct"));
+        assert_eq!(cfg(&direct).unwrap().posting, Posting::Direct);
         let v6 = [
             ("TIGERBEETLE_CLUSTER_ID", "7"),
             ("TIGERBEETLE_ADDRESSES", "[::1]:3000,3001"),

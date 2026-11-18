@@ -218,6 +218,12 @@ async fn lookup_classifies_like_the_statement() {
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn a_void_that_wins_the_race_turns_the_post_into_voided() {
+    // Stages the race on the `transactions` primary key, which decides it under Postgres and
+    // the hybrid. Under direct posting the key in the cluster decides it, and nothing may
+    // write a void behind the cluster's back: tests/direct.rs races the two there.
+    if backend().is_direct() {
+        return;
+    }
     let base = migrated_pool().await;
     let app_name = format!("void-race-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let url = std::env::var("DATABASE_URL").unwrap();

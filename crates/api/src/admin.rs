@@ -537,6 +537,7 @@ pub async fn admin_status(
     _admin: AdminUser,
     State(state): State<AppState>,
 ) -> ApiResult<Json<AdminStatusResponse>> {
+    state.ledger.settle_journal().await?;
     let cp = sqlx::query(
         "SELECT seq, to_txn_seq, txn_count,
                 (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS ms
@@ -645,6 +646,7 @@ pub async fn admin_metrics(
     _admin: AdminUser,
     State(state): State<AppState>,
 ) -> ApiResult<Json<MetricsResponse>> {
+    state.ledger.settle_journal().await?;
     let pool = state.ledger.pool();
 
     let volume_rows = sqlx::query(

@@ -135,6 +135,8 @@ pub async fn get_transaction(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<TransactionResponse>> {
+    // Under direct posting the journal follows the cluster: read what the cluster has applied.
+    state.ledger.settle_journal().await?;
     let mut conn = state.ledger.pool().acquire().await.map_err(db_err)?;
     Ok(Json(lookup(&mut conn, id, user_id).await?))
 }
@@ -142,12 +144,40 @@ pub async fn get_transaction(
 // Claiming the id in `transactions` (no entries) is what makes a void final: post_on claims
 // the same primary key first, so whichever commits first wins and the loser sees a duplicate.
 // A deposit request's id is reserved for its approval; withdrawing one is a reject, not a void.
+//
+// Under direct posting the cluster decides whose a key is (a posting's, a guarded request's or
+// a void's: `ledger_tigerbeetle::direct`), so the void is claimed there and the journal mirror
+// writes these rows. Only a key bound to a guarded request that has not committed is still
+// voided here: its posting claims the same primary key before it can commit.
 pub async fn void_transaction(
     AuthUser(user_id): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<TransactionResponse>> {
     let mut conn = state.ledger.pool().acquire().await.map_err(db_err)?;
+    if state.ledger.cluster_screens() {
+        let reserved: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM deposit_requests WHERE id = $1)")
+                .bind(id)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(db_err)?;
+        let voided = !reserved && state.ledger.void_key(id, user_id).await?;
+        let guarded = !reserved
+            && !voided
+            && matches!(
+                state.ledger.key_owner(id).await?,
+                Some(ledger_tigerbeetle::KeyOwner::Hybrid { .. })
+            );
+        if !guarded {
+            if voided {
+                metrics::counter!("transactions_voided_total").increment(1);
+                tracing::info!(%user_id, transaction_id = %id, "idempotency key voided");
+            }
+            state.ledger.settle_journal().await?;
+            return Ok(Json(lookup(&mut conn, id, user_id).await?));
+        }
+    }
     let claimed: Option<String> = sqlx::query_scalar(&format!(
         "WITH claim AS (
              INSERT INTO transactions (id)

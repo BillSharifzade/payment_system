@@ -929,9 +929,17 @@ async fn settle_check(
     let event = s.event;
     let release_slot = i32::from(event.is_some());
     let aml_screen = screen.clone();
+    // Under direct posting the cluster enforces the AML limits (the holds are placed with
+    // the posting's key, right before the COMMIT): the guard neither locks the payer nor
+    // sums the window, and records the screening it passes itself.
+    let cluster_screens = state.ledger.cluster_screens();
+    let screening = cluster_screens.then(|| crate::payments::screening(&screen, tjs, limits));
     let guard: PostHook = Box::new(move |conn: &mut PgConnection| {
         Box::pin(async move {
-            let stored = lock_user(conn, payer_id).await?;
+            let stored = match cluster_screens {
+                true => false,
+                false => lock_user(conn, payer_id).await?,
+            };
             let updated = sqlx::query(
                 "UPDATE checks
                  SET status = 'paid', payer_user_id = $2, payer_account = $3,
@@ -970,6 +978,9 @@ async fn settle_check(
                 .execute(&mut *conn)
                 .await?;
             }
+            if cluster_screens {
+                return Ok(crate::payments::allow_screening(conn, &aml_screen).await?);
+            }
             aml_check(conn, &aml_screen, tjs, limits, stored).await
         })
     });
@@ -977,7 +988,10 @@ async fn settle_check(
         idempotency: Some(record(key, s.fingerprint, &created)?),
         guard: Some(guard),
     };
-    let result = state.ledger.post_on(&mut *conn, &txn, opts).await;
+    let result = state
+        .ledger
+        .post_screened_on(&mut *conn, &txn, opts, screening)
+        .await;
     if let Err(StorageError::Rejected { rule, .. }) = &result {
         if rule == "check_not_open" {
             return Err(ApiError::Conflict("check is no longer open".to_string()));
@@ -985,9 +999,9 @@ async fn settle_check(
     }
     let out = finish(
         &mut *conn,
+        state,
         result,
-        key,
-        s.fingerprint,
+        (key, s.fingerprint),
         created,
         raced,
         Some(&screen),

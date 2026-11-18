@@ -291,6 +291,10 @@ async fn main() -> Result<(), BoxError> {
     if !(1..=60).contains(&recovery_interval.as_secs()) {
         return Err("TIGERBEETLE_RECOVERY_INTERVAL_SECS must be 1..=60".into());
     }
+    let mirror_interval = Duration::from_millis(env_or("TIGERBEETLE_MIRROR_INTERVAL_MS", 100)?);
+    if !(10..=10_000).contains(&mirror_interval.as_millis()) {
+        return Err("TIGERBEETLE_MIRROR_INTERVAL_MS must be 10..=10000".into());
+    }
     let interval_secs: u64 = env_or("WORKER_INTERVAL_SECS", 5)?;
     let relay_interval_secs: u64 = env_or("RELAY_INTERVAL_SECS", 2)?;
     let batch_size: i64 = env_or("SEAL_BATCH_SIZE", 500)?;
@@ -395,12 +399,19 @@ async fn main() -> Result<(), BoxError> {
         ),
         None => tracing::info!("LEDGER_BACKEND=postgres: reconciling the balances table"),
     }
+    if ledger.as_ref().is_some_and(direct_posting) {
+        tracing::info!(
+            mirror_interval_ms = mirror_interval.as_millis() as u64,
+            "TIGERBEETLE_POSTING=direct: journaling what the cluster posts"
+        );
+    }
 
     let cfg = Config {
         pool,
         connect_options,
         ledger,
         recovery_interval,
+        mirror_interval,
         signer: SignerSlot {
             cfg: signer_cfg,
             signer,
@@ -441,12 +452,18 @@ async fn main() -> Result<(), BoxError> {
     }
 }
 
+fn direct_posting(ledger: &HybridLedger<AnyTb>) -> bool {
+    ledger.tb().config().posting == ledger_tigerbeetle::Posting::Direct
+}
+
 struct Config {
     pool: PgPool,
     connect_options: PgConnectOptions,
     /// LEDGER_BACKEND=tigerbeetle.
     ledger: Option<HybridLedger<AnyTb>>,
     recovery_interval: Duration,
+    /// TIGERBEETLE_POSTING=direct: how often the journal mirror looks for new postings.
+    mirror_interval: Duration,
     signer: SignerSlot,
     trusted: TrustedKeys,
     tsa_trust: Option<TsaTrust>,
@@ -508,6 +525,7 @@ struct Liveness {
     duties: AtomicU64,
     anchor: AtomicU64,
     recovery: AtomicU64,
+    mirror: AtomicU64,
 }
 
 impl Liveness {
@@ -526,6 +544,7 @@ async fn heartbeat_loop(
     relay_interval_secs: u64,
     anchor_tick: Option<Duration>,
     recovery_tick: Option<Duration>,
+    mirror_tick: Option<Duration>,
     mut stop: watch::Receiver<bool>,
 ) {
     let path = heartbeat_path();
@@ -540,6 +559,9 @@ async fn heartbeat_loop(
     }
     if let Some(tick) = recovery_tick {
         limits.push(("recovery", &liveness.recovery, 3 * tick.as_secs() + 120));
+    }
+    if let Some(tick) = mirror_tick {
+        limits.push(("mirror", &liveness.mirror, 3 * tick.as_secs() + 120));
     }
     let mut ticker = ticker(Duration::from_secs(interval_secs));
     loop {
@@ -1407,6 +1429,7 @@ async fn run<P: EventPublisher + Send + Sync + 'static>(
         &liveness.duties,
         &liveness.anchor,
         &liveness.recovery,
+        &liveness.mirror,
     ] {
         Liveness::beat(slot);
     }
@@ -1423,6 +1446,21 @@ async fn run<P: EventPublisher + Send + Sync + 'static>(
             leader_rx.clone(),
             stop_rx.clone(),
             move || Liveness::beat(&liveness.recovery),
+        ))
+    });
+    let mirror_tick = cfg
+        .ledger
+        .as_ref()
+        .filter(|l| direct_posting(l))
+        .map(|_| cfg.mirror_interval);
+    let mirror = cfg.ledger.clone().filter(direct_posting).map(|ledger| {
+        let liveness = liveness.clone();
+        tokio::spawn(workers::mirror_loop(
+            ledger,
+            cfg.mirror_interval,
+            leader_rx.clone(),
+            stop_rx.clone(),
+            move || Liveness::beat(&liveness.mirror),
         ))
     });
 
@@ -1454,6 +1492,7 @@ async fn run<P: EventPublisher + Send + Sync + 'static>(
         cfg.relay_interval_secs,
         anchor_tick,
         recovery_tick,
+        mirror_tick,
         stop_rx.clone(),
     ));
     let anchor = anchor_tick.map(|tick| {
@@ -1485,6 +1524,9 @@ async fn run<P: EventPublisher + Send + Sync + 'static>(
     }
     if let Some(recovery) = recovery {
         let _ = recovery.await;
+    }
+    if let Some(mirror) = mirror {
+        let _ = mirror.await;
     }
     // Released only after the leader-only loops have finished their batch.
     if let Ok(Some(lock)) = election.await {

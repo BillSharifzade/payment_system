@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 
@@ -22,6 +22,8 @@ pub struct TbLedger<C> {
     tb: Arc<C>,
     cfg: Arc<TbConfig>,
     registry: Arc<RwLock<HashMap<AccountId, AccountInfo>>>,
+    /// Users whose AML limit accounts are known to exist and be funded (`limits.rs`).
+    pub(crate) limits_ready: Arc<RwLock<HashSet<u128>>>,
 }
 
 impl<C> Clone for TbLedger<C> {
@@ -30,6 +32,7 @@ impl<C> Clone for TbLedger<C> {
             tb: self.tb.clone(),
             cfg: self.cfg.clone(),
             registry: self.registry.clone(),
+            limits_ready: self.limits_ready.clone(),
         }
     }
 }
@@ -65,6 +68,7 @@ impl<C: TbClient> TbLedger<C> {
             tb: Arc::new(tb),
             cfg: Arc::new(cfg),
             registry: Arc::new(RwLock::new(HashMap::new())),
+            limits_ready: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -78,6 +82,7 @@ impl<C: TbClient> TbLedger<C> {
             tb: self.tb.clone(),
             cfg: Arc::new(cfg),
             registry: self.registry.clone(),
+            limits_ready: self.limits_ready.clone(),
         }
     }
 

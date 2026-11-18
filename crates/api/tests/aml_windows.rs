@@ -1,3 +1,7 @@
+//! The Postgres guard's stored AML windows (`aml_windows`, migration 0030). Under direct
+//! posting the cluster holds the windows instead (`tests/direct.rs` has those suites), so
+//! these skip themselves there: they stage journal entries the cluster never saw.
+
 mod common;
 
 use api::{AmlConfig, Limits, RateLimitState};
@@ -131,6 +135,9 @@ async fn age_window(pool: &PgPool, user: &str, day_from: &str, hour_from: &str) 
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn the_window_always_equals_a_full_recount() {
+    if backend().is_direct() {
+        return;
+    }
     let pool = migrated_pool().await;
     let app = router_with_aml(
         pool.clone(),
@@ -192,6 +199,9 @@ async fn the_window_always_equals_a_full_recount() {
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn limits_count_every_debit_in_the_window() {
+    if backend().is_direct() {
+        return;
+    }
     for bulk in [0, STORED_FROM] {
         let pool = migrated_pool().await;
         let app = router_with_aml(
@@ -233,6 +243,9 @@ async fn limits_count_every_debit_in_the_window() {
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL (docker compose up -d)"]
 async fn a_stored_window_stays_exact_under_concurrency() {
+    if backend().is_direct() {
+        return;
+    }
     let pool = migrated_pool().await;
     let app = router_with_aml(
         pool.clone(),

@@ -18,6 +18,8 @@
 //! the backstop for a recovery worker that is down.
 
 use std::future::Future;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ledger::{Account as LedgerAccount, AccountId, LedgerError, NormalSide, Transaction};
@@ -26,8 +28,10 @@ use storage::{HookError, IdempotencyRecord, PostOptions, PostgresLedger, Storage
 use uuid::Uuid;
 
 use crate::client::{transfer_flags as tf, TbClient, Transfer, TransferResult, AMOUNT_MAX};
+use crate::config::Posting;
 use crate::error::{first_failure, leg_failure, LegFailure, Result, TbError};
 use crate::ids::{self, leg};
+use crate::limits::Screening;
 use crate::plan::Leg;
 use crate::tb::{link, low64, TbLedger};
 
@@ -213,6 +217,8 @@ enum Commit {
 pub struct HybridLedger<C> {
     tb: TbLedger<C>,
     pg: PostgresLedger,
+    /// The journal mirror's watermark as far as this process has seen it (`mirror.rs`).
+    pub(crate) mirror_seen: Arc<AtomicU64>,
 }
 
 impl<C> Clone for HybridLedger<C> {
@@ -220,13 +226,18 @@ impl<C> Clone for HybridLedger<C> {
         Self {
             tb: self.tb.clone(),
             pg: self.pg.clone(),
+            mirror_seen: self.mirror_seen.clone(),
         }
     }
 }
 
 impl<C: TbClient> HybridLedger<C> {
     pub fn new(tb: TbLedger<C>, pg: PostgresLedger) -> Self {
-        Self { tb, pg }
+        Self {
+            tb,
+            pg,
+            mirror_seen: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn tb(&self) -> &TbLedger<C> {
@@ -256,6 +267,13 @@ impl<C: TbClient> HybridLedger<C> {
         owner: Option<Uuid>,
     ) -> Result<()> {
         self.tb.open_account(account).await?;
+        // Under direct posting a wallet's owner needs their AML limit accounts before the
+        // first payment (which would otherwise create them on its first try).
+        if let (Posting::Direct, Some(owner)) = (self.tb.config().posting, owner) {
+            if account.account_type == ledger::AccountType::UserWallet {
+                self.tb.ensure_limit_accounts(&[owner]).await?;
+            }
+        }
         Ok(self.pg.open_account_owned_on(conn, account, owner).await?)
     }
 
@@ -272,7 +290,22 @@ impl<C: TbClient> HybridLedger<C> {
         txn: &Transaction,
         opts: PostOptions,
     ) -> Result<()> {
-        self.post_probed(conn, txn, opts, &NoFaults).await
+        self.post_probed(conn, txn, opts, None, &NoFaults).await
+    }
+
+    /// [`post_on`](Self::post_on) for a posting the AML limits apply to. Under direct posting
+    /// the cluster enforces them (`screening`: the holds are placed with the posting's key,
+    /// right before the COMMIT) and the guard must not; under hybrid posting the guard does,
+    /// and `screening` is ignored.
+    pub async fn post_screened_on(
+        &self,
+        conn: &mut PgConnection,
+        txn: &Transaction,
+        opts: PostOptions,
+        screening: Option<Screening>,
+    ) -> Result<()> {
+        self.post_probed(conn, txn, opts, screening, &NoFaults)
+            .await
     }
 
     pub(crate) async fn post_probed<P: Probe>(
@@ -280,6 +313,7 @@ impl<C: TbClient> HybridLedger<C> {
         conn: &mut PgConnection,
         txn: &Transaction,
         opts: PostOptions,
+        screening: Option<Screening>,
         probe: &P,
     ) -> Result<()> {
         // A savepoint is not a commit point: the post would follow a COMMIT the caller's
@@ -294,7 +328,7 @@ impl<C: TbClient> HybridLedger<C> {
         let plan = self.tb.plan(txn).await?;
         if plan.legs.is_empty() {
             // Nothing moves (every account nets to zero): Postgres alone records it.
-            return match self.commit(conn, txn, opts, None, probe).await {
+            return match self.commit(conn, txn, opts, screening, None, probe).await {
                 Ok(()) => Ok(()),
                 Err(Commit::RolledBack(e) | Commit::Unknown(e) | Commit::Crashed(e)) => Err(e),
             };
@@ -330,7 +364,7 @@ impl<C: TbClient> HybridLedger<C> {
         crash(probe, Step::Reserved).await?;
 
         match self
-            .commit(conn, txn, opts, Some((&attempt, started)), probe)
+            .commit(conn, txn, opts, screening, Some((&attempt, started)), probe)
             .await
         {
             Ok(()) => {}
@@ -428,6 +462,7 @@ impl<C: TbClient> HybridLedger<C> {
         conn: &mut PgConnection,
         txn: &Transaction,
         opts: PostOptions,
+        screening: Option<Screening>,
         attempt: Option<(&Attempt, Instant)>,
         probe: &P,
     ) -> core::result::Result<(), Commit> {
@@ -439,7 +474,7 @@ impl<C: TbClient> HybridLedger<C> {
         // Roll back explicitly: until it happens the claim and intent keys stay locked, and
         // recovery's tombstone would wait on them.
         let body = async {
-            self.journal(&mut db, txn, opts, attempt.map(|(a, _)| a))
+            self.journal(&mut db, txn, opts, screening, attempt.map(|(a, _)| a))
                 .await?;
             if probe.at(Step::Mirrored).await {
                 return Err(None);
@@ -483,12 +518,15 @@ impl<C: TbClient> HybridLedger<C> {
     }
 
     /// Claim, intent, guards and mirror, in that order: the claim first so a duplicate never
-    /// runs the guards (nor queues on their locks while holding the claim).
+    /// runs the guards (nor queues on their locks while holding the claim). Under direct
+    /// posting the transaction's key in the cluster comes last (`direct.rs`): only a posting
+    /// every guard let through binds its key, and the AML holds are placed with it.
     async fn journal(
         &self,
         db: &mut PgConnection,
         txn: &Transaction,
         opts: PostOptions,
+        screening: Option<Screening>,
         attempt: Option<&Attempt>,
     ) -> core::result::Result<(), Option<TbError>> {
         let db_err = |e: sqlx::Error| Some(TbError::from(e));
@@ -528,7 +566,23 @@ impl<C: TbClient> HybridLedger<C> {
         }
         mirror(db, txn, opts.idempotency.as_ref())
             .await
-            .map_err(Some)
+            .map_err(Some)?;
+        if self.tb.config().posting == Posting::Direct {
+            let fingerprint = opts
+                .idempotency
+                .as_ref()
+                .map_or(0, |r| ids::fingerprint64(&r.fingerprint));
+            let ours = self
+                .tb
+                .claim_key(txn.id.as_uuid().as_u128(), fingerprint, screening.as_ref())
+                .await
+                .map_err(Some)?;
+            if !ours {
+                // A direct posting, another guarded request or a void owns the key.
+                return Err(Some(LedgerError::DuplicateTransaction(txn.id).into()));
+            }
+        }
+        Ok(())
     }
 
     /// Records the outcome Postgres decided for an attempt, or a `void` tombstone if it has

@@ -3,9 +3,16 @@
 //! journal, outbox and idempotency records, and runs the same guards under the same row
 //! locks), so only posting, account opening and balance reads dispatch here. Under
 //! TigerBeetle the `balances` table is no longer written: nothing may read it but this module.
+//!
+//! Under direct posting (`TIGERBEETLE_POSTING=direct`) the cluster also decides transfers and
+//! conversions by itself, AML limits included (`post_keyed`), and Postgres journals them
+//! afterwards: a handler that reads the journal calls `settle_journal` first, so a client
+//! always reads its own writes.
 
 use ledger::{Account, AccountId, AccountType, LedgerError, NormalSide, Transaction};
-use ledger_tigerbeetle::{AnyTb, Balance, HybridLedger, TbConfig, TbError};
+use ledger_tigerbeetle::{
+    AnyTb, Balance, HybridLedger, KeyOwner, Keyed, Posting, Screening, TbConfig, TbError,
+};
 use money::{Currency, Money};
 use sqlx::{PgConnection, PgExecutor, PgPool, Row};
 use storage::{PostOptions, PostgresLedger, StorageError};
@@ -108,9 +115,120 @@ impl Ledger {
         txn: &Transaction,
         opts: PostOptions,
     ) -> storage::Result<()> {
+        self.post_screened_on(conn, txn, opts, None).await
+    }
+
+    /// [`post_on`](Self::post_on) for a posting the AML limits apply to. Where the cluster
+    /// enforces them ([`cluster_screens`](Self::cluster_screens)) it does so from `screening`
+    /// and the guard in `opts` must leave them alone; everywhere else the guard enforces them
+    /// and `screening` is ignored.
+    pub async fn post_screened_on(
+        &self,
+        conn: &mut PgConnection,
+        txn: &Transaction,
+        opts: PostOptions,
+        screening: Option<Screening>,
+    ) -> storage::Result<()> {
         match self {
             Ledger::Postgres(l) => l.post_on(conn, txn, opts).await,
-            Ledger::TigerBeetle(l) => l.post_on(conn, txn, opts).await.map_err(tb_error),
+            Ledger::TigerBeetle(l) => {
+                let result = l
+                    .post_screened_on(conn, txn, opts, screening)
+                    .await
+                    .map_err(tb_error);
+                // The handler asks Postgres whose the id is: let it see what the cluster knows.
+                if let Err(StorageError::Ledger(LedgerError::DuplicateTransaction(_))) = &result {
+                    l.settle_journal().await.map_err(tb_error)?;
+                }
+                result
+            }
+        }
+    }
+
+    fn direct(&self) -> Option<&HybridLedger<AnyTb>> {
+        match self {
+            Ledger::TigerBeetle(l) if l.tb().config().posting == Posting::Direct => Some(l),
+            _ => None,
+        }
+    }
+
+    fn direct_only(&self) -> storage::Result<&HybridLedger<AnyTb>> {
+        self.direct().ok_or_else(|| {
+            StorageError::DataIntegrity("this ledger backend does not post directly".into())
+        })
+    }
+
+    /// Whether the cluster decides transfers and conversions and enforces the AML limits
+    /// (direct posting): the Postgres guards must not, and the journal follows the cluster.
+    pub fn cluster_screens(&self) -> bool {
+        self.direct().is_some()
+    }
+
+    /// Direct posting only: `txn` as one chain in the cluster, with its key and AML holds.
+    pub async fn post_keyed(
+        &self,
+        txn: &Transaction,
+        fingerprint: &str,
+        screening: &Screening,
+    ) -> storage::Result<Keyed> {
+        self.direct_only()?
+            .tb()
+            .post_keyed(txn, fingerprint, Some(screening))
+            .await
+            .map_err(tb_error)
+    }
+
+    /// Direct posting only: whom an idempotency key belongs to in the cluster.
+    pub async fn key_owner(&self, key: Uuid) -> storage::Result<Option<KeyOwner>> {
+        self.direct_only()?
+            .tb()
+            .key_owner(key)
+            .await
+            .map_err(tb_error)
+    }
+
+    /// Direct posting only: what a posted transaction moved out of `from` and into `to`.
+    pub async fn keyed_movement(
+        &self,
+        key: Uuid,
+        from: Uuid,
+        to: Uuid,
+    ) -> storage::Result<(i64, i64)> {
+        let legs = self
+            .direct_only()?
+            .tb()
+            .keyed_legs(key)
+            .await
+            .map_err(tb_error)?;
+        let sum = |pick: &dyn Fn(&ledger_tigerbeetle::Transfer) -> bool| {
+            let total: u128 = legs.iter().filter(|l| pick(l)).map(|l| l.amount).sum();
+            i64::try_from(total).map_err(|_| {
+                StorageError::AmountTooLarge(i128::try_from(total).unwrap_or(i128::MAX))
+            })
+        };
+        Ok((
+            sum(&|l| l.debit_account_id == from.as_u128())?,
+            sum(&|l| l.credit_account_id == to.as_u128())?,
+        ))
+    }
+
+    /// Direct posting only: voids an idempotency key in the cluster. `false`: the key
+    /// already belongs to a posting, a guarded request or someone else's void.
+    pub async fn void_key(&self, key: Uuid, by: Uuid) -> storage::Result<bool> {
+        self.direct_only()?
+            .tb()
+            .void_key(key, by)
+            .await
+            .map_err(tb_error)
+    }
+
+    /// Makes the journal current before it is read: under direct posting it follows the
+    /// cluster, and this waits for (and helps) the mirror to hold everything the cluster had
+    /// applied. Nothing to do on the other backends, whose postings commit in Postgres.
+    pub async fn settle_journal(&self) -> storage::Result<()> {
+        match self.direct() {
+            Some(l) => l.settle_journal().await.map_err(tb_error),
+            None => Ok(()),
         }
     }
 
@@ -203,6 +321,7 @@ impl Ledger {
     /// Per currency, what every account nets to: zero while money is conserved. Postgres sums
     /// its balances; under TigerBeetle, whose ledgers conserve by construction, the journal.
     pub async fn conservation(&self) -> storage::Result<Vec<(String, i64)>> {
+        self.settle_journal().await?;
         let sql = match self {
             Ledger::Postgres(_) => "SELECT a.currency, SUM(b.raw_minor)::BIGINT
                  FROM balances b JOIN accounts a ON a.id = b.account_id
@@ -219,6 +338,7 @@ impl Ledger {
 
     /// Per currency, the funds held in user wallets.
     pub async fn customer_funds(&self) -> storage::Result<Vec<(String, i64)>> {
+        self.settle_journal().await?;
         let sql = match self {
             Ledger::Postgres(_) => "SELECT a.currency, SUM(b.raw_minor)::BIGINT
                  FROM balances b JOIN accounts a ON a.id = b.account_id

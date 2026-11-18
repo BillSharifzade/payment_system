@@ -13,9 +13,12 @@ use uuid::Uuid;
 use crate::client::{
     Account, AccountResult, TbClient, Transfer, TransferResult, CREATE_BATCH, LOOKUP_BATCH,
 };
+use crate::config::Posting;
 use crate::error::Result;
 use crate::hybrid::HybridLedger;
 use crate::ids;
+use crate::limits::HoldSeed;
+use crate::mirror::MirrorReport;
 use crate::recovery::RecoveryReport;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -24,6 +27,21 @@ pub struct RollbackReport {
     /// `balances` rows that differed from the journal (all that moved since the cut-over).
     pub balances_rewritten: u64,
     /// The final recovery pass, with no grace: nothing was left pending.
+    pub settled: RecoveryReport,
+}
+
+/// What `payment-server tigerbeetle-posting` did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SwitchReport {
+    /// The mode now recorded.
+    pub posting: &'static str,
+    /// To direct: users whose limit accounts exist in the cluster now.
+    pub users: usize,
+    /// To direct: AML holds standing for the journal's debits of the last 24 h.
+    pub holds_seeded: usize,
+    /// To hybrid: what the journal mirror still had to write.
+    pub mirrored: MirrorReport,
+    /// The final recovery pass, with no grace.
     pub settled: RecoveryReport,
 }
 
@@ -227,7 +245,7 @@ impl<C: TbClient> HybridLedger<C> {
         Ok(report)
     }
 
-    fn cluster(&self) -> Uuid {
+    pub(crate) fn cluster(&self) -> Uuid {
         Uuid::from_u128(self.tb().client().cluster_id())
     }
 
@@ -267,7 +285,116 @@ impl<C: TbClient> HybridLedger<C> {
             ))
             .into());
         }
+        let configured = self.tb().config().posting;
+        let stored = self.adopt_posting(configured).await?;
+        if stored != configured {
+            return Err(StorageError::DataIntegrity(format!(
+                "this database is served with {} posting, not TIGERBEETLE_POSTING={}: set \
+                 TIGERBEETLE_POSTING={0}, or stop money movement and run `payment-server \
+                 tigerbeetle-posting {1}`",
+                stored.as_str(),
+                configured.as_str()
+            ))
+            .into());
+        }
+        if configured == Posting::Direct {
+            self.tb().ensure_aml_accounts().await?;
+            self.mirror_from_here().await?;
+        }
         self.open_system_accounts().await
+    }
+
+    /// The posting mode recorded for this cluster. With none recorded, a database that holds
+    /// no transaction takes `configured` (there is no AML window to carry over); any other is
+    /// under hybrid posting.
+    async fn adopt_posting(&self, configured: Posting) -> Result<Posting> {
+        sqlx::query(
+            "INSERT INTO tb_posting (cluster_id, posting)
+             SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM transactions)
+             ON CONFLICT (cluster_id) DO NOTHING",
+        )
+        .bind(self.cluster())
+        .bind(configured.as_str())
+        .execute(self.pool())
+        .await?;
+        self.stored_posting().await
+    }
+
+    /// The posting mode this database is served with by this cluster (`hybrid` unless a
+    /// switch recorded otherwise).
+    pub async fn stored_posting(&self) -> Result<Posting> {
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT posting FROM tb_posting WHERE cluster_id = $1")
+                .bind(self.cluster())
+                .fetch_optional(self.pool())
+                .await?;
+        match stored.as_deref() {
+            None | Some("hybrid") => Ok(Posting::Hybrid),
+            Some("direct") => Ok(Posting::Direct),
+            Some(other) => {
+                Err(StorageError::DataIntegrity(format!("tb_posting.posting={other}")).into())
+            }
+        }
+    }
+
+    async fn record_posting(&self, posting: Posting) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO tb_posting (cluster_id, posting) VALUES ($1, $2)
+             ON CONFLICT (cluster_id) DO UPDATE
+             SET posting = EXCLUDED.posting, switched_at = now()",
+        )
+        .bind(self.cluster())
+        .bind(posting.as_str())
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Hybrid → direct posting, with money movement stopped: settles every reservation, gives
+    /// every wallet owner their limit accounts and re-creates the AML holds of the journal's
+    /// debits still inside their windows (`seeds`, oldest first per user: the API computes
+    /// them from the journal, the users' limits and the rates), so each user's rolling 24 h
+    /// and 1 h carry over. Idempotent.
+    pub async fn switch_to_direct(&self, seeds: &[HoldSeed]) -> Result<SwitchReport> {
+        self.refuse_rolled_back().await?;
+        let settled = self.recover_quiesced().await?;
+        self.tb().ensure_aml_accounts().await?;
+        let users: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT owner_user_id FROM accounts
+             WHERE account_type = 'user_wallet' AND owner_user_id IS NOT NULL",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        self.tb().ensure_limit_accounts(&users).await?;
+        let holds_seeded = self.tb().seed_holds(seeds).await?;
+        self.mirror_from_here().await?;
+        self.record_posting(Posting::Direct).await?;
+        Ok(SwitchReport {
+            posting: Posting::Direct.as_str(),
+            users: users.len(),
+            holds_seeded,
+            settled,
+            ..SwitchReport::default()
+        })
+    }
+
+    /// Direct → hybrid posting, with money movement stopped: the journal catches up with the
+    /// cluster and every reservation is settled. From then on the Postgres guard decides the
+    /// AML limits again, from the journal (which holds every debit, so nothing is carried).
+    pub async fn switch_to_hybrid(&self) -> Result<SwitchReport> {
+        self.refuse_rolled_back().await?;
+        let mirrored = match self.has_mirrored().await? {
+            true => self.mirror_all().await?,
+            false => MirrorReport::default(),
+        };
+        let settled = self.recover_quiesced().await?;
+        self.record_posting(Posting::Hybrid).await?;
+        Ok(SwitchReport {
+            posting: Posting::Hybrid.as_str(),
+            mirrored,
+            settled,
+            ..SwitchReport::default()
+        })
     }
 
     async fn refuse_rolled_back(&self) -> Result<()> {
@@ -312,6 +439,10 @@ impl<C: TbClient> HybridLedger<C> {
     /// `balances` from the journal in one transaction (refusing unless the result conserves
     /// per currency) and marks this cluster rolled back, so it is never served again.
     pub async fn rollback_to_postgres(&self) -> Result<RollbackReport> {
+        // Direct postings the journal has not seen yet must be in it before it is compared.
+        if self.has_mirrored().await? {
+            self.mirror_all().await?;
+        }
         let settled = self.recover_quiesced().await?;
         let ids: Vec<AccountId> = sqlx::query_scalar("SELECT id FROM accounts ORDER BY id")
             .fetch_all(self.pool())

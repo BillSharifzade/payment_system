@@ -66,6 +66,12 @@ async fn a_post_waits_for_holds_in_flight_like_for_a_row_lock() {
     holds(SimTb::new(), &postgres().await).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL (DATABASE_URL)"]
+async fn direct_posting_keys_limits_and_the_journal() {
+    direct_posting(SimTb::new(), &postgres().await).await;
+}
+
 /// Lost replies, which only the model can inject: TigerBeetle applied a request the caller
 /// never heard back about.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -176,6 +176,11 @@ pub async fn reconcile_incremental(
     balances: Balances<'_>,
 ) -> Result<ReconciliationReport> {
     let mut report = ReconciliationReport::default();
+    // Under direct posting the journal follows the cluster: bring it up to what the cluster
+    // has applied, so the pass checks every account those postings touched.
+    if let Balances::TigerBeetle(ledger) = balances {
+        ledger.settle_journal().await?;
+    }
     let chunk = cfg.fold_chunk.max(1);
     let mut chunks = 0;
     loop {
@@ -346,6 +351,11 @@ const CONFIRM_ATTEMPTS: usize = 5;
 /// at or before `n0` was. So `cluster = journal − those not in the read`, exactly — unless a
 /// post landed between `n0` and `n1`, when the account is read again (at most
 /// [`CONFIRM_ATTEMPTS`] times, then reported inconclusive).
+///
+/// Under direct posting the cluster may also be ahead: a direct posting is applied before
+/// the journal has it. So the journal is first settled through everything the cluster had at
+/// `n1` (`settle_journal`), and a direct posting counts by the cluster timestamp the mirror
+/// recorded for it (`transactions.tb_timestamp`) exactly as a guarded one counts by its post.
 pub async fn confirm(
     pool: &PgPool,
     ledger: &HybridLedger<AnyTb>,
@@ -372,6 +382,8 @@ pub async fn confirm(
         let n0 = ledger.tb().newest_timestamp().await?;
         let tb = ledger.tb().raw_balances(&ids).await?;
         let n1 = ledger.tb().newest_timestamp().await?;
+        // No-op under hybrid posting.
+        ledger.settle_journal().await?;
 
         let mut db = snapshot(pool).await?;
         let derived: HashMap<Uuid, i64> = match derive {
@@ -414,15 +426,16 @@ pub async fn confirm(
         .into_iter()
         .collect();
         // Transactions from before the cut-over moved into the cluster as opening balances.
-        let recent: Vec<(Uuid, Uuid, i64)> = sqlx::query_as(
+        let recent: Vec<(Uuid, Uuid, i64, Option<i64>)> = sqlx::query_as(
             "SELECT e.transaction_id, e.account_id,
                     SUM(CASE e.direction WHEN 'credit' THEN e.amount_minor
-                                         ELSE -e.amount_minor END)::BIGINT
+                                         ELSE -e.amount_minor END)::BIGINT,
+                    t.tb_timestamp
              FROM entries e JOIN transactions t ON t.id = e.transaction_id
              WHERE e.account_id = ANY($1) AND e.created_at >= to_timestamp($2)
                AND t.seq > COALESCE((SELECT through_seq FROM tb_cutover
                                      WHERE cluster_id = $3), 0)
-             GROUP BY e.transaction_id, e.account_id
+             GROUP BY e.transaction_id, e.account_id, t.tb_timestamp
              HAVING SUM(CASE e.direction WHEN 'credit' THEN e.amount_minor
                                          ELSE -e.amount_minor END) <> 0",
         )
@@ -433,17 +446,23 @@ pub async fn confirm(
         .await?;
         db.commit().await?;
 
+        // A guarded posting is in the cluster from its post; a direct one from its chain.
         let txns: Vec<Uuid> = recent
             .iter()
-            .map(|(t, _, _)| *t)
+            .filter(|(_, _, _, direct)| direct.is_none())
+            .map(|(t, _, _, _)| *t)
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
         let posted = ledger.tb().posted_at(&txns).await?;
         let mut unposted: HashMap<Uuid, i64> = HashMap::new();
         let mut ambiguous: HashSet<Uuid> = HashSet::new();
-        for (txn, account, signed) in recent {
-            match posted.get(&txn) {
+        for (txn, account, signed, direct) in recent {
+            let applied = match direct {
+                Some(at) => Some(at as u64),
+                None => posted.get(&txn).copied(),
+            };
+            match applied.as_ref() {
                 Some(&at) if at <= n0 => {}
                 Some(&at) if at <= n1 => {
                     ambiguous.insert(account);

@@ -15,7 +15,7 @@ pub use reconcile::{
     confirm, reconcile, reconcile_full, reconcile_incremental, unsealed_lag, BalanceMismatch,
     Balances, Confirmation, Derive, FullReconciliation, ReconcileConfig, ReconciliationReport,
 };
-pub use recovery::{record_recovery, recover_once, recovery_loop};
+pub use recovery::{mirror_loop, mirror_once, record_recovery, recover_once, recovery_loop};
 pub use relay::{
     outbox_lag, relay_all, relay_once, EventPublisher, LoggingPublisher, NatsPublisher,
     OutboxEvent, PublishError, PUBLISH_TIMEOUT,

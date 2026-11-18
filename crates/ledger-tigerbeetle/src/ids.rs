@@ -21,15 +21,32 @@ pub const MAX_LEGS: usize = 64;
 
 /// Holds the two control accounts commit markers move zero between.
 pub const CONTROL_LEDGER: u32 = 1;
+/// Holds the AML limit accounts (`limits.rs`): its unit is a fraction of a limit, not money.
+pub const AML_LEDGER: u32 = 2;
 
 /// Account codes. Every ledger account's `code` is its [`AccountType`].
 pub const CODE_CONTROL: u16 = 100;
 pub const CODE_OPENING: u16 = 101;
+pub const CODE_AML_SOURCE: u16 = 110;
+pub const CODE_AML_SINK: u16 = 111;
+pub const CODE_AML_DAY: u16 = 112;
+pub const CODE_AML_HOUR: u16 = 113;
 
 /// Transfer codes.
 pub const TRANSFER_LEG: u16 = 1;
 pub const TRANSFER_MARKER: u16 = 2;
 pub const TRANSFER_OPENING: u16 = 3;
+/// Who an idempotency key belongs to under `TIGERBEETLE_POSTING=direct` (`direct.rs`): the
+/// transaction a direct chain posted, a request of the guarded protocol, or nobody (voided).
+pub const TRANSFER_KEY_DIRECT: u16 = 10;
+pub const TRANSFER_KEY_HYBRID: u16 = 11;
+pub const TRANSFER_KEY_VOID: u16 = 12;
+/// The second transfer of a void: its `user_data_128` is who voided the key.
+pub const TRANSFER_VOID_WITNESS: u16 = 13;
+/// AML: a limit account's one-time allowance, and the expiring holds payments place on it.
+pub const TRANSFER_AML_FUND: u16 = 20;
+pub const TRANSFER_AML_DAY: u16 = 21;
+pub const TRANSFER_AML_HOUR: u16 = 22;
 
 /// `user_data_32` of every transfer the backend creates: the protocol step it belongs to.
 /// Recovery scans for `TAG_RESERVE`; a post or void carries its own tag, not the pending's.
@@ -40,6 +57,12 @@ pub const TAG_FORCED: u32 = 4;
 pub const TAG_DIRECT: u32 = 5;
 pub const TAG_MARKER: u32 = 6;
 pub const TAG_OPENING: u32 = 7;
+/// Every transfer of a chain the journal mirror turns into Postgres rows (`mirror.rs`): a
+/// direct posting (key, holds, legs) or a void (key, witness). The mirror scans this tag.
+pub const TAG_JOURNALED: u32 = 8;
+/// The key and holds of a guarded (hybrid) posting under direct mode: Postgres journals it.
+pub const TAG_KEY_HYBRID: u32 = 9;
+pub const TAG_AML: u32 = 10;
 
 pub fn ledger_of(currency: Currency) -> u32 {
     let c = currency.code().as_bytes();
@@ -127,6 +150,68 @@ pub fn opening_account(ledger: u32) -> u128 {
 
 pub fn opening_transfer(account: u128) -> u128 {
     derive("payment/tb/opening-balance", account)
+}
+
+/// The transfer that binds an idempotency key (a transaction id) under direct posting: at
+/// most one ever exists per key, whoever creates it. `key(k) | 1` and `| 2` are its fixed
+/// companions (a void's witness; a guarded posting's holds).
+pub fn key(transaction: u128) -> u128 {
+    derive("payment/tb/key", transaction)
+}
+
+pub fn aml_account(side: u8) -> u128 {
+    derive("payment/tb/aml", side as u128) | 1
+}
+
+/// A user's rolling 24 h allowance.
+pub fn aml_day_account(user: u128) -> u128 {
+    derive("payment/tb/aml-day", user) | 1
+}
+
+/// A user's rolling 1 h allowance of payments.
+pub fn aml_hour_account(user: u128) -> u128 {
+    derive("payment/tb/aml-hour", user) | 1
+}
+
+pub fn aml_fund_transfer(account: u128) -> u128 {
+    derive("payment/tb/aml-fund", account)
+}
+
+/// A hold re-created at the switch to direct posting for a debit the journal already holds.
+pub fn aml_seed_transfer(entry: u128, hour: bool) -> u128 {
+    derive("payment/tb/aml-seed", entry) | hour as u128
+}
+
+/// The journal entry the mirror writes for one side of one account of a direct posting.
+pub fn mirror_entry(transaction: u128, account: u128, credit: bool) -> u128 {
+    let digest = Sha256::new()
+        .chain_update(b"payment/tb/mirror-entry")
+        .chain_update(transaction.to_be_bytes())
+        .chain_update(account.to_be_bytes())
+        .chain_update([credit as u8])
+        .finalize();
+    let mut h = [0u8; 16];
+    h.copy_from_slice(&digest[..16]);
+    (transaction & (u128::MAX << 80)) | (u128::from_be_bytes(h) >> 48)
+}
+
+/// The outbox event the mirror writes for a direct posting.
+pub fn mirror_event(transaction: u128) -> u128 {
+    derive("payment/tb/mirror-event", transaction)
+}
+
+/// The `allowed` screening event the mirror writes for a screened direct posting.
+pub fn mirror_screening(transaction: u128) -> u128 {
+    derive("payment/tb/mirror-screening", transaction)
+}
+
+/// 64 bits of a request fingerprint, for the key's `user_data_64`: a retry with the same
+/// request finds the same key (`exists`), any other request a different one.
+pub fn fingerprint64(fingerprint: &str) -> u64 {
+    let digest = Sha256::digest(fingerprint.as_bytes());
+    let mut h = [0u8; 8];
+    h.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(h)
 }
 
 pub fn leg(base: u128, index: usize) -> u128 {

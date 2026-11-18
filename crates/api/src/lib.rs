@@ -19,7 +19,9 @@ pub use backend::Ledger;
 pub use biometric::{BiometricConfig, MatcherBackend};
 pub use config::{DeviceBinding, DeviceConfig};
 pub use error::{ApiError, ApiResult};
-pub use payments::{aml_guard, payment_entries, settlement_shard, system_shards, ScreenCtx};
+pub use payments::{
+    aml_guard, hold_seeds, payment_entries, settlement_shard, system_shards, ScreenCtx,
+};
 pub use ratelimit::RateLimitState;
 pub use session::{warm_password_hasher, AdminUser, AuthUser};
 
@@ -130,6 +132,23 @@ impl AmlConfig {
             }
         }
         Ok(cfg)
+    }
+
+    /// Under direct posting the cluster decides the daily and velocity limits as fractions of
+    /// an allowance (`ledger_tigerbeetle::limits`): exact as long as a 24 h window's holds
+    /// lose less than one minor unit to rounding, which bounds daily limit × velocity.
+    pub fn require_exact_in_cluster(&self) -> Result<(), String> {
+        for (name, l) in [("L1", self.level1), ("L2", self.level2)] {
+            if !ledger_tigerbeetle::Screening::exact(l.daily_minor, l.velocity_per_hour) {
+                return Err(format!(
+                    "TIGERBEETLE_POSTING=direct: AML_{name}_DAILY_MINOR={} with \
+                     AML_{name}_VELOCITY_PER_HOUR={} is beyond what the cluster decides exactly \
+                     (daily limit x 25 x velocity must be at most 2^64)",
+                    l.daily_minor, l.velocity_per_hour
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

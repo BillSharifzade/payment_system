@@ -16,7 +16,7 @@ type BoxError = Box<dyn std::error::Error>;
 async fn main() -> Result<(), BoxError> {
     match std::env::args().nth(1).as_deref() {
         Some("healthcheck") => return healthcheck().await,
-        Some(cmd @ ("tigerbeetle-import" | "tigerbeetle-rollback")) => {
+        Some(cmd @ ("tigerbeetle-import" | "tigerbeetle-rollback" | "tigerbeetle-posting")) => {
             std::process::exit(cutover_command(cmd).await)
         }
         _ => {}
@@ -71,6 +71,12 @@ async fn main() -> Result<(), BoxError> {
     let tigerbeetle = ledger_tigerbeetle::backend_from_env()?;
     let fees = FeeConfig::from_env()?;
     let aml = AmlConfig::from_env()?;
+    if tigerbeetle
+        .as_ref()
+        .is_some_and(|cfg| cfg.posting == ledger_tigerbeetle::Posting::Direct)
+    {
+        aml.require_exact_in_cluster()?;
+    }
     let deposits = DepositConfig::from_env(is_prod)?;
     let biometric = BiometricConfig::from_env(is_prod)?;
     tracing::info!(
@@ -254,6 +260,12 @@ async fn shutdown_signal() {
 /// `LEDGER_BACKEND=tigerbeetle` and the way back (deploy/README.md), run with money movement
 /// stopped. Reads DATABASE_URL (MIGRATION_DATABASE_URL, if set, applies migrations first) and
 /// TIGERBEETLE_*. One JSON object on stdout; exit 0 = done, 1 = refused, 2 = could not run.
+///
+/// `payment-server tigerbeetle-posting direct | hybrid`: switches who decides a posting
+/// (`TIGERBEETLE_POSTING`), also with money movement stopped. To direct, every user's AML
+/// windows are carried into the cluster (the journal's debits of the last 24 h become holds,
+/// valued and weighed with AML_* and the current rates); to hybrid, the journal catches up
+/// with the cluster first.
 async fn cutover_command(cmd: &str) -> i32 {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -303,6 +315,33 @@ async fn cutover(cmd: &str) -> Result<Result<serde_json::Value, BoxError>, BoxEr
                 "opening_balances": r.opening_balances, "through_seq": r.through_seq,
             })
         }),
+        "tigerbeetle-posting" => {
+            let switched = match std::env::args().nth(2).as_deref() {
+                Some("direct") => {
+                    let aml = api::AmlConfig::from_env()?;
+                    aml.require_exact_in_cluster()?;
+                    let seeds = api::hold_seeds(ledger.pool(), &aml).await?;
+                    ledger.switch_to_direct(&seeds).await
+                }
+                Some("hybrid") => ledger.switch_to_hybrid().await,
+                other => {
+                    return Err(format!(
+                        "usage: payment-server tigerbeetle-posting direct|hybrid (got {other:?})"
+                    )
+                    .into())
+                }
+            };
+            switched.map(|r| {
+                serde_json::json!({
+                    "status": "switched", "posting": r.posting, "users": r.users,
+                    "holds_seeded": r.holds_seeded,
+                    "mirrored": {"transactions": r.mirrored.transactions,
+                                 "voids": r.mirrored.voids},
+                    "settled": {"posted": r.settled.posted, "forced": r.settled.forced,
+                                "voided": r.settled.voided},
+                })
+            })
+        }
         _ => ledger.rollback_to_postgres().await.map(|r| {
             serde_json::json!({
                 "status": "rolled_back", "accounts": r.accounts,

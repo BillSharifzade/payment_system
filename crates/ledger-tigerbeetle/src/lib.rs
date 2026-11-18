@@ -7,6 +7,9 @@
 //!   inside the posting lock (per-user AML, single-use transitions, audit rows), the idempotency
 //!   record, the outbox and the journal mirror stay in one Postgres transaction. See
 //!   `hybrid.rs` for the reserve → commit → post protocol and `recovery.rs` for crash recovery.
+//! - Direct posting (`TIGERBEETLE_POSTING=direct`): transfers and conversions are decided by
+//!   the cluster alone, as one chain that also enforces the AML limits (`direct.rs`,
+//!   `limits.rs`); Postgres journals them afterwards, exactly once (`mirror.rs`).
 //! - [`SimTb`]: an in-process model of a cluster for tests. With the `native-client` feature,
 //!   `LiveTb` is TigerBeetle's own client (building it needs Zig and libclang) and the same
 //!   suites run against a real cluster (`tests/live.rs`); [`AnyTb`] is either.
@@ -14,10 +17,13 @@
 mod any;
 mod client;
 mod config;
+mod direct;
 mod error;
 mod hybrid;
 mod ids;
 mod import;
+mod limits;
+mod mirror;
 #[cfg(feature = "native-client")]
 mod native;
 mod plan;
@@ -35,10 +41,14 @@ pub use client::{
     account_flags, transfer_flags, Account, AccountResult, ClientError, QueryFilter, TbClient,
     Transfer, TransferResult, AMOUNT_MAX,
 };
-pub use config::{Backend, TbConfig};
+pub use config::{Backend, Posting, TbConfig};
+pub use direct::{KeyOwner, Keyed};
 pub use error::{Result, TbError};
 pub use hybrid::HybridLedger;
-pub use import::{ImportReport, Mismatch, RollbackReport};
+pub use ids::fingerprint64;
+pub use import::{ImportReport, Mismatch, RollbackReport, SwitchReport};
+pub use limits::{HoldSeed, Holds, LimitRule, Screening, ALLOWANCE};
+pub use mirror::MirrorReport;
 #[cfg(feature = "native-client")]
 pub use native::LiveTb;
 pub use plan::AccountInfo;

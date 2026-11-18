@@ -4,6 +4,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use ledger::{AccountId, AccountType, Entry, LedgerError, Transaction, TransactionId};
+use ledger_tigerbeetle::{fingerprint64, HoldSeed, KeyOwner, Keyed, Screening};
 use money::{Currency, Money};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
@@ -110,6 +111,8 @@ pub(crate) struct MoneyContext {
     pub(crate) pair_rate: Option<(i64, i64)>,
     pub(crate) tjs_rate: Option<(i64, i64)>,
     pub(crate) key: KeyState,
+    /// The journal already holds this Idempotency-Key as a transaction id.
+    pub(crate) key_claimed: bool,
     pub(crate) device: Option<DeviceKey>,
 }
 
@@ -228,6 +231,7 @@ pub(crate) async fn money_context(
                 (bt.user_id IS NOT NULL) AS recipient_blocked, tu.status AS recipient_status,
                 rp.rate_num AS pair_num, rp.rate_den AS pair_den,
                 rt.rate_num AS tjs_num, rt.rate_den AS tjs_den,
+                (kt.id IS NOT NULL) AS key_claimed,
                 {KEY_STATE_COLUMNS}, {device_columns}
          FROM users u
          LEFT JOIN blocked_users bu ON bu.user_id = u.id
@@ -241,6 +245,7 @@ pub(crate) async fn money_context(
          LEFT JOIN fx_rates rt ON rt.base_currency = f.currency AND rt.quote_currency = 'TJS'
          LEFT JOIN idempotency_keys ik ON ik.key = $4
          LEFT JOIN voided_transactions vt ON vt.id = $4
+         LEFT JOIN transactions kt ON kt.id = $4
          LEFT JOIN devices dv ON dv.id = $5 AND dv.user_id = u.id AND dv.revoked_at IS NULL
          WHERE u.id = $1",
         device_columns = devices::device_columns()
@@ -276,6 +281,7 @@ pub(crate) async fn money_context(
         pair_rate: get_rate("pair_num", "pair_den")?,
         tjs_rate: get_rate("tjs_num", "tjs_den")?,
         key: KeyState::from_row(&row)?,
+        key_claimed: row.try_get("key_claimed").map_err(StorageError::from)?,
         device: DeviceKey::from_row(&row)?,
     })
 }
@@ -609,6 +615,164 @@ pub fn aml_guard(s: ScreenCtx, tjs: (i64, i64), limits: Limits) -> PostHook {
     })
 }
 
+/// The payment as the cluster's AML limits see it (direct posting): the same value in TJS and
+/// the same limits `aml_check` decides on.
+pub(crate) fn screening(s: &ScreenCtx, tjs: (i64, i64), limits: Limits) -> Screening {
+    Screening {
+        user: s.user_id,
+        tjs_minor: to_tjs(s.amount_minor, tjs),
+        daily_minor: limits.daily_minor,
+        velocity_per_hour: limits.velocity_per_hour,
+    }
+}
+
+/// The `allowed` screening event of a guarded posting whose limits the cluster enforces. In
+/// the posting's transaction, so it stays only if the cluster lets the posting through.
+pub(crate) async fn allow_screening(
+    conn: &mut PgConnection,
+    s: &ScreenCtx,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO screening_events
+           (id, user_id, from_account, to_account, amount_minor, currency, decision)
+         VALUES ($1, $2, $3, $4, $5, $6, 'allowed')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(s.user_id)
+    .bind(s.from_account)
+    .bind(s.to_account)
+    .bind(s.amount_minor)
+    .bind(&s.currency)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Whether this very request (same key, same fingerprint) is a direct posting the cluster
+/// already applied. The other backends replay a stored response before they check anything;
+/// direct postings store none, so a handler asks this when it is about to refuse (or could
+/// not tell what the cluster did): a request that posted is answered as it was, whatever has
+/// changed since. `false` when the cluster cannot be asked.
+pub(crate) async fn replayed_in_cluster(state: &AppState, key: Uuid, fingerprint: &str) -> bool {
+    state.ledger.cluster_screens()
+        && matches!(
+            state.ledger.key_owner(key).await,
+            Ok(Some(KeyOwner::Direct { fingerprint: f, .. })) if f == fingerprint64(fingerprint)
+        )
+}
+
+/// How a direct posting ended for its handler.
+pub(crate) enum Direct {
+    /// Applied now, or this very request had already posted: answer `201` with what the
+    /// first answer said.
+    Posted { replayed: bool },
+    /// The journal holds the id from before direct posting, with no stored response: the
+    /// `200 already_posted` the other backends give for it.
+    Raced,
+}
+
+/// Posts a transfer or a conversion under direct posting: one chain in the cluster, which
+/// also decides the AML limits. Nothing is written to Postgres unless the posting is refused
+/// for a limit (its `blocked` screening event).
+pub(crate) async fn post_direct(
+    conn: &mut PgConnection,
+    state: &AppState,
+    ctx: &MoneyContext,
+    txn: &Transaction,
+    fingerprint: &str,
+    screen: &ScreenCtx,
+    screening: Screening,
+) -> ApiResult<Direct> {
+    let key = txn.id.as_uuid();
+    if ctx.key_claimed {
+        // The journal has the id but no stored response: a direct posting the mirror wrote,
+        // or a claim older than direct posting. The key in the cluster says which.
+        return match state.ledger.key_owner(key).await? {
+            Some(KeyOwner::Direct { fingerprint: f, .. }) if f == fingerprint64(fingerprint) => {
+                metrics::counter!("ledger_posts_total", "outcome" => "duplicate").increment(1);
+                Ok(Direct::Posted { replayed: true })
+            }
+            Some(KeyOwner::Void { .. }) => Err(ApiError::Voided),
+            Some(_) => Err(ApiError::IdempotencyConflict),
+            None => Ok(Direct::Raced),
+        };
+    }
+    match state.ledger.post_keyed(txn, fingerprint, &screening).await {
+        Ok(Keyed::Posted) => {
+            metrics::counter!("ledger_posts_total", "outcome" => "posted").increment(1);
+            Ok(Direct::Posted { replayed: false })
+        }
+        Ok(Keyed::Replayed) => {
+            metrics::counter!("ledger_posts_total", "outcome" => "duplicate").increment(1);
+            Ok(Direct::Posted { replayed: true })
+        }
+        Ok(Keyed::Conflict) => Err(ApiError::IdempotencyConflict),
+        Ok(Keyed::Voided) => Err(ApiError::Voided),
+        Err(StorageError::Rejected { rule, message }) => {
+            metrics::counter!("ledger_posts_total", "outcome" => "rejected").increment(1);
+            log_screening(conn, screen, "blocked", Some(&rule), Some(&message)).await?;
+            Err(ApiError::LimitExceeded(message))
+        }
+        Err(e) => {
+            metrics::counter!("ledger_posts_total", "outcome" => "error").increment(1);
+            Err(e.into())
+        }
+    }
+}
+
+/// The AML holds standing for the journal's debits of the last 24 h, oldest first: what
+/// `payment-server tigerbeetle-posting direct` seeds into the cluster so every user's rolling
+/// windows carry over. Each debit is valued at the current TJS rate and weighed against its
+/// user's present limits, as the Postgres guard would on the next payment; a debit that cannot
+/// be priced fills the allowance (the guard fails closed on it too).
+pub async fn hold_seeds(pool: &sqlx::PgPool, aml: &crate::AmlConfig) -> ApiResult<Vec<HoldSeed>> {
+    let rows = sqlx::query(
+        "SELECT e.id, e.transaction_id, a.owner_user_id, e.amount_minor, a.currency,
+                u.kyc_level, EXTRACT(EPOCH FROM (now() - e.created_at))::BIGINT AS age_secs,
+                r.rate_num, r.rate_den
+         FROM entries e
+         JOIN accounts a ON a.id = e.account_id AND a.account_type = 'user_wallet'
+         JOIN users u ON u.id = a.owner_user_id
+         LEFT JOIN fx_rates r ON r.base_currency = a.currency AND r.quote_currency = 'TJS'
+         WHERE e.direction = 'debit' AND e.created_at >= now() - interval '24 hours'
+         ORDER BY e.created_at, e.id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(StorageError::from)?;
+    let mut seeds = Vec::with_capacity(rows.len());
+    for row in rows {
+        let get = |e: sqlx::Error| ApiError::from(StorageError::from(e));
+        let currency: String = row.try_get("currency").map_err(get)?;
+        let amount: i64 = row.try_get("amount_minor").map_err(get)?;
+        let rate: Option<(i64, i64)> = row
+            .try_get::<Option<i64>, _>("rate_num")
+            .map_err(get)?
+            .zip(row.try_get::<Option<i64>, _>("rate_den").map_err(get)?);
+        let tjs_minor = match (currency.as_str(), rate) {
+            ("TJS", _) => amount,
+            (_, Some(rate)) => to_tjs(amount, rate),
+            (_, None) => i64::MAX,
+        };
+        let limits = aml.limits_for(row.try_get("kyc_level").map_err(get)?);
+        let age: i64 = row.try_get("age_secs").map_err(get)?;
+        let left = |window: i64| (window - age.max(0)).clamp(0, window) as u32;
+        seeds.push(HoldSeed {
+            entry: row.try_get("id").map_err(get)?,
+            transaction: row.try_get("transaction_id").map_err(get)?,
+            screening: Screening {
+                user: row.try_get("owner_user_id").map_err(get)?,
+                tjs_minor,
+                daily_minor: limits.daily_minor,
+                velocity_per_hour: limits.velocity_per_hour,
+            },
+            day_left_secs: left(24 * 3600),
+            hour_left_secs: left(3600),
+        });
+    }
+    Ok(seeds)
+}
+
 /// The entries of a same-currency payment from `from` to `to` (a transfer or a check): the
 /// recipient gets `amount` less the transfer fee (TJS only), which goes to a fee shard.
 pub fn payment_entries(
@@ -666,9 +830,9 @@ pub(crate) fn record<T: Serialize>(
 
 pub(crate) async fn finish<T>(
     conn: &mut PgConnection,
+    state: &AppState,
     result: storage::Result<()>,
-    key: Uuid,
-    fingerprint: &str,
+    (key, fingerprint): (Uuid, &str),
     created: T,
     raced: T,
     screen: Option<&ScreenCtx>,
@@ -685,6 +849,20 @@ where
             metrics::counter!("ledger_posts_total", "outcome" => "duplicate").increment(1);
             if let Some(found) = KeyState::load(conn, key).await?.replay::<T>(fingerprint)? {
                 return Ok(found);
+            }
+            // No stored response: under direct posting the id may be a direct posting's (they
+            // store none) or another guarded request's whose COMMIT has not happened.
+            if state.ledger.cluster_screens() {
+                match state.ledger.key_owner(key).await? {
+                    Some(KeyOwner::Void { .. }) => return Err(ApiError::Voided),
+                    Some(KeyOwner::Direct { .. }) => return Err(ApiError::IdempotencyConflict),
+                    Some(KeyOwner::Hybrid { fingerprint: f })
+                        if f != fingerprint64(fingerprint) =>
+                    {
+                        return Err(ApiError::IdempotencyConflict)
+                    }
+                    _ => {}
+                }
             }
             Ok((StatusCode::OK, Json(raced)))
         }
@@ -744,86 +922,118 @@ pub async fn create_transfer(
     if let Some(found) = ctx.replay::<PostResponse>(&fingerprint)? {
         return Ok(found);
     }
-    devices::verify(
-        &mut conn,
-        state.devices.binding,
-        &proof,
-        ctx.device.as_ref(),
-        &PaymentAuth {
-            kind: MoneyMove::Transfer,
+    let outcome: ApiResult<(StatusCode, Json<PostResponse>)> = async {
+        devices::verify(
+            &mut conn,
+            state.devices.binding,
+            &proof,
+            ctx.device.as_ref(),
+            &PaymentAuth {
+                kind: MoneyMove::Transfer,
+                user_id,
+                idempotency_key: key,
+                from_account: Some(req.from_account),
+                to_account: req.to_account,
+                amount_minor: req.amount_minor,
+                currency: &req.currency,
+                check_id: None,
+            },
+        )
+        .await?;
+        ctx.require_active()?;
+        ctx.require_kyc(KYC_LEVEL_FOR_TRANSFER)?;
+
+        let to = ctx
+            .to
+            .as_ref()
+            .ok_or_else(|| ApiError::NotFound("account not found".to_string()))?;
+        if to.account_type != AccountType::UserWallet {
+            return Err(ApiError::BadRequest(
+                "recipient must be a user wallet".to_string(),
+            ));
+        }
+        ctx.require_recipient_active()?;
+        if from.currency.code() != req.currency {
+            return Err(ApiError::BadRequest(format!(
+                "wallet holds {}, not {}",
+                from.currency.code(),
+                req.currency
+            )));
+        }
+        if to.currency != from.currency {
+            return Err(ApiError::BadRequest(format!(
+                "recipient wallet holds {}; use /v1/fx to convert",
+                to.currency.code()
+            )));
+        }
+        let currency = from.currency;
+
+        let screen = ScreenCtx {
             user_id,
-            idempotency_key: key,
-            from_account: Some(req.from_account),
+            from_account: req.from_account,
             to_account: req.to_account,
             amount_minor: req.amount_minor,
-            currency: &req.currency,
-            check_id: None,
-        },
-    )
-    .await?;
-    ctx.require_active()?;
-    ctx.require_kyc(KYC_LEVEL_FOR_TRANSFER)?;
+            currency: currency.code().to_string(),
+        };
+        let (tjs, limits) = pre_screen(&mut conn, &state, &ctx, &screen).await?;
 
-    let to = ctx
-        .to
-        .as_ref()
-        .ok_or_else(|| ApiError::NotFound("account not found".to_string()))?;
-    if to.account_type != AccountType::UserWallet {
-        return Err(ApiError::BadRequest(
-            "recipient must be a user wallet".to_string(),
-        ));
+        let amount = Money::from_minor(req.amount_minor as i128, currency);
+        let entries = payment_entries(state.fees, req.from_account, req.to_account, amount)?;
+        let txn = Transaction::new(TransactionId(key), entries);
+        let created = PostResponse {
+            transaction_id: key,
+            status: "posted".to_string(),
+        };
+        let raced = PostResponse {
+            transaction_id: key,
+            status: "already_posted".to_string(),
+        };
+        if state.ledger.cluster_screens() {
+            let screening = screening(&screen, tjs, limits);
+            return Ok(
+                match post_direct(
+                    &mut conn,
+                    &state,
+                    &ctx,
+                    &txn,
+                    &fingerprint,
+                    &screen,
+                    screening,
+                )
+                .await?
+                {
+                    Direct::Posted { .. } => (StatusCode::CREATED, Json(created)),
+                    Direct::Raced => (StatusCode::OK, Json(raced)),
+                },
+            );
+        }
+        let opts = PostOptions {
+            idempotency: Some(record(key, &fingerprint, &created)?),
+            guard: Some(aml_guard(screen.clone(), tjs, limits)),
+        };
+        let result = state.ledger.post_on(&mut conn, &txn, opts).await;
+        finish(
+            &mut conn,
+            &state,
+            result,
+            (key, &fingerprint),
+            created,
+            raced,
+            Some(&screen),
+        )
+        .await
     }
-    ctx.require_recipient_active()?;
-    if from.currency.code() != req.currency {
-        return Err(ApiError::BadRequest(format!(
-            "wallet holds {}, not {}",
-            from.currency.code(),
-            req.currency
-        )));
+    .await;
+    match outcome {
+        Err(_) if replayed_in_cluster(&state, key, &fingerprint).await => Ok((
+            StatusCode::CREATED,
+            Json(PostResponse {
+                transaction_id: key,
+                status: "posted".to_string(),
+            }),
+        )),
+        other => other,
     }
-    if to.currency != from.currency {
-        return Err(ApiError::BadRequest(format!(
-            "recipient wallet holds {}; use /v1/fx to convert",
-            to.currency.code()
-        )));
-    }
-    let currency = from.currency;
-
-    let screen = ScreenCtx {
-        user_id,
-        from_account: req.from_account,
-        to_account: req.to_account,
-        amount_minor: req.amount_minor,
-        currency: currency.code().to_string(),
-    };
-    let (tjs, limits) = pre_screen(&mut conn, &state, &ctx, &screen).await?;
-
-    let amount = Money::from_minor(req.amount_minor as i128, currency);
-    let entries = payment_entries(state.fees, req.from_account, req.to_account, amount)?;
-    let txn = Transaction::new(TransactionId(key), entries);
-    let created = PostResponse {
-        transaction_id: key,
-        status: "posted".to_string(),
-    };
-    let raced = PostResponse {
-        transaction_id: key,
-        status: "already_posted".to_string(),
-    };
-    let opts = PostOptions {
-        idempotency: Some(record(key, &fingerprint, &created)?),
-        guard: Some(aml_guard(screen.clone(), tjs, limits)),
-    };
-    let result = state.ledger.post_on(&mut conn, &txn, opts).await;
-    finish(
-        &mut conn,
-        result,
-        key,
-        &fingerprint,
-        created,
-        raced,
-        Some(&screen),
-    )
-    .await
 }
 
 pub async fn create_fx(
@@ -870,95 +1080,152 @@ pub async fn create_fx(
     if let Some(found) = ctx.replay::<FxResponse>(&fingerprint)? {
         return Ok(found);
     }
-    devices::verify(
-        &mut conn,
-        state.devices.binding,
-        &proof,
-        ctx.device.as_ref(),
-        &PaymentAuth {
-            kind: MoneyMove::Fx,
+    let outcome: ApiResult<(StatusCode, Json<FxResponse>)> = async {
+        devices::verify(
+            &mut conn,
+            state.devices.binding,
+            &proof,
+            ctx.device.as_ref(),
+            &PaymentAuth {
+                kind: MoneyMove::Fx,
+                user_id,
+                idempotency_key: key,
+                from_account: Some(req.from_account),
+                to_account: req.to_account,
+                amount_minor: req.amount_minor,
+                currency: from_cur.code(),
+                check_id: None,
+            },
+        )
+        .await?;
+        ctx.require_active()?;
+        ctx.require_kyc(KYC_LEVEL_FOR_TRANSFER)?;
+
+        if from_cur == to_cur {
+            return Err(ApiError::BadRequest(
+                "use /v1/transfers for same-currency movements".to_string(),
+            ));
+        }
+
+        let screen = ScreenCtx {
             user_id,
-            idempotency_key: key,
-            from_account: Some(req.from_account),
+            from_account: req.from_account,
             to_account: req.to_account,
             amount_minor: req.amount_minor,
-            currency: from_cur.code(),
-            check_id: None,
-        },
-    )
-    .await?;
-    ctx.require_active()?;
-    ctx.require_kyc(KYC_LEVEL_FOR_TRANSFER)?;
+            currency: from_cur.code().to_string(),
+        };
+        let (tjs, limits) = pre_screen(&mut conn, &state, &ctx, &screen).await?;
 
-    if from_cur == to_cur {
-        return Err(ApiError::BadRequest(
-            "use /v1/transfers for same-currency movements".to_string(),
-        ));
+        let (rate_num, rate_den) = ctx.pair_rate.ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "no FX rate configured for {}->{}",
+                from_cur.code(),
+                to_cur.code()
+            ))
+        })?;
+        let credited_128 = (req.amount_minor as i128 * rate_num as i128) / rate_den as i128;
+        let credited_minor = i64::try_from(credited_128)
+            .map_err(|_| ApiError::BadRequest("converted amount is too large".to_string()))?;
+        if credited_minor <= 0 {
+            return Err(ApiError::BadRequest(
+                "converted amount rounds to zero".to_string(),
+            ));
+        }
+
+        let fx_from = fx_shard(from_cur.code())
+            .ok_or_else(|| ApiError::BadRequest("unsupported source currency".to_string()))?;
+        let fx_to = fx_shard(to_cur.code())
+            .ok_or_else(|| ApiError::BadRequest("unsupported target currency".to_string()))?;
+
+        let amount_a = Money::from_minor(req.amount_minor as i128, from_cur);
+        let amount_b = Money::from_minor(credited_minor as i128, to_cur);
+
+        let txn = Transaction::new(
+            TransactionId(key),
+            vec![
+                Entry::debit(AccountId(req.from_account), amount_a),
+                Entry::credit(AccountId(fx_from), amount_a),
+                Entry::debit(AccountId(fx_to), amount_b),
+                Entry::credit(AccountId(req.to_account), amount_b),
+            ],
+        );
+
+        let resp = FxResponse {
+            transaction_id: key,
+            debited_minor: req.amount_minor,
+            credited_minor,
+            from_currency: from_cur.code().to_string(),
+            to_currency: to_cur.code().to_string(),
+        };
+        if state.ledger.cluster_screens() {
+            let screening = screening(&screen, tjs, limits);
+            return Ok(
+                match post_direct(
+                    &mut conn,
+                    &state,
+                    &ctx,
+                    &txn,
+                    &fingerprint,
+                    &screen,
+                    screening,
+                )
+                .await?
+                {
+                    Direct::Posted { replayed: false } => (StatusCode::CREATED, Json(resp)),
+                    // The rate may have moved since: answer with what the posting moved.
+                    Direct::Posted { replayed: true } => {
+                        let (debited_minor, credited_minor) = state
+                            .ledger
+                            .keyed_movement(key, req.from_account, req.to_account)
+                            .await?;
+                        let first = FxResponse {
+                            debited_minor,
+                            credited_minor,
+                            ..resp
+                        };
+                        (StatusCode::CREATED, Json(first))
+                    }
+                    Direct::Raced => (StatusCode::OK, Json(resp)),
+                },
+            );
+        }
+        let opts = PostOptions {
+            idempotency: Some(record(key, &fingerprint, &resp)?),
+            guard: Some(aml_guard(screen.clone(), tjs, limits)),
+        };
+        let result = state.ledger.post_on(&mut conn, &txn, opts).await;
+        finish(
+            &mut conn,
+            &state,
+            result,
+            (key, &fingerprint),
+            resp.clone(),
+            resp,
+            Some(&screen),
+        )
+        .await
     }
-
-    let screen = ScreenCtx {
-        user_id,
-        from_account: req.from_account,
-        to_account: req.to_account,
-        amount_minor: req.amount_minor,
-        currency: from_cur.code().to_string(),
-    };
-    let (tjs, limits) = pre_screen(&mut conn, &state, &ctx, &screen).await?;
-
-    let (rate_num, rate_den) = ctx.pair_rate.ok_or_else(|| {
-        ApiError::BadRequest(format!(
-            "no FX rate configured for {}->{}",
-            from_cur.code(),
-            to_cur.code()
-        ))
-    })?;
-    let credited_128 = (req.amount_minor as i128 * rate_num as i128) / rate_den as i128;
-    let credited_minor = i64::try_from(credited_128)
-        .map_err(|_| ApiError::BadRequest("converted amount is too large".to_string()))?;
-    if credited_minor <= 0 {
-        return Err(ApiError::BadRequest(
-            "converted amount rounds to zero".to_string(),
-        ));
+    .await;
+    match outcome {
+        Err(e) if replayed_in_cluster(&state, key, &fingerprint).await => {
+            let Ok((debited_minor, credited_minor)) = state
+                .ledger
+                .keyed_movement(key, req.from_account, req.to_account)
+                .await
+            else {
+                return Err(e);
+            };
+            Ok((
+                StatusCode::CREATED,
+                Json(FxResponse {
+                    transaction_id: key,
+                    debited_minor,
+                    credited_minor,
+                    from_currency: from_cur.code().to_string(),
+                    to_currency: to_cur.code().to_string(),
+                }),
+            ))
+        }
+        other => other,
     }
-
-    let fx_from = fx_shard(from_cur.code())
-        .ok_or_else(|| ApiError::BadRequest("unsupported source currency".to_string()))?;
-    let fx_to = fx_shard(to_cur.code())
-        .ok_or_else(|| ApiError::BadRequest("unsupported target currency".to_string()))?;
-
-    let amount_a = Money::from_minor(req.amount_minor as i128, from_cur);
-    let amount_b = Money::from_minor(credited_minor as i128, to_cur);
-
-    let txn = Transaction::new(
-        TransactionId(key),
-        vec![
-            Entry::debit(AccountId(req.from_account), amount_a),
-            Entry::credit(AccountId(fx_from), amount_a),
-            Entry::debit(AccountId(fx_to), amount_b),
-            Entry::credit(AccountId(req.to_account), amount_b),
-        ],
-    );
-
-    let resp = FxResponse {
-        transaction_id: key,
-        debited_minor: req.amount_minor,
-        credited_minor,
-        from_currency: from_cur.code().to_string(),
-        to_currency: to_cur.code().to_string(),
-    };
-    let opts = PostOptions {
-        idempotency: Some(record(key, &fingerprint, &resp)?),
-        guard: Some(aml_guard(screen.clone(), tjs, limits)),
-    };
-    let result = state.ledger.post_on(&mut conn, &txn, opts).await;
-    finish(
-        &mut conn,
-        result,
-        key,
-        &fingerprint,
-        resp.clone(),
-        resp,
-        Some(&screen),
-    )
-    .await
 }

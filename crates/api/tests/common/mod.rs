@@ -23,7 +23,11 @@ use uuid::Uuid;
 /// - `postgres` (default): `PostgresLedger`;
 /// - `tigerbeetle`: the hybrid against a live cluster (`TIGERBEETLE_ADDRESSES`, default 3000;
 ///   `TIGERBEETLE_CLUSTER_ID`, default 0), in a build with `--features tigerbeetle`;
-/// - `tigerbeetle-sim`: the hybrid against the in-process cluster model.
+/// - `tigerbeetle-sim`: the hybrid against the in-process cluster model;
+/// - `tigerbeetle-direct`, `tigerbeetle-direct-sim`: the same two clusters under direct
+///   posting (`TIGERBEETLE_POSTING=direct`): the cluster decides transfers and conversions and
+///   enforces the AML limits, and the journal follows it. The test router settles the journal
+///   after every request, so a suite's own SQL sees what a client would read.
 ///
 /// Give each backend a database of its own: under TigerBeetle `balances` is stale by design,
 /// and suites read the whole database (conservation, statements).
@@ -32,6 +36,22 @@ pub enum Backend {
     Postgres,
     TigerBeetle,
     TigerBeetleSim,
+    TigerBeetleDirect,
+    TigerBeetleDirectSim,
+}
+
+impl Backend {
+    pub fn is_tigerbeetle(self) -> bool {
+        self != Backend::Postgres
+    }
+
+    /// The cluster decides postings and enforces the AML limits.
+    pub fn is_direct(self) -> bool {
+        matches!(
+            self,
+            Backend::TigerBeetleDirect | Backend::TigerBeetleDirectSim
+        )
+    }
 }
 
 pub fn backend() -> Backend {
@@ -39,7 +59,12 @@ pub fn backend() -> Backend {
         Err(std::env::VarError::NotPresent) | Ok("postgres") => Backend::Postgres,
         Ok("tigerbeetle") => Backend::TigerBeetle,
         Ok("tigerbeetle-sim") => Backend::TigerBeetleSim,
-        other => panic!("TEST_LEDGER_BACKEND={other:?}: postgres, tigerbeetle or tigerbeetle-sim"),
+        Ok("tigerbeetle-direct") => Backend::TigerBeetleDirect,
+        Ok("tigerbeetle-direct-sim") => Backend::TigerBeetleDirectSim,
+        other => panic!(
+            "TEST_LEDGER_BACKEND={other:?}: postgres, tigerbeetle, tigerbeetle-sim, \
+             tigerbeetle-direct or tigerbeetle-direct-sim"
+        ),
     }
 }
 
@@ -49,7 +74,11 @@ static CLUSTER: OnceCell<Option<AnyTb>> = OnceCell::const_new();
 
 fn tb_config(tb: &AnyTb) -> TbConfig {
     use ledger_tigerbeetle::TbClient;
-    TbConfig::new(tb.cluster_id(), "test")
+    let cfg = TbConfig::new(tb.cluster_id(), "test");
+    match backend().is_direct() {
+        true => cfg.direct(),
+        false => cfg,
+    }
 }
 
 #[cfg(feature = "tigerbeetle")]
@@ -67,15 +96,27 @@ async fn cluster(pool: &PgPool) -> Option<AnyTb> {
         .get_or_init(|| async {
             let tb = match backend() {
                 Backend::Postgres => return None,
-                Backend::TigerBeetle => live_cluster(),
-                Backend::TigerBeetleSim => AnyTb::Sim(Arc::new(SimTb::new())),
+                Backend::TigerBeetle | Backend::TigerBeetleDirect => live_cluster(),
+                Backend::TigerBeetleSim | Backend::TigerBeetleDirectSim => {
+                    AnyTb::Sim(Arc::new(SimTb::new()))
+                }
             };
             let pg = PostgresLedger::new(pool.clone());
             pg.migrate().await.unwrap();
-            HybridLedger::new(TbLedger::new(tb.clone(), tb_config(&tb)), pg)
+            let ledger = HybridLedger::new(TbLedger::new(tb.clone(), tb_config(&tb)), pg);
+            ledger
                 .open_system_accounts()
                 .await
                 .expect("system accounts in the cluster");
+            if backend().is_direct() {
+                ledger
+                    .tb()
+                    .ensure_aml_accounts()
+                    .await
+                    .expect("AML accounts in the cluster");
+                // A cluster may outlive a test database: journal from its present on.
+                ledger.mirror_from_here().await.expect("mirror watermark");
+            }
             Some(tb)
         })
         .await
@@ -84,13 +125,34 @@ async fn cluster(pool: &PgPool) -> Option<AnyTb> {
 
 /// The backend `router` serves with. Needs `connect` (or `migrated_pool`) to have run.
 pub fn ledger(pool: PgPool) -> Ledger {
+    ledger_with(pool, |cfg| cfg)
+}
+
+/// [`ledger`] with the cluster configuration adjusted (shorter AML windows, say).
+pub fn ledger_with(pool: PgPool, adjust: impl FnOnce(TbConfig) -> TbConfig) -> Ledger {
+    match hybrid_with(pool.clone(), adjust) {
+        Some(hybrid) => Ledger::TigerBeetle(hybrid),
+        None => Ledger::Postgres(PostgresLedger::new(pool)),
+    }
+}
+
+/// The TigerBeetle backend itself (`None` under Postgres), for what a suite does with the
+/// cluster directly: mirror passes, keys, holds.
+pub fn hybrid(pool: PgPool) -> Option<HybridLedger<AnyTb>> {
+    hybrid_with(pool, |cfg| cfg)
+}
+
+pub fn hybrid_with(
+    pool: PgPool,
+    adjust: impl FnOnce(TbConfig) -> TbConfig,
+) -> Option<HybridLedger<AnyTb>> {
     let pg = PostgresLedger::new(pool);
     match CLUSTER.get() {
-        Some(Some(tb)) => Ledger::TigerBeetle(HybridLedger::new(
-            TbLedger::new(tb.clone(), tb_config(tb)),
+        Some(Some(tb)) => Some(HybridLedger::new(
+            TbLedger::new(tb.clone(), adjust(tb_config(tb))),
             pg,
         )),
-        Some(None) => Ledger::Postgres(pg),
+        Some(None) => None,
         None => panic!("connect() before router(): it prepares the ledger backend"),
     }
 }
@@ -155,8 +217,31 @@ pub fn router(pool: PgPool, cfg: TestConfig) -> axum::Router {
     router_on(ledger(pool), cfg)
 }
 
+/// Under direct posting the journal follows the cluster; a request that reads it settles it
+/// first. Suites also read the database with their own SQL, so the test router settles after
+/// every request: what a suite sees is what any client would.
+async fn settle_after(
+    axum::extract::State(ledger): axum::extract::State<Ledger>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let resp = next.run(req).await;
+    ledger.settle_journal().await.expect("journal mirror");
+    resp
+}
+
 /// A router on a backend the test built itself.
 pub fn router_on(ledger: Ledger, cfg: TestConfig) -> axum::Router {
+    let settle = ledger.cluster_screens().then(|| ledger.clone());
+    let router = router_plain(ledger, cfg);
+    match settle {
+        Some(ledger) => router.layer(axum::middleware::from_fn_with_state(ledger, settle_after)),
+        None => router,
+    }
+}
+
+/// [`router_on`] without the settling layer: what a real server is.
+pub fn router_plain(ledger: Ledger, cfg: TestConfig) -> axum::Router {
     build_router(AppState {
         ledger,
         auth: cfg.auth,

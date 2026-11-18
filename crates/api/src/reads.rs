@@ -324,6 +324,8 @@ pub async fn list_account_transactions(
         None => None,
         Some(raw) => Some(parse_cursor(raw)?),
     };
+    // Under direct posting the journal follows the cluster: read what the cluster has applied.
+    state.ledger.settle_journal().await?;
 
     let base = "SELECT e.id, e.transaction_id, e.direction, e.amount_minor, e.currency,
                        e.created_at, e.created_at::text AS ts,
