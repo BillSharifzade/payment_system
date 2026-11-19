@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Balance mark (docs/brand) on its 256 grid: two equal bars moving in opposite
+     directions. White; drawn on the rust tile by BrandMark(). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="256dp"
+    android:height="256dp"
+    android:viewportWidth="256"
+    android:viewportHeight="256">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M86.5 64H232L184 112H86.5A24 24 0 0 1 86.5 64ZM72 144H169.5A24 24 0 0 1 169.5 192H24L72 144Z" />
+</vector>

@@ -6,6 +6,7 @@
 
 import { NavLink, Outlet } from "react-router-dom";
 import { logout } from "./api";
+import { BrandMark } from "./brand";
 import { IdleGuard } from "./idle";
 import { OpsProvider, pendingLabel, useOps } from "./ops";
 import { Icon, IconName } from "./ui";
@@ -86,7 +87,7 @@ function Topbar() {
     <header className="topbar">
       <div className="brand">
         <div className="brand-mark">
-          <Icon name="bank" size={16} />
+          <BrandMark />
         </div>
         <div>
           <div className="brand-name">Payment Ops</div>

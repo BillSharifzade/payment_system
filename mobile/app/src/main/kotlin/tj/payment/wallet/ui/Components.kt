@@ -3,6 +3,7 @@ package tj.payment.wallet.ui
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -41,6 +42,7 @@ import tj.payment.wallet.ui.theme.NegativeRed
 import tj.payment.wallet.ui.theme.PositiveGreen
 import tj.payment.wallet.ui.theme.Rust
 import tj.payment.wallet.ui.theme.RustBright
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import tj.payment.wallet.R
 
@@ -93,8 +95,9 @@ fun PrimaryButton(
 }
 
 /**
- * The app's brand mark: a rounded rust tile with a minimal coin glyph. Vector-
- * drawn (no image asset), so it's crisp at any density.
+ * The app's brand mark (docs/brand): the Balance mark — two equal bars moving in
+ * opposite directions — in white on a rounded rust tile. Both are vectors, so it's
+ * crisp at any density; the launcher icon uses the same geometry.
  */
 @Composable
 fun BrandMark(modifier: Modifier = Modifier, size: Int = 60) {
@@ -115,34 +118,12 @@ fun BrandMark(modifier: Modifier = Modifier, size: Int = 60) {
                 ),
                 cornerRadius = androidx.compose.ui.geometry.CornerRadius(corner, corner),
             )
-            // Upward arrow — clean, positive, reads as "send/pay".
-            val cx = s / 2f
-            val stroke = s * 0.09f
-            val top = s * 0.30f
-            val bottom = s * 0.70f
-            val head = s * 0.17f
-            drawLine(
-                color = Color.White,
-                start = Offset(cx, bottom),
-                end = Offset(cx, top),
-                strokeWidth = stroke,
-                cap = StrokeCap.Round,
-            )
-            drawLine(
-                color = Color.White,
-                start = Offset(cx, top),
-                end = Offset(cx - head, top + head),
-                strokeWidth = stroke,
-                cap = StrokeCap.Round,
-            )
-            drawLine(
-                color = Color.White,
-                start = Offset(cx, top),
-                end = Offset(cx + head, top + head),
-                strokeWidth = stroke,
-                cap = StrokeCap.Round,
-            )
         }
+        Image(
+            painter = painterResource(R.drawable.brand_mark),
+            contentDescription = null,
+            modifier = Modifier.size((size * 0.76f).dp),
+        )
     }
 }
 

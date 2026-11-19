@@ -2,6 +2,7 @@ import { FormEvent, useState } from "react";
 import { ApiError, login } from "../api";
 import { useSessionNotice } from "../auth";
 import { IDLE_TIMEOUT_MS } from "../idle";
+import { BrandMark } from "../brand";
 import { Alert, Icon } from "../ui";
 
 export default function Login() {
@@ -40,7 +41,7 @@ export default function Login() {
       <form className="login-card" onSubmit={submit}>
         <div className="brand">
           <div className="brand-mark">
-            <Icon name="bank" size={16} />
+            <BrandMark />
           </div>
           <div>
             <div className="brand-name">Payment Ops</div>
