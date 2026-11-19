@@ -222,6 +222,18 @@ impl Ledger {
             .map_err(tb_error)
     }
 
+    /// Direct posting only (`None` elsewhere): one pass of the journal mirror, which the
+    /// workers' leader runs in a loop; whether more is waiting, and how many postings it wrote.
+    pub async fn mirror_pass(&self) -> storage::Result<Option<(bool, usize)>> {
+        match self.direct() {
+            Some(l) => {
+                let pass = l.mirror_pass().await.map_err(tb_error)?;
+                Ok(Some((pass.more, pass.transactions)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Makes the journal current before it is read: under direct posting it follows the
     /// cluster, and this waits for (and helps) the mirror to hold everything the cluster had
     /// applied. Nothing to do on the other backends, whose postings commit in Postgres.

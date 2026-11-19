@@ -131,6 +131,69 @@ tests:
       - eval_time: 2h
         alertname: TigerBeetleUnavailable
         exp_alerts: []
+      - eval_time: 2h
+        alertname: TigerBeetleMirrorStale
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: TigerBeetleMirrorBehind
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: TigerBeetleMirrorIntegrity
+        exp_alerts: []
+
+  # Direct posting: the leader's mirror passes succeed every minute, then stop at 10m (a
+  # replica that is not the leader exports a stale success time, which must not count); a
+  # backlog builds up from 4m on; one integrity refusal at 6m.
+  - interval: 1m
+    input_series:
+      - series: 'worker_leader{job="payment-workers",instance="w:9101"}'
+        values: '1x20'
+      - series: 'tigerbeetle_mirror_last_success_timestamp_seconds{job="payment-workers",instance="w:9101"}'
+        values: '0+60x10 600x10'
+      - series: 'worker_leader{job="payment-workers",instance="w2:9101"}'
+        values: '0x20'
+      - series: 'tigerbeetle_mirror_last_success_timestamp_seconds{job="payment-workers",instance="w2:9101"}'
+        values: '0x20'
+      - series: 'tigerbeetle_mirror_lag_seconds{job="payment-workers",instance="w:9101"}'
+        values: '0 0 0 0 45x16'
+      - series: 'tigerbeetle_mirror_errors_total{job="payment-workers",instance="w:9101",kind="integrity"}'
+        values: '0 0 0 0 0 0 1x14'
+      - series: 'tigerbeetle_mirror_errors_total{job="payment-workers",instance="w:9101",kind="unavailable"}'
+        values: '0+1x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: TigerBeetleMirrorIntegrity
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: TigerBeetleMirrorIntegrity
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "The TigerBeetle journal mirror refused what it read (1 in 10 min)"
+              description: "The journal and the cluster disagree about a transaction id, so the mirror will not write past it. Preserve logs ('journal mirror pass failed'), stop money movement, reconcile."
+      - eval_time: 8m
+        alertname: TigerBeetleMirrorBehind
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: TigerBeetleMirrorBehind
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "The journal trails the TigerBeetle cluster by 45s"
+              description: "The mirror is writing but not keeping up: statements and lookups wait for it, events are late. Check Postgres load and `tigerbeetle_mirror_seconds`."
+      - eval_time: 12m
+        alertname: TigerBeetleMirrorStale
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: TigerBeetleMirrorStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No successful TigerBeetle journal mirror pass for 4m 0s"
+              description: "Direct postings are committed in the cluster but not being journaled. Is the cluster reachable from payment-workers, and Postgres writable? See `tigerbeetle_mirror_errors_total` and `docker compose logs payment-workers`."
 
   # The leader's recovery passes succeed every minute, then stop at 10m. A replica that lost
   # leadership long ago exports a stale success time: it must not count.

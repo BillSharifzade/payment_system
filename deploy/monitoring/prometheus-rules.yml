@@ -311,6 +311,41 @@ groups:
           summary: "Money requests are failing with TigerBeetle unavailable ({{ $value | printf \"%.2f\" }}/s)"
           description: "Is the cluster up and reachable (`docker compose ps tigerbeetle`, replica logs)?"
 
+      # TIGERBEETLE_POSTING=direct: the cluster commits transfers by itself and the leader's
+      # mirror loop writes their journal rows (and outbox events) afterwards. Under hybrid
+      # posting none of these series exist.
+      - alert: TigerBeetleMirrorStale
+        # A pass every TIGERBEETLE_MIRROR_INTERVAL_MS (default 100 ms). Without one, requests
+        # that read the journal still settle it themselves, but nothing feeds the outbox,
+        # sealing or reconciliation with what the cluster posted.
+        expr: time() - max(tigerbeetle_mirror_last_success_timestamp_seconds and on (instance) (worker_leader == 1)) > 60
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No successful TigerBeetle journal mirror pass for {{ $value | humanizeDuration }}"
+          description: "Direct postings are committed in the cluster but not being journaled. Is the cluster reachable from payment-workers, and Postgres writable? See `tigerbeetle_mirror_errors_total` and `docker compose logs payment-workers`."
+
+      - alert: TigerBeetleMirrorBehind
+        # With a backlog, how far the journal trails the cluster's clock; 0 when current.
+        expr: max(tigerbeetle_mirror_lag_seconds) > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The journal trails the TigerBeetle cluster by {{ $value | humanizeDuration }}"
+          description: "The mirror is writing but not keeping up: statements and lookups wait for it, events are late. Check Postgres load and `tigerbeetle_mirror_seconds`."
+
+      - alert: TigerBeetleMirrorIntegrity
+        # The journal already holds, from elsewhere, an id the cluster posted directly (the keys
+        # rule that out), or the cluster's journaled stream is malformed. The mirror stops.
+        expr: sum(increase(tigerbeetle_mirror_errors_total{kind=~"integrity|protocol"}[10m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "The TigerBeetle journal mirror refused what it read ({{ $value | printf \"%.0f\" }} in 10 min)"
+          description: "The journal and the cluster disagree about a transaction id, so the mirror will not write past it. Preserve logs ('journal mirror pass failed'), stop money movement, reconcile."
+
   - name: payment-backups
     rules:
       - alert: BackupStale

@@ -20,6 +20,7 @@
 //! creates its key right before its COMMIT, and a void is a key of its own kind.
 
 use ledger::Transaction;
+use storage::StorageError;
 use uuid::Uuid;
 
 use crate::client::{TbClient, Transfer, TransferResult};
@@ -155,6 +156,15 @@ impl<C: TbClient> TbLedger<C> {
     ) -> Result<Keyed> {
         txn.validate()?;
         let plan = self.plan(txn).await?;
+        if plan.legs.is_empty() {
+            // The journal is rebuilt from the legs: a transaction whose entries cancel out
+            // would leave none (the guarded protocol journals its entries as given).
+            return Err(StorageError::Rejected {
+                rule: "nothing_moves".to_string(),
+                message: "a direct posting must move money between accounts".to_string(),
+            }
+            .into());
+        }
         let holds = screening
             .map(|s| s.holds().map(|h| (s, h)))
             .transpose()

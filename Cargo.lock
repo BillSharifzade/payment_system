@@ -1588,6 +1588,7 @@ version = "0.1.0"
 dependencies = [
  "ledger",
  "money",
+ "proptest",
  "serde_json",
  "sha2",
  "sqlx",

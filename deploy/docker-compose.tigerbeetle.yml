@@ -22,6 +22,11 @@
 # has a fixed address on a network of its own: TIGERBEETLE_SUBNET /
 # TIGERBEETLE_IP if the defaults collide with a local network.
 #
+# Direct posting (TIGERBEETLE_POSTING=direct in app.env; deploy/README.md "Direct
+# posting") lets the cluster decide transfers by itself: then an acknowledged
+# transfer lives in the cluster before Postgres has it, so run it on a
+# replicated cluster in production, not on this overlay's single replica.
+#
 # Memory: the replica allocates everything at start. Measured (0.17.9, this
 # --cache-grid): 2.3 GiB resident. That does not fit next to the prod stack on
 # a 4 GB box; give it 8 GB, or run the replica on its own host.

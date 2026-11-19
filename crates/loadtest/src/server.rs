@@ -12,6 +12,11 @@ use tokio::process::{Child, Command};
 use crate::args::Config;
 
 const NO_LIMIT: &str = "1000000000000000";
+// Under direct posting the cluster decides the limits as fractions of an allowance, exactly
+// while daily limit x 25 x velocity <= 2^64 (the server refuses anything beyond): the highest
+// pair that leaves a million payments an hour per payer. The holds are still placed.
+const DIRECT_DAILY: &str = "400000000000";
+const DIRECT_VELOCITY: &str = "1000000";
 
 pub async fn spawn(cfg: &Config) -> Result<(Child, String), String> {
     let bin = cfg.server_bin.as_ref().expect("checked by the caller");
@@ -43,9 +48,15 @@ pub async fn spawn(cfg: &Config) -> Result<(Child, String), String> {
             cmd.env(k, v);
         }
     }
+    let direct = std::env::var("TIGERBEETLE_POSTING").is_ok_and(|p| p.trim() == "direct");
     for level in ["L1", "L2"] {
-        for limit in ["PER_TX_MINOR", "DAILY_MINOR", "VELOCITY_PER_HOUR"] {
-            cmd.env(format!("AML_{level}_{limit}"), NO_LIMIT);
+        for (limit, under_direct) in [
+            ("PER_TX_MINOR", NO_LIMIT),
+            ("DAILY_MINOR", DIRECT_DAILY),
+            ("VELOCITY_PER_HOUR", DIRECT_VELOCITY),
+        ] {
+            let value = if direct { under_direct } else { NO_LIMIT };
+            cmd.env(format!("AML_{level}_{limit}"), value);
         }
     }
     if let Some(redis) = &cfg.redis_url {

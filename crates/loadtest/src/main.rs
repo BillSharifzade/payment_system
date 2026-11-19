@@ -145,8 +145,19 @@ struct Report<'a> {
     verification: verify::Verification,
     cpu: cpu::CpuReport,
     pg: Option<pg::PgReport>,
+    /// Direct posting only: the journal mirror the harness ran in the workers' place.
+    journal: Option<JournalMirror>,
     setup_secs: f64,
     verify_secs: f64,
+}
+
+#[derive(Serialize)]
+struct JournalMirror {
+    passes: u64,
+    /// Postings journaled while the load ran.
+    during_run: u64,
+    /// Postings still to journal when the load stopped (the mirror's backlog).
+    after_run: u64,
 }
 
 async fn connect(cfg: &Config, size: u32) -> Result<PgPool, String> {
@@ -247,6 +258,39 @@ async fn run(cfg: Config) -> Result<bool, String> {
             (Target::Direct(d), funding, wallets)
         }
     };
+    // The server has migrated the database by now. Under direct posting the journal follows
+    // the cluster, and here nobody else writes it: the harness runs the mirror the workers'
+    // leader would (same passes, same pacing), so its cost is in the measurement.
+    let ledger = api::Ledger::connect(
+        tigerbeetle,
+        storage::PostgresLedger::new(admin_pool.clone()),
+    )
+    .await?;
+    let (mirror_stop, mirror_stopped) = tokio::sync::watch::channel(false);
+    let mirror = ledger.cluster_screens().then(|| {
+        let (ledger, mut stop) = (ledger.clone(), mirror_stopped);
+        tokio::spawn(async move {
+            let (mut passes, mut postings) = (0u64, 0u64);
+            loop {
+                match ledger.mirror_pass().await {
+                    Ok(Some((more, n))) => {
+                        passes += 1;
+                        postings += n as u64;
+                        if more {
+                            continue;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => eprintln!("journal mirror: {e}"),
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    _ = stop.changed() => break,
+                }
+            }
+            (passes, postings)
+        })
+    });
     let setup_secs = setup_started.elapsed().as_secs_f64();
     eprintln!(
         "setup {setup_secs:.1}s; running {:?}/{:?} at concurrency {} for {:?} (+{:?} warm-up)",
@@ -287,11 +331,30 @@ async fn run(cfg: Config) -> Result<bool, String> {
     drop((target, server));
 
     let verify_started = Instant::now();
-    let ledger = api::Ledger::connect(
-        tigerbeetle,
-        storage::PostgresLedger::new(admin_pool.clone()),
-    )
-    .await?;
+    // What the mirror journaled while the load ran, and what it still had to afterwards.
+    let journal = match mirror {
+        Some(task) => {
+            let _ = mirror_stop.send(true);
+            let (passes, during_run) = task.await.map_err(|e| e.to_string())?;
+            let mut after_run = 0u64;
+            while let Some((more, n)) = ledger.mirror_pass().await.map_err(|e| e.to_string())? {
+                after_run += n as u64;
+                if !more {
+                    break;
+                }
+            }
+            eprintln!(
+                "journal mirror: {during_run} postings in {passes} passes during the run, \
+                 {after_run} left at its end"
+            );
+            Some(JournalMirror {
+                passes,
+                during_run,
+                after_run,
+            })
+        }
+        None => None,
+    };
     let verification = verify::verify(&ledger, &wallets, &funding, &rec).await?;
     let summary = rec.summarise(measured.max(Duration::from_millis(1)), cfg.interval);
     let cpu = cpu::diff(&cpu_before, &cpu_after, summary.total.ok);
@@ -325,6 +388,7 @@ async fn run(cfg: Config) -> Result<bool, String> {
         verification,
         cpu,
         pg: pg_report,
+        journal,
         setup_secs,
         verify_secs: verify_started.elapsed().as_secs_f64(),
     };

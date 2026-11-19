@@ -1,5 +1,6 @@
-// CPU time spent by the harness, the spawned server and the Postgres processes over the measured
-// window, from /proc (Linux, USER_HZ = 100; Postgres only when it runs on this host). On a
+// CPU time spent by the harness, the spawned server, the Postgres processes and (with
+// LEDGER_BACKEND=tigerbeetle) every TigerBeetle replica on this host over the measured window,
+// from /proc (Linux, USER_HZ = 100; Postgres only when it runs on this host). On a
 // shared, noisy box CPU per operation is a far steadier A/B signal than throughput: the work
 // one operation costs does not depend on what the neighbours are doing.
 
@@ -23,6 +24,20 @@ pub struct Snapshot {
     harness: f64,
     server: Option<f64>,
     postgres: HashMap<u32, f64>,
+    tigerbeetle: HashMap<u32, f64>,
+}
+
+/// Every process on this host whose command is `name`.
+fn processes(name: &str) -> HashMap<u32, f64> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return HashMap::new();
+    };
+    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|p| {
+            std::fs::read_to_string(format!("/proc/{p}/comm")).is_ok_and(|c| c.trim_end() == name)
+        })
+        .filter_map(|p| Some((p, proc_secs(p)?)))
+        .collect()
 }
 
 pub async fn snapshot(pool: &PgPool, server: Option<u32>) -> Snapshot {
@@ -44,6 +59,10 @@ pub async fn snapshot(pool: &PgPool, server: Option<u32>) -> Snapshot {
             })
             .filter_map(|p| Some((p, proc_secs(p)?)))
             .collect(),
+        tigerbeetle: match std::env::var("LEDGER_BACKEND").as_deref() {
+            Ok("tigerbeetle") => processes("tigerbeetle"),
+            _ => HashMap::new(),
+        },
     }
 }
 
@@ -53,6 +72,8 @@ pub struct CpuReport {
     pub server_s: Option<f64>,
     /// None when Postgres is not on this host.
     pub postgres_s: Option<f64>,
+    /// None unless LEDGER_BACKEND=tigerbeetle with replicas on this host (all of them).
+    pub tigerbeetle_s: Option<f64>,
     /// CPU milliseconds per successful operation, per process group.
     pub per_op_ms: BTreeMap<&'static str, f64>,
 }
@@ -67,6 +88,13 @@ pub fn diff(before: &Snapshot, after: &Snapshot, ok_ops: u64) -> CpuReport {
             .map(|(pid, a)| a - before.postgres.get(pid).copied().unwrap_or(0.0))
             .sum::<f64>()
     });
+    let tigerbeetle_s = (!after.tigerbeetle.is_empty()).then(|| {
+        after
+            .tigerbeetle
+            .iter()
+            .map(|(pid, a)| a - before.tigerbeetle.get(pid).copied().unwrap_or(0.0))
+            .sum::<f64>()
+    });
     let harness_s = after.harness - before.harness;
     let per = |s: f64| s * 1000.0 / ok_ops.max(1) as f64;
     let mut per_op_ms = BTreeMap::from([("harness", per(harness_s))]);
@@ -76,10 +104,14 @@ pub fn diff(before: &Snapshot, after: &Snapshot, ok_ops: u64) -> CpuReport {
     if let Some(s) = postgres_s {
         per_op_ms.insert("postgres", per(s));
     }
+    if let Some(s) = tigerbeetle_s {
+        per_op_ms.insert("tigerbeetle", per(s));
+    }
     CpuReport {
         harness_s,
         server_s,
         postgres_s,
+        tigerbeetle_s,
         per_op_ms,
     }
 }

@@ -564,7 +564,7 @@ local key. Back up Vault itself with `vault operator raft snapshot save`.
 (`LEDGER_BACKEND=tigerbeetle`, DESIGN.md §15): balances and the no-overdraft
 rule live in a TigerBeetle replica; users, the journal (entries), idempotency,
 the outbox and the posting guards (AML, single-use checks and deposits) stay in
-Postgres. The overlay builds the image with TigerBeetle's client (Dockerfile
+Postgres ("Direct posting", below, moves the decision itself into the cluster). The overlay builds the image with TigerBeetle's client (Dockerfile
 `TIGERBEETLE=1`: pinned Zig + libclang in the builder; the default image has
 neither), runs one replica (`ghcr.io/tigerbeetle/tigerbeetle`, digest-pinned)
 on an internal network of its own with a fixed address (the client resolves no
@@ -573,8 +573,8 @@ host names), and gives the server and workers `LEDGER_BACKEND`,
 `TIGERBEETLE_CLUSTER_ID` (required) and, if the defaults collide with a local
 network, `TIGERBEETLE_SUBNET` / `TIGERBEETLE_IP` (172.31.250.0/29, .2); other
 knobs (`TIGERBEETLE_REQUEST_TIMEOUT_MS`, `_PENDING_TIMEOUT_SECS`,
-`_HOLD_WAIT_MS`, `_RECOVERY_INTERVAL_SECS`, …) go in `app.env` (README.md lists
-them).
+`_HOLD_WAIT_MS`, `_RECOVERY_INTERVAL_SECS`, `_POSTING`, …) go in `app.env`
+(README.md lists them).
 
 **One cluster belongs to one database, for good.** The servers and workers
 refuse to start on a database whose balances never reached the cluster, on a
@@ -645,6 +645,60 @@ docker compose run --rm --no-deps payment-server tigerbeetle-rollback
 The rolled-back cluster is never served again (Postgres moves money it will not
 see); a later cut-over needs a freshly formatted cluster with a new id.
 
+### Direct posting (the cluster decides)
+
+By default the cluster only holds balances and Postgres decides every posting
+(`TIGERBEETLE_POSTING=hybrid`). With `TIGERBEETLE_POSTING=direct` the cluster
+decides transfers and conversions by itself: one request carries the
+transaction's key (its Idempotency-Key), the payer's AML limits and the money,
+and the reply is the outcome. Nothing is written to Postgres on the request
+path; the workers' leader journals what the cluster posted a moment later
+(entries, outbox events, screening events), and a request that reads the
+journal waits for it, so clients always read their own writes. Check payments
+and deposits keep the guarded protocol (their single-use rules live in
+Postgres) and share the same keys and AML limits. DESIGN.md §15 has the design;
+crates/loadtest/README.md what it buys (about 3× the transfers per second of
+the hybrid on one box, with the Postgres work per transfer down by two thirds).
+
+What changes for you:
+
+- **The cluster's durability is the payment's durability.** A transfer is
+  acknowledged when the cluster has it, before Postgres does. With one replica
+  on one disk, losing that disk loses the acknowledged transfers the journal
+  had not received yet (normally the last 100 ms). Run direct posting on a
+  replicated cluster (3 or 6 replicas on separate hosts,
+  `TIGERBEETLE_ADDRESSES=ip1:3000,ip2:3000,…`); on a single replica it is for
+  staging.
+- **AML limits are held by the cluster**: each payment holds its share of the
+  payer's 24 h amount and hourly count, and the cluster releases it when the
+  window has passed. Limits may change at any time (a KYC tier, `AML_*`): a
+  payment weighs what it was of the limit in force when it was made. The
+  server refuses to start unless `AML_L*_DAILY_MINOR × 25 ×
+  AML_L*_VELOCITY_PER_HOUR ≤ 2^64` for both levels (below that the cluster
+  decides to the minor unit; the defaults are far below).
+- **The mode is recorded in the database** (`tb_posting`). A server or worker
+  whose `TIGERBEETLE_POSTING` differs refuses to start, and says which command
+  to run. A database with no transactions yet takes the setting as it is.
+
+Switching, either way, with money movement stopped (a minute or two):
+
+```bash
+docker compose stop payment-server payment-workers
+# To direct: settles reservations, gives every wallet owner their limit accounts and
+# carries each user's last 24 h into the cluster (valued with AML_* and the current
+# rates). Idempotent. Exit 0 = switched, 1 = refused (JSON says why).
+docker compose run --rm --no-deps payment-server tigerbeetle-posting direct
+#   app.env: TIGERBEETLE_POSTING=direct
+# Back to hybrid: the journal catches up with the cluster first; from then on the
+# Postgres guard decides the limits again, from the journal.
+docker compose run --rm --no-deps payment-server tigerbeetle-posting hybrid
+#   app.env: TIGERBEETLE_POSTING=hybrid (or remove the line)
+./deploy.sh
+```
+
+`tigerbeetle-rollback` (below "Rollback to Postgres") works from either mode:
+it drains the journal first.
+
 ### Operating it
 
 - **Alerts** (monitoring overlay): `TigerBeetleRecoveryStale` (no successful
@@ -652,6 +706,16 @@ see); a later cut-over needs a freshly formatted cluster with a new id.
   `TigerBeetleForcedRepost` (recovery was down past half the pending timeout),
   `TigerBeetleProtocolError` (an invariant broke: page a human, stop money
   movement, reconcile), `TigerBeetleUnavailable` (money requests answered 503).
+  Under direct posting also `TigerBeetleMirrorStale` (the journal is not being
+  written: readers still settle it themselves, but events, sealing and
+  reconciliation wait), `TigerBeetleMirrorBehind` (it trails the cluster by
+  more than 30 s) and `TigerBeetleMirrorIntegrity` (the journal already holds,
+  from elsewhere, an id the cluster posted: the mirror stops there; page).
+- **Restoring Postgres to an earlier point under direct posting:** the mirror's
+  position is in the database, so it goes back with it and the mirror journals
+  again everything the cluster posted since: direct postings come back by
+  themselves. (Guarded postings committed after the restore point are in the
+  cluster and no longer in the journal, as under hybrid posting: reconcile.)
 - **Backups:** the replica's state is one file in the `tigerbeetledata` volume;
   copy it with the replica stopped. It is only consistent with a Postgres
   backup taken at the same quiet moment. The journal is complete, though, so

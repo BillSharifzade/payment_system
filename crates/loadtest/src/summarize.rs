@@ -78,19 +78,20 @@ pub fn run(paths: &[String]) -> Result<String, String> {
             if op == "total" {
                 put("pg cpu", &cpu["postgres"]);
                 put("server cpu", &cpu["server"]);
+                put("tb cpu", &cpu["tigerbeetle"]);
             }
         }
     }
     let mut out = String::from(
-        "| label | op | runs | ok/s | p50 ms | p99 ms | p99.9 ms | PG CPU ms/op | server CPU ms/op | verified |\n\
-         |---|---|---|---|---|---|---|---|---|---|\n",
+        "| label | op | runs | ok/s | p50 ms | p99 ms | p99.9 ms | PG CPU ms/op | server CPU ms/op | TB CPU ms/op | verified |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for label in &order {
         let g = &groups[label];
         for (op, m) in &g.ops {
             let col = |k: &str, d: usize| spread(m.get(k).cloned().unwrap_or_default(), d);
             out.push_str(&format!(
-                "| {label} | {op} | {} | {} | {} | {} | {} | {} | {} | {}/{} |\n",
+                "| {label} | {op} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{} |\n",
                 g.runs,
                 col("ok/s", 0),
                 col("p50", 1),
@@ -98,6 +99,7 @@ pub fn run(paths: &[String]) -> Result<String, String> {
                 col("p99.9", 1),
                 col("pg cpu", 3),
                 col("server cpu", 3),
+                col("tb cpu", 3),
                 g.passed,
                 g.runs
             ));
@@ -155,6 +157,6 @@ mod tests {
             table.contains("| A | transfer | 2 | 200 (100–300) |"),
             "{table}"
         );
-        assert!(table.contains("| A | total | 2 | 200 (100–300) | 1.0 (1.0–1.0) | 2.0 (2.0–2.0) | 3.0 (3.0–3.0) | 1.500 (1.500–1.500) | – | 2/2 |"), "{table}");
+        assert!(table.contains("| A | total | 2 | 200 (100–300) | 1.0 (1.0–1.0) | 2.0 (2.0–2.0) | 3.0 (3.0–3.0) | 1.500 (1.500–1.500) | – | – | 2/2 |"), "{table}");
     }
 }

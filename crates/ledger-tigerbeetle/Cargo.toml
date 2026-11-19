@@ -33,6 +33,7 @@ tigerbeetle-unofficial = { version = "=0.14.28", features = ["tokio-rt-multi-thr
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+proptest = { workspace = true }
 
 # The shared suites against a live cluster (TIGERBEETLE_ADDRESSES, DATABASE_URL).
 [[test]]

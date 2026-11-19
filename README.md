@@ -164,6 +164,11 @@ TEST_LEDGER_BACKEND=tigerbeetle TIGERBEETLE_ADDRESSES=127.0.0.1:3001 TIGERBEETLE
 # Every workers suite against a live cluster of its own.
 TEST_LEDGER_BACKEND=tigerbeetle TIGERBEETLE_ADDRESSES=127.0.0.1:3002 TIGERBEETLE_CLUSTER_ID=2 \
   DATABASE_URL=.../payment_tb_workers cargo test -p workers --features tigerbeetle -- --ignored --test-threads=1
+
+# Direct posting (TIGERBEETLE_POSTING=direct): every api suite again, the model, then live.
+TEST_LEDGER_BACKEND=tigerbeetle-direct-sim DATABASE_URL=.../payment_tb_direct_model cargo test -p api -- --ignored
+TEST_LEDGER_BACKEND=tigerbeetle-direct TIGERBEETLE_ADDRESSES=127.0.0.1:3003 TIGERBEETLE_CLUSTER_ID=3 \
+  DATABASE_URL=.../payment_tb_direct cargo test -p api --features tigerbeetle -- --ignored
 ```
 
 `.github/workflows/tigerbeetle.yml` runs exactly these lanes. Configuration (strictly parsed; a
@@ -180,6 +185,8 @@ bad value refuses to boot), for `payment-server` and `payment-workers`:
 | `TIGERBEETLE_HOLD_WAIT_MS` | 2000 | a post refused only for other requests' holds waits this long for them, then `503` (0–30000) |
 | `TIGERBEETLE_SESSIONS` | 1 | client sessions per process (1–16) |
 | `TIGERBEETLE_RECOVERY_INTERVAL_SECS` | 2 | workers: the leader's recovery pass (1–60) |
+| `TIGERBEETLE_POSTING` | `hybrid` | `hybrid` (Postgres decides a posting) or `direct` (the cluster decides transfers and conversions, AML limits included; Postgres journals them afterwards). Must match the database: switch with `payment-server tigerbeetle-posting direct\|hybrid` (deploy/README.md) |
+| `TIGERBEETLE_MIRROR_INTERVAL_MS` | 100 | workers, direct posting: how often the leader looks for postings to journal (10–10000) |
 
 Fuzzing needs nightly: `rustup toolchain install nightly-2026-10-08 && cargo install cargo-fuzz --locked --version 0.13.2`,
 then `FUZZ_TOOLCHAIN=nightly-2026-10-08 fuzz/run.sh 60` (every target, 60 s each) or

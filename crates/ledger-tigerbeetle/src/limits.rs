@@ -467,6 +467,48 @@ mod tests {
         assert_eq!(screening(0, 10, 5).holds().unwrap().day, 0);
     }
 
+    proptest::proptest! {
+        /// The cluster's decision (do the holds still fit the allowance?) is the exact one
+        /// (does the window's sum stay within the limit?) at every step of any sequence of
+        /// payments and expiries, for any limit the server accepts.
+        #[test]
+        fn the_allowance_decides_like_the_sum(
+            daily in 1_i64..=10_i64.pow(13),
+            steps in proptest::collection::vec((0_u64..=u64::MAX, proptest::bool::weighted(0.2)), 1..400),
+        ) {
+            proptest::prop_assume!(Screening::exact(daily, 1_000));
+            // (amount, hold) of the payments still in the window, oldest first.
+            let mut window: std::collections::VecDeque<(i64, u128)> = Default::default();
+            let (mut sum, mut held) = (0_i64, 0_u128);
+            for (raw, expire) in steps {
+                if expire {
+                    if let Some((a, h)) = window.pop_front() {
+                        sum -= a;
+                        held -= h;
+                    }
+                    continue;
+                }
+                // Skewed towards what is left, so sequences end right at the limit.
+                let amount = match raw % 4 {
+                    0 => daily - sum,
+                    1 => daily - sum + 1,
+                    _ => (raw % daily as u64) as i64,
+                };
+                let exact = sum + amount <= daily;
+                let cluster = screening(amount, daily, 1_000)
+                    .holds()
+                    .is_ok_and(|h| held + h.day <= ALLOWANCE);
+                proptest::prop_assert_eq!(cluster, exact, "{} of {} after {}", amount, daily, sum);
+                if exact {
+                    let h = screening(amount, daily, 1_000).holds().unwrap().day;
+                    window.push_back((amount, h));
+                    sum += amount;
+                    held += h;
+                }
+            }
+        }
+    }
+
     #[test]
     fn exactness_bounds() {
         assert!(Screening::exact(1_000_000_000, 1_000));

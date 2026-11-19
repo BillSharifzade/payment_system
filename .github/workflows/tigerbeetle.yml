@@ -5,13 +5,15 @@
 #    single-replica cluster: model/cluster fidelity, the differentials, crash recovery,
 #    races, holds, cut-over and rollback.
 # 2. Every api integration suite through the TigerBeetle backend: against the model, then
-#    against a live cluster. Every workers suite against a live cluster (the recovery loop,
+#    against a live cluster; and again under direct posting (TIGERBEETLE_POSTING=direct: the
+#    cluster decides, AML limits included, the journal follows), model then live. Every
+#    workers suite against a live cluster (the recovery loop, the journal mirror,
 #    reconciliation against the cluster). ci.yml runs the same suites on Postgres.
 # 3. A short benchmark smoke run, its table in the job summary.
 #
 # One cluster per database, as in production (a cluster belongs to one database for good):
-# three replicas, clusters 0/1/2 on ports 3000/3001/3002, for the crate, api and workers
-# lanes. The native client builds with Zig (pinned like in ci.yml) and the runner's libclang.
+# four replicas, clusters 0/1/2/3 on ports 3000-3003, for the crate, api, workers and
+# direct-posting lanes. The native client builds with Zig (pinned like in ci.yml) and the runner's libclang.
 # The TigerBeetle release and Zig are pinned by version and SHA-256; actions by commit SHA,
 # service images by digest, as in ci.yml.
 name: TigerBeetle
@@ -124,7 +126,7 @@ jobs:
           PG_SERVICE_ID: ${{ job.services.postgres.id }}
         run: |
           set -euo pipefail
-          for db in tb_crate tb_api_model tb_api_live tb_workers_live; do
+          for db in tb_crate tb_api_model tb_api_live tb_workers_live tb_direct_model tb_direct_live; do
             docker exec "$PG_SERVICE_ID" psql -U payment -d payment -qc "CREATE DATABASE $db"
           done
 
@@ -139,13 +141,13 @@ jobs:
           unzip -q "$dir/tb.zip" -d "$dir"
           rm "$dir/tb.zip"
           "$dir/tigerbeetle" version
-          for cluster in 0 1 2; do
+          for cluster in 0 1 2 3; do
             "$dir/tigerbeetle" format --cluster="$cluster" --replica=0 --replica-count=1 \
               --development "$dir/${cluster}_0.tigerbeetle"
             nohup "$dir/tigerbeetle" start --addresses="127.0.0.1:300$cluster" --development \
               "$dir/${cluster}_0.tigerbeetle" > "$dir/replica-$cluster.log" 2>&1 &
           done
-          for cluster in 0 1 2; do
+          for cluster in 0 1 2 3; do
             for _ in $(seq 1 60); do
               (echo > "/dev/tcp/127.0.0.1/300$cluster") 2>/dev/null && break
               sleep 1
@@ -189,6 +191,20 @@ jobs:
           TEST_LEDGER_BACKEND: tigerbeetle
           TIGERBEETLE_ADDRESSES: "127.0.0.1:3001"
           TIGERBEETLE_CLUSTER_ID: "1"
+        run: cargo test -p api --features tigerbeetle -- --ignored
+
+      - name: api — every suite under direct posting, cluster model
+        env:
+          DATABASE_URL: ${{ env.PG }}/tb_direct_model
+          TEST_LEDGER_BACKEND: tigerbeetle-direct-sim
+        run: cargo test -p api -- --ignored
+
+      - name: api — every suite under direct posting, live cluster
+        env:
+          DATABASE_URL: ${{ env.PG }}/tb_direct_live
+          TEST_LEDGER_BACKEND: tigerbeetle-direct
+          TIGERBEETLE_ADDRESSES: "127.0.0.1:3003"
+          TIGERBEETLE_CLUSTER_ID: "3"
         run: cargo test -p api --features tigerbeetle -- --ignored
 
       - name: workers — every suite against the live cluster
