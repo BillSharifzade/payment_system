@@ -293,6 +293,46 @@ the p99). More client sessions only added CPU on this 4-core box. To reproduce, 
 itself (it verifies through the same backend and forwards the settings to the server it spawns)
 and reformat the replica before every run: a cluster belongs to one database.
 
+### Direct posting: the cluster decides (November 2026)
+
+`TIGERBEETLE_POSTING=direct` (DESIGN.md §15): a transfer is one chain in TigerBeetle — key,
+AML holds, legs — and Postgres journals it afterwards (the harness runs the workers' mirror
+loop while the load runs, so its cost is counted, and drains it before verifying). Same box,
+same release binaries (`--features api/tigerbeetle,loadtest/tigerbeetle`), HTTP, 1 000 users,
+64 clients, 30 s after 5 s warm-up, kernel writeback tuned as in "Tail latency"; every run on
+a fresh database and, for TigerBeetle, a freshly formatted single-replica 0.17.9 cluster in
+production mode (direct I/O, no `--development`) on the same 4 cores; variants interleaved,
+order flipped per repeat; median (min–max) of 3. 18 runs, all verified, zero failed requests;
+in every direct run the mirror kept up (130 000–144 000 postings journaled during the run,
+none left at its end).
+
+| case | backend | ok/s | p50 ms | p99 ms | Postgres CPU ms/op | server CPU ms/op | TigerBeetle CPU ms/op |
+|---|---|---|---|---|---|---|---|
+| uniform | postgres | 1851 (1714–2064) | 32.8 | 58.8 | 1.362 | 0.316 | – |
+| uniform | tigerbeetle, hybrid | 1503 (1498–1772) | 39.1 | 98.2 | 1.084 | 0.368 | 0.152 |
+| uniform | tigerbeetle, **direct** | **3708** (3679–4005) | **12.2** | 59.5 | **0.305** | 0.165 | 0.112 |
+| hot, 1 merchant | postgres | 631 (587–702) | 69.8 | 365.3 | 2.292 | 0.559 | – |
+| hot, 1 merchant | tigerbeetle, hybrid | 1748 (1703–1751) | 34.4 | 97.6 | 0.972 | 0.336 | 0.141 |
+| hot, 1 merchant | tigerbeetle, **direct** | **3928** (3922–4075) | **11.4** | **57.2** | **0.283** | 0.158 | 0.107 |
+
+Against Postgres: 2.0× the transfers per second with spread-out traffic and **6.2× under one
+hot merchant** (whose balance row no longer serialises anything), a third of the median
+latency, and the p99 of the hot case cut from 365 to 57 ms. Against the hybrid: 2.2–2.5×,
+because a transfer is one cluster round trip instead of two plus a Postgres transaction.
+Postgres does a quarter of the work per transfer (0.28–0.31 ms of CPU against 1.08–1.36: the
+mirror writes the journal in batches of thousands), and the hot merchant costs no more than
+spread-out traffic. TigerBeetle itself spends 0.11 ms of CPU per transfer; on this box the
+harness, the server, Postgres and the replica share 4 cores and the server's request handling
+is now the largest cost, so the cluster is nowhere near its own limit — the next gains are in
+the HTTP path and batching requests into the client, not in the ledger. The p99.9 of the
+Postgres row (78.8–591.4 ms) moved from run to run with the box; the direct rows' did not
+(79–96 ms).
+
+To reproduce, export for the harness `LEDGER_BACKEND=tigerbeetle TIGERBEETLE_CLUSTER_ID=…
+TIGERBEETLE_ADDRESSES=… TIGERBEETLE_POSTING=direct` (it forwards them to the server it spawns
+and gives the server AML limits the cluster decides exactly) and reformat the replica before
+every run.
+
 ### Reproduce
 
 ```bash

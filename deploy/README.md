@@ -657,8 +657,9 @@ path; the workers' leader journals what the cluster posted a moment later
 journal waits for it, so clients always read their own writes. Check payments
 and deposits keep the guarded protocol (their single-use rules live in
 Postgres) and share the same keys and AML limits. DESIGN.md §15 has the design;
-crates/loadtest/README.md what it buys (about 3× the transfers per second of
-the hybrid on one box, with the Postgres work per transfer down by two thirds).
+crates/loadtest/README.md what it buys (on one 4-core box: 2× the transfers
+per second of plain Postgres, 6× under one hot merchant, 2.2–2.5× the hybrid's,
+with Postgres doing a quarter of the work per transfer).
 
 What changes for you:
 
