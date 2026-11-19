@@ -682,7 +682,9 @@ ul.ledger-pts{padding:0;margin:40px 0 0}
     cur = n;
     progress.style.width = ((n + 1) / slides.length * 100) + "%";
     counter.textContent = `${n + 1} / ${slides.length}`;
-    history.replaceState(null, "", "#" + (n + 1));
+    // Some viewers (sandboxed iframes, srcdoc previews) refuse history changes: the URL hash is
+    // a convenience, never a requirement.
+    try { history.replaceState(null, "", "#" + (n + 1)); } catch (e) {}
     count(slides[n]);
     ha(slides[n].id === "ha");
   }
@@ -696,7 +698,12 @@ ul.ledger-pts{padding:0;margin:40px 0 0}
     relabelNumbers();
   };
   document.getElementById("lang").onclick = toggleLang;
-  const fullscreen = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  const fullscreen = () => {
+    try {
+      const p = document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
+  };
   document.getElementById("fs").onclick = fullscreen;
   addEventListener("keydown", e => {
     if (["ArrowRight", "PageDown", " ", "Enter"].includes(e.key)) { e.preventDefault(); next(); }
@@ -774,7 +781,8 @@ ul.ledger-pts{padding:0;margin:40px 0 0}
 
   try { const l = localStorage.getItem("pitch-lang"); if (l) { document.documentElement.dataset.lang = l; document.documentElement.lang = l; } } catch (e) {}
   relabelNumbers();
-  const start = parseInt(location.hash.slice(1), 10);
+  let start = NaN;
+  try { start = parseInt(location.hash.slice(1), 10); } catch (e) {}
   go(Number.isFinite(start) ? start - 1 : 0);
 })();
 </script>
